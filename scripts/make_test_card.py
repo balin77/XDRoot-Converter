@@ -29,6 +29,7 @@ try:
     from xdroot_converter import tools as _tools  # noqa: E402
 except Exception:  # pragma: no cover
     _tools = None
+from xdroot_converter import mxfheader  # noqa: E402
 
 FPS = 50
 N_AUDIO = 8
@@ -272,6 +273,50 @@ def wrap_clip(out: Path, video: Path, wavs: list[Path], anc: Path, start_tc: str
     return run(args)
 
 
+def sonyfy_header(path: Path) -> list[str]:
+    """Macht die bmx-Kopfdaten einer Quell-MXF "Sony-aehnlich" (nur fuer den Test der
+    Uebernahme in xdroot_converter.mxfheader; sonst waere die Uebernahme ein No-op).
+
+    ANNAHMEN (nicht an echten Sony-Dateien belegt, ausser wo vermerkt):
+    - Track-IDs Video 2, Audio 3..10, ANC 11 in beiden Packages: wie docs/analysis/f55_mxf2raw.txt.
+    - Timecode-Track-ID 1: ANNAHME, nicht belegt.
+    - ToolkitVersion/Platform der Identification entfernt: mxf2raw zeigt sie bei echten Sony-Dateien nicht.
+    - Track-Namen (TC1/V1/A1..) entfernt: ANNAHME zum Testen.
+    - Sound-Deskriptoren: AvgBps entfernt und SequenceOffset (3d.0b) = 0 ergaenzt: reine
+      TEST-ANNAHME, damit Regel c (Deskriptor wie Quelle) tatsaechlich etwas zu tun hat.
+    """
+    def edit(hm):
+        st = mxfheader.resolve(hm)
+        first = {"timecode": 1, "picture": 2, "sound": 3, "data": 11}
+        maps = {}
+        for pkg in (st.file, st.material):
+            used = {k: 0 for k in first}
+            extra = 12
+            ids = []
+            for t in pkg.tracks:
+                if t.kind in first:
+                    ids.append(first[t.kind] + used[t.kind])
+                    used[t.kind] += 1
+                else:
+                    ids.append(extra)
+                    extra += 1
+            maps[pkg.role] = mxfheader.set_track_ids(hm, pkg, ids)
+            for t in pkg.tracks:
+                hm.drop(t.set, "GenericTrack.TrackName")
+        mxfheader.relink_after_renumber(hm, st, maps["source"], maps["material"])
+        for ident in st.identifications:
+            hm.drop(ident, "Identification.ToolkitVersion")
+            hm.drop(ident, "Identification.Platform")
+        for d in st.file_descriptors():
+            if hm.get(d, "GenericSoundEssenceDescriptor.ChannelCount") is not None:
+                hm.drop(d, "WaveAudioDescriptor.AvgBps")
+                hm.put(d, "WaveAudioDescriptor.SequenceOffset", b"\x00",
+                       after=["WaveAudioDescriptor.BlockAlign"])
+        mxfheader.verify_references(hm)
+        return []
+    return mxfheader.patch_header(path, edit)
+
+
 # --------------------------------------------------------------------------- Hauptprogramm
 def main() -> int:
     ap = argparse.ArgumentParser(description="Synthetische XAVC-I-Testkarte (XDROOT) erzeugen")
@@ -321,6 +366,7 @@ def main() -> int:
             v = first_video
         out = xr / "Clip" / f"{name}.MXF"
         wrap_clip(out, v, wavs, anc, start_tc, frames, mp, fp, create_date, prod_info, [])
+        sonyfy_header(out)
         print(f"Clip {name}.MXF  start_tc={start_tc}  frames={frames}  listed={listed}")
         if not listed and not a.unlisted_no_xml:
             (xr / "Clip" / f"{name}M01.XML").write_bytes(clip_xml(name, mp, frames, start_tc, dt_local))
