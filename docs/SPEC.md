@@ -159,3 +159,38 @@ Nur Python-Standardbibliothek (Python 3.11), keine pip-Abhängigkeiten (Tests mi
 - Nicht änderbar mit raw2bmx: Identification (bmx statt Sony „Mem“), Track-IDs (1001/2001/3001 statt 2,3,…), mime_type des TextObject (`application/xml` statt `text/xml`), TextObject-description.
 - ffmpeg braucht `-color_range tv` (sonst markiert x264 den Strom als Full Range).
 - Auf der Testkarte liegen 147 MXF, `MEDIAPRO.XML` listet nur 19. Option `--unlisted skip` bzw. GUI-Haken.
+
+## Runde 2: MXF-Kopfdaten wie Sony (Anforderung des Nutzers, verbindlich)
+
+Die Ziel-MXF soll in den Kopfdaten so aussehen wie eine Sony-Kameradatei, nicht wie
+eine bmx-Datei. Maßstab ist `docs/analysis/fx6_mxf2raw.txt` (Ziel) bzw. die Quell-MXF.
+
+1. **Identification wie Sony**: `company_name` = `Sony`, `product_name` = `Mem ` (mit
+   Leerzeichen am Ende), `version_string` = `2.00`, `product_uid` =
+   `cede1104-8280-11de-8a39-08004678031c` – jeweils aus der **Quell-MXF** übernehmen
+   (nicht fest verdrahten; Fallback auf diese Werte). Kein „BBC/bmx" mehr sichtbar
+   (auch toolkit/platform prüfen und an die Referenz angleichen, soweit vorhanden).
+   Erster Versuch: `raw2bmx --prod-info`.
+2. **Spuren wie Sony**: Track-IDs wie in der Quelle/Referenz (Video 2, Audio 3…N,
+   ANC danach; siehe `track_id` in `docs/analysis/f55_mxf2raw.txt`) statt
+   1001/2001/3001. Track-Nummern, Reihenfolge und Audio-Descriptor-Felder exakt wie
+   in der Quell-MXF. Die Tonspuren dürfen in keinem von mxf2raw/ffprobe/MXFDump
+   sichtbaren Feld von der Quelle abweichen (außer wo Sony selbst zwischen XAVC-I und
+   XAVC-L unterscheidet).
+3. **Weg dorthin** (in dieser Reihenfolge prüfen):
+   a) vorhandene raw2bmx-Optionen;
+   b) Nachbearbeitung der fertigen MXF durch einen eigenen Python-Patcher
+      (Header-/Footer-Metadaten sind KLV mit festen Feldlängen: Track-ID,
+      SourceTrackID, LinkedTrackID, Identification-Strings bei gleicher Länge bzw.
+      mit sauberem Neuschreiben der Partition) – muss Header- **und** Footer-Partition
+      sowie alle Verweise konsistent ändern;
+   c) bmx (BSD-Lizenz, https://github.com/bbc/bmx) forken, anpassen und selbst
+      bauen; der Fork wird dann von `setup_tools` bezogen.
+   Die einfachste Variante wählen, die ein strukturell sauberes MXF ergibt.
+4. **Vollständiger Strukturvergleich**: Mit `MXFDump` (liegt bei bmx) die
+   Header-Metadaten von Quelle (F55), Referenz (FX6) und Ziel Satz für Satz
+   vergleichen und jede verbleibende Abweichung in `docs/MXF-VERGLEICH.md`
+   auflisten und begründen (behoben / bewusst belassen / nicht machbar).
+   `verify` prüft die neuen Felder mit.
+5. README: offen dokumentieren, dass die Dateien Sony-Kennungen der Quellkamera
+   tragen, aber von diesem Tool erzeugt wurden.
