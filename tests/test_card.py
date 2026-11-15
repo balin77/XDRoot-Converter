@@ -134,15 +134,31 @@ class Folders(unittest.TestCase):
             with self.assertRaises(ValueError, msg=str(bad)):
                 card.check_target(src, bad)
 
+    def test_check_target_inside_chosen_source_parent(self):
+        """K4: Wurde der Elternordner des XDROOT gewaehlt, darf das Ziel auch nicht dort drin liegen."""
+        parent = self.tmp / "card"
+        src = parent / "XDROOT"
+        self.make_card(src)
+        for bad in (parent / "out", parent / "x" / "y", parent):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                card.check_target(src, bad, chosen_source=parent)
+        # ohne chosen_source war "card/out" bisher erlaubt (Bug)
+        self.assertEqual(card.check_target(src, parent / "out"), parent / "out" / "XDROOT")
+        self.assertEqual(card.check_target(src, self.tmp / "ziel", chosen_source=parent), self.tmp / "ziel" / "XDROOT")
+        self.assertEqual(card.check_target(src, self.tmp / "ziel", chosen_source=src), self.tmp / "ziel" / "XDROOT")
+
     def test_copy_structure(self):
         src = self.tmp / "card" / "XDROOT"
         self.make_card(src)
         dst = self.tmp / "out" / "XDROOT"
         n = card.copy_structure(src, dst)
         self.assertTrue((dst / "Sub").is_dir())  # leere Ordner
-        self.assertTrue((dst / "Clip" / "A BM01.XML").is_file())
+        self.assertTrue((dst / "Clip" / "A BR01.BIM").is_file())
         self.assertFalse((dst / "Clip" / "A B.MXF").exists())
-        self.assertEqual(n, 6)
+        # MEDIAPRO.XML und Clip/*M??.XML schreibt der Ablauf selbst (zustandsabhaengig)
+        self.assertFalse((dst / "MEDIAPRO.XML").exists())
+        self.assertFalse((dst / "Clip" / "A BM01.XML").exists())
+        self.assertEqual(n, 3)
         s, d = (src / "CUEUP.XML").stat().st_mtime, (dst / "CUEUP.XML").stat().st_mtime
         self.assertAlmostEqual(s, d, delta=2)
 
@@ -150,16 +166,176 @@ class Folders(unittest.TestCase):
         src = self.tmp / "card" / "XDROOT"
         self.make_card(src)
         dst = self.tmp / "out" / "XDROOT"
-        card.copy_structure(src, dst, skip_stems={"a b"})
+        card.copy_structure(src, dst, skip_stems={"a b"}, skip_xml=False)
         self.assertFalse((dst / "Clip" / "A BM01.XML").exists())
         self.assertFalse((dst / "Clip" / "A BR01.BIM").exists())
         self.assertFalse((dst / "Thmbnl" / "A BT01.JPG").exists())
         self.assertTrue((dst / "Clip" / "A B2M01.XML").exists())  # anderer Clip "A B2"
 
+    def test_copy_structure_skip_xml_false_copies_everything(self):
+        src = self.tmp / "card" / "XDROOT"
+        self.make_card(src)
+        dst = self.tmp / "out" / "XDROOT"
+        n = card.copy_structure(src, dst, skip_xml=False)
+        self.assertEqual(n, 6)
+        self.assertTrue((dst / "MEDIAPRO.XML").is_file())
+        self.assertTrue((dst / "Clip" / "A BM01.XML").is_file())
+
+    def test_copy_structure_collects_errors_per_file(self):
+        from unittest import mock
+        src = self.tmp / "card" / "XDROOT"
+        self.make_card(src)
+        dst = self.tmp / "out" / "XDROOT"
+        real = card.copy_file_atomic
+
+        def flaky(s, d):
+            if Path(s).name == "CUEUP.XML":
+                raise OSError("kaputt")
+            return real(s, d)
+
+        errors = []
+        with mock.patch.object(card, "copy_file_atomic", flaky):
+            n = card.copy_structure(src, dst, errors=errors)
+        self.assertEqual([e[0] for e in errors], ["CUEUP.XML"])
+        self.assertIn("kaputt", errors[0][1])
+        self.assertEqual(n, 2)  # der Rest wurde trotzdem kopiert
+        self.assertTrue((dst / "Clip" / "A BR01.BIM").is_file())
+        with mock.patch.object(card, "copy_file_atomic", flaky), self.assertRaises(OSError):
+            card.copy_structure(src, self.tmp / "out2" / "XDROOT")  # ohne errors-Liste: Fehler wird ausgeloest
+
+    def test_copy_structure_cancel_is_not_swallowed(self):
+        src = self.tmp / "card" / "XDROOT"
+        self.make_card(src)
+
+        class Stop(Exception):
+            pass
+
+        def chk():
+            raise Stop()
+
+        with self.assertRaises(Stop):
+            card.copy_structure(src, self.tmp / "out" / "XDROOT", cancel_check=chk, errors=[])
+
+    def test_clip_xml_stem(self):
+        self.assertEqual(card.clip_xml_stem("PDW F5_0001M01.XML"), "PDW F5_0001")
+        self.assertEqual(card.clip_xml_stem("a bm02.xml"), "a b")
+        self.assertIsNone(card.clip_xml_stem("CUEUP.XML"))
+
+    def test_write_bytes_atomic_and_stat(self):
+        a = self.tmp / "a.xml"
+        a.write_bytes(b"alt")
+        import os
+        os.utime(a, (1_000_000_000, 1_000_000_000))
+        b = self.tmp / "b.xml"
+        card.write_bytes_atomic(b, b"neu", stat_from=a)
+        self.assertEqual(b.read_bytes(), b"neu")
+        self.assertAlmostEqual(b.stat().st_mtime, 1_000_000_000, delta=2)
+        self.assertEqual([p.name for p in self.tmp.iterdir() if p.name.endswith(card.TMP_SUFFIX)], [])
+
+    def test_write_bytes_atomic_failure_keeps_old_and_no_temp(self):
+        from unittest import mock
+        b = self.tmp / "b.xml"
+        b.write_bytes(b"alt")
+        with mock.patch("os.replace", side_effect=OSError("x")), self.assertRaises(OSError):
+            card.write_bytes_atomic(b, b"neu")
+        self.assertEqual(b.read_bytes(), b"alt")
+        self.assertEqual([p.name for p in self.tmp.iterdir() if p.name.endswith(card.TMP_SUFFIX)], [])
+
+    def test_remove_stray_temp_files(self):
+        (self.tmp / "Clip").mkdir()
+        (self.tmp / "Clip" / ("x.XML" + card.TMP_SUFFIX)).write_text("t")
+        (self.tmp / "Clip" / "x.XML").write_text("k")
+        self.assertEqual(card.remove_stray_temp_files(self.tmp), 1)
+        self.assertTrue((self.tmp / "Clip" / "x.XML").exists())
+
     def test_list_clip_mxf(self):
         src = self.tmp / "card" / "XDROOT"
         self.make_card(src)
         self.assertEqual([p.name for p in card.list_clip_mxf(src)], ["A B.MXF"])
+
+
+class ExistingTarget(unittest.TestCase):
+    """G2: ein vorhandenes Ziel muss zur selben Karte gehoeren."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.src = self.tmp / "card" / "XDROOT"
+        (self.src / "Clip").mkdir(parents=True)
+        (self.src / "MEDIAPRO.XML").write_bytes(fixture_bytes("f55_MEDIAPRO.XML"))
+        (self.src / "Clip" / "PDW-F55_6753.MXF").write_bytes(b"x")
+        self.mp = card.parse_mediapro(fixture_bytes("f55_MEDIAPRO.XML"))
+        self.out = self.tmp / "out" / "XDROOT"
+
+    def _make_target(self, mp_bytes=None, mxf=("PDW-F55_6753.MXF",)):
+        (self.out / "Clip").mkdir(parents=True)
+        if mp_bytes is not None:
+            (self.out / "MEDIAPRO.XML").write_bytes(mp_bytes)
+        for n in mxf:
+            (self.out / "Clip" / n).write_bytes(b"y")
+
+    def test_media_id_parsed(self):
+        self.assertTrue(self.mp.media_id)
+
+    def test_missing_or_empty_target_ok(self):
+        card.check_existing_target(self.src, self.out, self.mp)
+        (self.out / "Clip").mkdir(parents=True)
+        card.check_existing_target(self.src, self.out, self.mp)
+
+    def test_same_card_with_changed_video_type_ok(self):
+        src = fixture_bytes("f55_MEDIAPRO.XML")
+        self._make_target(src.replace(b"AVC100CBG_1920_1080_H422IP@L42", b"AVC50_1920_1080_H422P@L42"))
+        card.check_existing_target(self.src, self.out, self.mp)
+
+    def test_other_system_id(self):
+        mp = fixture_bytes("f55_MEDIAPRO.XML")
+        sid = self.mp.system_id.encode()
+        self.assertTrue(sid and sid in mp)
+        self._make_target(mp.replace(sid, b"FFFFFFFFFFFFFFFF"))
+        with self.assertRaisesRegex(ValueError, "andere Karte"):
+            card.check_existing_target(self.src, self.out, self.mp)
+
+    def test_other_umid(self):
+        mp = fixture_bytes("f55_MEDIAPRO.XML")
+        umid = self.mp.materials[0].umid.encode()
+        self._make_target(mp.replace(umid, b"0" * len(umid)))
+        with self.assertRaisesRegex(ValueError, "andere Karte"):
+            card.check_existing_target(self.src, self.out, self.mp)
+
+    def test_other_media_id(self):
+        mp = fixture_bytes("f55_MEDIAPRO.XML")
+        self.assertTrue(self.mp.media_id.encode() in mp)
+        self._make_target(mp.replace(self.mp.media_id.encode(), b"A" * len(self.mp.media_id)))
+        with self.assertRaisesRegex(ValueError, "andere Karte"):
+            card.check_existing_target(self.src, self.out, self.mp)
+
+    def test_unreadable_mediapro(self):
+        self._make_target(b"<kein xml")
+        with self.assertRaisesRegex(ValueError, "nicht lesbar"):
+            card.check_existing_target(self.src, self.out, self.mp)
+
+    def test_mxf_not_from_source(self):
+        self._make_target(fixture_bytes("f55_MEDIAPRO.XML"), mxf=("PDW-F55_6753.MXF", "FREMD.MXF"))
+        with self.assertRaisesRegex(ValueError, "FREMD.MXF"):
+            card.check_existing_target(self.src, self.out, self.mp)
+
+    def test_xdroot_without_mediapro_but_with_mxf(self):
+        self._make_target(None)
+        with self.assertRaisesRegex(ValueError, "ohne MEDIAPRO.XML"):
+            card.check_existing_target(self.src, self.out, self.mp)
+
+    def test_xdroot_without_mediapro_with_foreign_file(self):
+        (self.out / "Clip").mkdir(parents=True)
+        (self.out / "Urlaub.doc").write_text("privat")
+        with self.assertRaisesRegex(ValueError, "Urlaub.doc"):
+            card.check_existing_target(self.src, self.out, self.mp)
+
+    def test_xdroot_without_mediapro_only_own_partial_copy_ok(self):
+        (self.out / "Clip").mkdir(parents=True)
+        (self.src / "CUEUP.XML").write_text("c")
+        (self.out / "CUEUP.XML").write_text("c")
+        (self.out / ("x.XML" + card.TMP_SUFFIX)).write_text("t")
+        card.check_existing_target(self.src, self.out, self.mp)
 
 
 if __name__ == "__main__":

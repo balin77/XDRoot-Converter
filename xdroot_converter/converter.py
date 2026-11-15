@@ -369,14 +369,15 @@ def tool_versions() -> dict:
 
 
 def diff_settings(old: dict, new: dict) -> list[str]:
-    """Unterschiede zweier Einstellungs-Dicts als lesbare Teile ('Bitrate (Mbit/s) 40 statt 50')."""
+    """Unterschiede zweier Einstellungs-Dicts (alt = beim Erzeugen, neu = aktuell) als lesbare Teile
+    ('Bitrate (Mbit/s): damals 40, jetzt 50')."""
     out = []
     for k, label in _SETTING_LABELS.items():
         a, b = old.get(k), new.get(k)
         if a is None or b is None or a == "?" or b == "?":
             continue
         if a != b:
-            out.append(f"{label} {a} statt {b}")
+            out.append(f"{label}: damals {a}, jetzt {b}")
     return out
 
 
@@ -620,6 +621,21 @@ class Converter:
         if self.l_codecs:
             self.info(f"{len(self.l_codecs)} bereits umgewandelte Clip(s) im Ziel gefunden")
 
+    def _prewrite_clip_xml(self, plans: list[ClipPlan], out_root: Path) -> None:
+        """Fehlt im Ziel die M01.XML eines ausgewaehlten Clips, die unveraenderte Quell-XML schreiben, damit auch
+        bei Abbruch/Fehler/hartem Kill jeder Clip eine (zum Zustand 'noch XAVC-I' passende) XML hat.  Eine
+        bereits vorhandene Ziel-XML (z. B. angepasst) wird nicht angeruehrt."""
+        for plan in plans:
+            if not plan.selected or plan.xml_path is None:
+                continue
+            d = out_root / "Clip" / plan.xml_path.name
+            if d.exists():
+                continue
+            try:
+                card.copy_file_atomic(plan.xml_path, d)
+            except OSError as e:
+                self.warn(f"{plan.xml_path.name}: konnte nicht kopiert werden: {e}")
+
     # ------------------------------------------------------------------ Einstellungen
     def _current_settings(self) -> dict:
         v = tool_versions()
@@ -663,8 +679,8 @@ class Converter:
         for d, names in self._resume_diffs.items():
             shown = ", ".join(names[:5]) + (" ..." if len(names) > 5 else "")
             self.warn(
-                f"Bereits fertige Clips ({len(names)}) wurden mit anderen Einstellungen erzeugt ({d}; "
-                f"alt statt aktuell) und werden nicht neu erzeugt: {shown}"
+                f"Bereits fertige Clips ({len(names)}) wurden mit anderen Einstellungen erzeugt ({d}) "
+                f"und werden nicht neu erzeugt: {shown}"
             )
 
     # ------------------------------------------------------------------ Hauptablauf
@@ -762,6 +778,7 @@ class Converter:
                 )
             # Ist-Zustand in die XML-Dateien uebertragen (M01.XML bereits umgewandelter Clips, MEDIAPRO.XML)
             self._heal_target(plans, out_root)
+            self._prewrite_clip_xml(plans, out_root)
             self._write_mediapro()
 
             self._t0 = time.time()

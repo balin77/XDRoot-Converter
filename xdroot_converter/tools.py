@@ -214,8 +214,11 @@ def run_capture(
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             pass
-        t1.join(timeout=5)
-        t2.join(timeout=5)
+        # Lesethreads: nach Prozessende kommt die Restausgabe sofort; haelt ein Enkelprozess die Pipe offen,
+        # nicht ewig warten
+        end = time.monotonic() + 3
+        t1.join(timeout=max(0.0, end - time.monotonic()))
+        t2.join(timeout=max(0.0, end - time.monotonic()))
     finally:
         if cancel is not None:
             cancel.unregister(proc)
