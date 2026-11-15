@@ -161,6 +161,7 @@ class Partition:
     body_sid: int = 0
     operational_pattern: bytes = b""
     essence_containers: list = field(default_factory=list)
+    pre_fill: int = 0           # Bytes KLV-Fill zwischen Partition Pack und Primer (KAG > 1)
 
     @property
     def pack_end(self) -> int:
@@ -168,8 +169,10 @@ class Partition:
 
     @property
     def meta_offset(self) -> int:
-        """Beginn der Header-Metadaten (direkt hinter dem Partition Pack)."""
-        return self.pack_end
+        """Beginn der Header-Metadaten = Primer Pack.  HeaderByteCount zaehlt ab dem Primer-Key;
+        zwischen Partition Pack und Primer kann ein KLV-Fill bis zur KAG-Grenze stehen
+        (libMXF ueberspringt ihn mit mxf_read_next_nonfiller_kl)."""
+        return self.pack_end + self.pre_fill
 
     @property
     def complete(self) -> bool:
@@ -178,6 +181,22 @@ class Partition:
 
 def _is_partition_key(key: bytes) -> bool:
     return key[:13] == _PARTITION_PREFIX and key[13] in (2, 3, 4) and key[14] in (1, 2, 3, 4) and key[15] == 0
+
+
+def _skip_fill(f, pos: int) -> int:
+    """Gesamtgroesse der KLV-Fill-Elemente ab ``pos`` (0, wenn dort gleich ein anderer Key steht)."""
+    total = 0
+    for _ in range(64):
+        f.seek(pos + total)
+        head = f.read(16 + 9)
+        if len(head) < 17 or not _is_fill(head[:16]):
+            break
+        try:
+            ln, nb = read_ber(head, 16)
+        except MxfParseError:
+            break
+        total += 16 + nb + ln
+    return total
 
 
 def _read_partition(f, offset: int) -> Partition:
@@ -203,12 +222,13 @@ def _read_partition(f, offset: int) -> Partition:
     ecs = []
     if isz == 16 and 88 + cnt * 16 <= len(v):
         ecs = [v[88 + 16 * i:104 + 16 * i] for i in range(cnt)]
+    pre_fill = _skip_fill(f, offset + 16 + nb + ln) if hbc > 0 else 0
     return Partition(
         offset=offset, key=key, kind={2: "header", 3: "body", 4: "footer"}[key[13]], status=key[14],
         ber_size=nb, value_len=ln, major=major, minor=minor, kag_size=kag, this_partition=this,
         previous_partition=prev, footer_partition=footer, header_byte_count=hbc,
         index_byte_count=ibc, index_sid=index_sid, body_offset=body_offset, body_sid=body_sid,
-        operational_pattern=op, essence_containers=ecs)
+        operational_pattern=op, essence_containers=ecs, pre_fill=pre_fill)
 
 
 def _rip_offsets(f, size: int) -> Optional[list[int]]:
@@ -239,6 +259,13 @@ def find_partitions(path: Union[str, Path]) -> list[Partition]:
 
 
 def _find_partitions_f(f) -> list[Partition]:
+    return _find_partitions_ex(f)[0]
+
+
+def _find_partitions_ex(f) -> tuple:
+    """(Partitionen, vollstaendig).  ``vollstaendig`` ist False, wenn weder ein RIP vorhanden ist
+    noch der Header-Pack einen FooterPartition-Offset hat (offener Header, z. B. nach
+    Stromausfall): dann sind nur Partitionen gesichert, die man nicht auffinden kann."""
     f.seek(0, 2)
     size = f.tell()
     first = _read_partition(f, 0)       # Datei muss mit dem Header-Partition-Pack beginnen
@@ -246,6 +273,7 @@ def _find_partitions_f(f) -> list[Partition]:
         raise MxfParseError("erste Partition ist keine Header-Partition")
     offs = _rip_offsets(f, size)
     parts: list[Partition] = []
+    complete = True
     if offs:
         try:
             parts = [first if o == 0 else _read_partition(f, o) for o in sorted(set(offs))]
@@ -255,6 +283,7 @@ def _find_partitions_f(f) -> list[Partition]:
             parts = []
     if not parts:
         parts = [first]
+        complete = bool(first.footer_partition)
         if first.footer_partition and first.footer_partition < size:
             chain = []
             cur = first.footer_partition
@@ -271,7 +300,7 @@ def _find_partitions_f(f) -> list[Partition]:
     for p in parts:
         if p.this_partition != p.offset:
             raise MxfParseError("ThisPartition (%d) passt nicht zum Offset (%d)" % (p.this_partition, p.offset))
-    return parts
+    return parts, complete
 
 
 # --------------------------------------------------------------------------- Datenmodell
@@ -620,10 +649,14 @@ def patch_header(path: Union[str, Path], edit: Callable[[HeaderMetadata], list],
     path = Path(path)
     try:
         with open(path, "rb") as f:
-            parts = _find_partitions_f(f)
+            parts, complete = _find_partitions_ex(f)
             regions = [(p, _read_region(f, p)) for p in parts if p.header_byte_count > 0]
     except MxfParseError as e:
         raise HeaderPatchError("MXF-Struktur nicht lesbar: %s" % e) from e
+    if not complete:
+        raise HeaderPatchError(
+            "Partitionen nicht vollstaendig auffindbar (kein RIP und FooterPartition = 0, offener Header): "
+            "Datei wird nicht veraendert")
     if not regions:
         raise HeaderPatchError("Datei enthaelt keine Header-Metadaten")
     msgs: list = []
@@ -944,6 +977,9 @@ def _adopt_identification(tgt: HeaderMetadata, src: HeaderMetadata, log: list) -
             log.append("Identification.%s: %s -> %s" % (f, _show(f, cur), _show(f, want)))
 
 
+_ESSENCE_KINDS = ("picture", "sound", "data")
+
+
 def _pairs(tp: PackageView, sp: PackageView) -> list:
     """(Ziel-Track, Quell-Track oder None): nach Art und laufender Nummer innerhalb der Art."""
     out = []
@@ -951,6 +987,74 @@ def _pairs(tp: PackageView, sp: PackageView) -> list:
         tl, sl = tp.kind_tracks(kind), sp.kind_tracks(kind)
         for i, t in enumerate(tl):
             out.append((t, sl[i] if i < len(sl) else None))
+    return out
+
+
+def _fmt_nums(tracks: list) -> str:
+    return ", ".join("0x%08x" % (t.track_number or 0) for t in tracks)
+
+
+def _pairs_file(tp: PackageView, sp: PackageView, log: list) -> list:
+    """Paarung der Tracks des File Source Packages.  Essenz-Tracks (Bild/Ton/Daten) werden ueber
+    die TrackNumber gepaart, wenn in Quelle und Ziel alle Nummern der Art != 0 und eindeutig sind
+    und die Mengen uebereinstimmen; sonst nach Position je Art (bei mehreren Spuren mit WARNUNG)."""
+    out = []
+    for kind in KINDS:
+        tl, sl = tp.kind_tracks(kind), sp.kind_tracks(kind)
+        pairs = None
+        if kind in _ESSENCE_KINDS and tl and sl:
+            tn, sn = [t.track_number for t in tl], [s.track_number for s in sl]
+            usable = all(tn) and all(sn) and len(set(tn)) == len(tn) and len(set(sn)) == len(sn)
+            if usable and set(tn) == set(sn):
+                by_num = {s.track_number: s for s in sl}
+                pairs = [(t, by_num[t.track_number]) for t in tl]
+            elif usable and (len(tl) > 1 or len(sl) > 1):
+                log.append("WARNUNG: File Package, %s: TrackNumbers von Quelle (%s) und Ziel (%s) passen nicht "
+                           "zusammen - Spuren werden nach Position gepaart" % (kind, _fmt_nums(sl), _fmt_nums(tl)))
+        if pairs is None:
+            pairs = [(t, sl[i] if i < len(sl) else None) for i, t in enumerate(tl)]
+        out.extend(pairs)
+    return out
+
+
+def _pairs_material(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: Structure,
+                    fp_pairs: list) -> list:
+    """Paarung der Material-Package-Tracks: Essenz-Tracks ueber ihre SourceClips (SourceTrackID ->
+    File-Package-Track -> dessen Quell-Partner -> Material-Track der Quelle, der darauf verweist);
+    Rueckfall (und alle anderen Arten): Position je Art."""
+    tp, sp = ts.material, ss.material
+    fp_by_id = {t.track_id: t for t in ts.file.tracks}
+    partner = {id(t.set): s for t, s in fp_pairs}
+    # Quelle: (File-Package-Track-ID der Quelle) -> Material-Track
+    src_mp: dict = {}
+    for st in sp.tracks:
+        for c in st.clips:
+            if src.get(c, "SourceClip.SourcePackageID") == ss.file.uid:
+                src_mp.setdefault(src.u32(c, "SourceClip.SourceTrackID"), []).append(st)
+    out = []
+    for kind in KINDS:
+        tl, sl = tp.kind_tracks(kind), sp.kind_tracks(kind)
+        pairs = None
+        if kind in _ESSENCE_KINDS and tl and sl:
+            cand = []
+            for t in tl:
+                found = None
+                for c in t.clips:
+                    if tgt.get(c, "SourceClip.SourcePackageID") != ts.file.uid:
+                        continue
+                    ft = fp_by_id.get(tgt.u32(c, "SourceClip.SourceTrackID"))
+                    fs = partner.get(id(ft.set)) if ft is not None else None
+                    if fs is not None:
+                        lst = src_mp.get(fs.track_id, [])
+                        if len(lst) == 1 and lst[0].kind == kind:
+                            found = lst[0]
+                        break
+                cand.append(found)
+            if all(x is not None for x in cand) and len({id(x.set) for x in cand}) == len(cand):
+                pairs = list(zip(tl, cand))
+        if pairs is None:
+            pairs = [(t, sl[i] if i < len(sl) else None) for i, t in enumerate(tl)]
+        out.extend(pairs)
     return out
 
 
@@ -964,8 +1068,8 @@ def _adopt_tracks(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: S
         if len(tp.kind_tracks("sound")) != len(sp.kind_tracks("sound")):
             raise HeaderPatchError("Anzahl Tonspuren weicht ab (%s: Quelle %d, Ziel %d)" % (
                 what, len(sp.kind_tracks("sound")), len(tp.kind_tracks("sound"))))
-    fp_pairs = _pairs(ts.file, ss.file)
-    mp_pairs = _pairs(ts.material, ss.material)
+    fp_pairs = _pairs_file(ts.file, ss.file, log)
+    mp_pairs = _pairs_material(tgt, src, ts, ss, fp_pairs)
     sound_map = {id(t.set): s for t, s in fp_pairs if t.kind == "sound" and s is not None}
     fp_old = {t.track_id: t for t in ts.file.tracks}
     # --- File Package zuerst, dann Material Package (unzugeordnete MP-Tracks erben ggf. die FP-ID)
@@ -1002,7 +1106,7 @@ def _adopt_tracks(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: S
     fp_map: dict = {}
     mp_map: dict = {}
     for pkg, store, mp, label in ((ts.file, fp_new, fp_map, "File Package"), (ts.material, mp_new, mp_map, "Material Package")):
-        spairs = dict((id(t.set), s) for t, s in _pairs(pkg, ss.file if pkg is ts.file else ss.material))
+        spairs = dict((id(t.set), s) for t, s in (fp_pairs if pkg is ts.file else mp_pairs))
         id_changes: list = []
         name_changes: list = []
         for t in pkg.tracks:

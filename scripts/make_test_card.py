@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Erzeugt eine synthetische Sony-XDROOT-Karte mit XAVC-I (AVC-Intra Class 100, 1080p50).
 
-Aufruf:  python scripts/make_test_card.py [zielordner] [--clips 2] [--seconds 2]
+Aufruf:  python scripts/make_test_card.py [zielordner] [--clips 2] [--seconds 2] [--kag1]
+
+Die Quell-MXF werden standardmaessig mit KAG 512 (raw2bmx --kag-size-512) erzeugt, weil echte
+Sony-Dateien sehr wahrscheinlich KAG 512 nutzen (KLV-Fill zwischen Partition Pack und Primer);
+--kag1 waehlt stattdessen KAG 1 ab.  --kag512 (Standard) bleibt als Alias erhalten.
 
 Standardziel: _test_out/synth_card.  Es entsteht <zielordner>/XDROOT/ mit Clip/, Take/, Sub/,
 Edit/, General/, Thmbnl/, UserData/, MEDIAPRO.XML, CUEUP.XML, DISCMETA.XML.
@@ -264,8 +268,8 @@ def wrap_clip(out: Path, video: Path, wavs: list[Path], anc: Path, start_tc: str
               mp_uid: str, fp_uid: str, create_date: str, prod_info: list[str], extra: list[str]) -> str:
     args = [tool("raw2bmx"), "-t", "op1a", "-o", out, "-f", FPS, "-y", start_tc,
             "--mp-uid", mp_uid, "--fp-uid", fp_uid, "--dur", frames, "--aes-3",
-            "--create-date", create_date, "--prod-info", *prod_info,
-            "--signal-std", "st274", "--color-siting", "cositing", *extra,
+            "--create-date", create_date, "--prod-info", *prod_info, *extra,
+            "--signal-std", "st274", "--color-siting", "cositing",
             "--avci100_1080p", video]
     for w in wavs:
         args += ["--locked", "true", "--audio-ref", "0", "--wave", w]
@@ -323,6 +327,11 @@ def main() -> int:
     ap.add_argument("target", nargs="?", default="_test_out/synth_card")
     ap.add_argument("--clips", type=int, default=2, help="Anzahl gelisteter Clips (Standard 2)")
     ap.add_argument("--seconds", type=float, default=2, help="Laenge je Clip in Sekunden (Standard 2)")
+    kag = ap.add_mutually_exclusive_group()
+    kag.add_argument("--kag512", dest="kag512", action="store_true", default=True,
+                     help="Quell-MXF mit KAG 512 erzeugen (Standard, wie vermutlich echte Sony-Dateien)")
+    kag.add_argument("--kag1", dest="kag512", action="store_false",
+                     help="Quell-MXF mit KAG 1 erzeugen (statt des Standards KAG 512)")
     ap.add_argument("--unlisted-no-xml", action="store_true",
                     help="nicht gelisteter Clip (PDW F5_0099) bekommt keine M01.XML (Standard: mit M01.XML)")
     a = ap.parse_args()
@@ -365,7 +374,8 @@ def main() -> int:
         else:
             v = first_video
         out = xr / "Clip" / f"{name}.MXF"
-        wrap_clip(out, v, wavs, anc, start_tc, frames, mp, fp, create_date, prod_info, [])
+        wrap_clip(out, v, wavs, anc, start_tc, frames, mp, fp, create_date, prod_info,
+                  ["--kag-size-512"] if a.kag512 else [])
         sonyfy_header(out)
         print(f"Clip {name}.MXF  start_tc={start_tc}  frames={frames}  listed={listed}")
         if not listed and not a.unlisted_no_xml:
