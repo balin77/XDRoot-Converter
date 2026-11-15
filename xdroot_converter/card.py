@@ -269,10 +269,16 @@ def patch_clip_xml(data: bytes, new_codec: str) -> tuple[bytes, bool]:
 # --------------------------------------------------------------------------- Dateien
 
 
+def is_clip_mxf_name(name: str) -> bool:
+    """Ist ``name`` eine Clip-MXF?  Dateien, deren Name mit '.' beginnt (macOS-AppleDouble ``._NAME.MXF`` u. a.),
+    sind keine Clips: sie werden wie jede andere Begleitdatei 1:1 kopiert."""
+    return not name.startswith(".") and name.upper().endswith(".MXF")
+
+
 def list_clip_mxf(xdroot: Path) -> list[Path]:
     clip_dir = xdroot / "Clip"
     return sorted(
-        (p for p in clip_dir.iterdir() if p.is_file() and p.suffix.upper() == ".MXF"),
+        (p for p in clip_dir.iterdir() if p.is_file() and is_clip_mxf_name(p.name)),
         key=lambda p: p.name.casefold(),
     )
 
@@ -481,7 +487,7 @@ def copy_structure(
         for fn in fnames:
             if cancel_check:
                 cancel_check()
-            if top == "clip" and fn.upper().endswith(".MXF"):
+            if top == "clip" and is_clip_mxf_name(fn):
                 continue
             if skip_xml and not rel.parts and fn.upper() == "MEDIAPRO.XML":
                 continue

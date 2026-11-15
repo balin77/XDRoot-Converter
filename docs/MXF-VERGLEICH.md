@@ -1,4 +1,4 @@
-# MXF-Kopfdaten-Vergleich (Runde 2, Stand nach den Fix-Runden)
+# MXF-Kopfdaten-Vergleich (Runde 2, Stand nach den Fix-Runden, neu gemessen)
 
 > **Wichtig zur Beleglage (bitte zuerst lesen)**
 >
@@ -22,12 +22,15 @@
 > eine Aussage über Sony.
 >
 > Die auf der echten Hardware offenen Prüfungen stehen in Abschnitt 6 („Was der Autor lokal prüfen muss“).
+>
+> Zahlen und Tabellen unten wurden mit einer frisch erzeugten Testkarte neu gemessen (Linux, bmx 1.6, Ziel jetzt **KAG 512**,
+> `--head-fill 65536`). Die Zahl der Abweichungen (117 / 30 / 45) ist gegenüber der letzten Messung unverändert.
 
 ## 1. Methode und Befehle
 
 ```
 # Testkarte (Quelle ist "Sony-aehnlich": Track-IDs 2/3..10/11, Identification Sony/"Mem "/2.00;
-# Standard KAG 512, --kag1 waehlt KAG 1)
+# Standard KAG 512, --kag1 waehlt KAG 1; das Ziel uebernimmt das KAG der Quelle)
 python scripts/make_test_card.py _test_out/synth_card
 
 # Umwandlung (Runde 2: Kopfdaten werden aus der Quell-MXF uebernommen)
@@ -51,7 +54,8 @@ mxf2raw -i <datei>.MXF
 ```
 
 Ablauf in der Umwandlung: `raw2bmx --prod-info <Company> <Product> 0.0.0.0.0 <VersionString> <UID>` (Werte aus der
-Quell-MXF, Rückfall Sony / `Mem ` / 2.00 / `cede1104-8280-11de-8a39-08004678031c`), danach
+Quell-MXF, Rückfall Sony / `Mem ` / 2.00 / `cede1104-8280-11de-8a39-08004678031c`), `--kag-size-512` (wenn die Quelle KAG 512 hat),
+`--head-fill 65536` (Fill-Reserve in der Header-Region) und `--seq-off` (aus der Quelle), danach
 `mxfheader.adopt_from_source(ziel, quelle)` (Python-Patcher, schreibt die Header-Metadaten in place,
 Länge der Header-Region bleibt unverändert, alle Offsets bleiben gültig), danach die Prüfung
 (`verify.check_clip(..., source=quelle)` = bisherige Prüfungen + `mxfheader.compare_with_source` +
@@ -62,7 +66,7 @@ mxf2raw-Felder).
 Grundlage: Vergleich Quelle (**synth.**, Sony-ähnlich, KAG 512) gegen Ausgabe Version 1 (`--no-sony-header`: 117 Abweichungen in
 45 Sätzen) bzw. Runde 2 (Standard, ohne eingebettetes XML: 30 Abweichungen in 3 Sätzen, alle im Video-Deskriptor; mit
 `--embed-xml always` 45 Abweichungen in 10 Sätzen, die zusätzlichen 15 sind das gewollte TextObject, siehe Abschnitt 4).
-Zahlen gemessen am Stand nach den Fix-Runden (Linux, bmx 1.6).
+Zahlen neu gemessen (Linux, bmx 1.6, 3-Clip-Testkarte, ein Clip verglichen).
 
 | Bereich | bmx-Version 1 | Runde 2 | Status | Begründung |
 |---|---|---|---|---|
@@ -81,8 +85,9 @@ Zahlen gemessen am Stand nach den Fix-Runden (Linux, bmx 1.6).
 | TextObject `mime_type` | `application/xml` | `text/xml` (bzw. Wert der Quelle) | behoben | Patcher; in raw2bmx nicht setzbar |
 | TextObject `description` | bmx-Wert | leer wie FX6 (bzw. Wert der Quelle) | behoben | Patcher |
 | Video-Deskriptor | MPEG-Video-Deskriptor (**synth.** Quelle; Art des Sets bei der echten F55 ungeprüft) | `CDCIEssenceDescriptor` + `AVCSubDescriptor`, `PictureEssenceCoding` `…0d.04010202.01316001`, StoredHeight 1088 u. a. | bewusst belassen | das ist der Zweck der Umwandlung (XAVC-L); entspricht der FX6-Referenz (`stored_height 1088`, `display_x/y_offset 0`). Die synth. Quelle hat 1080, die **echte F55 laut `mxf2raw` 1088**, dort wird dieser Unterschied also nicht auftreten |
-| Partitionslayout / Index / KAG | Header, Essenz-Body, Index-Body, Footer (bmx), KAG 1 | unverändert (Patcher verschiebt nichts), **KAG 1** | bewusst belassen, echte Sony-Werte **nicht geprüft** | `mxf2raw` zeigt das Layout nicht. Die synth. Quelle hat KAG 512 und die Reihenfolge Index vor Essenz (Generator), das Ziel KAG 1 und Essenz vor Index (so schreibt `raw2bmx` hier); beides ist kein Beleg für Sony. Der Patcher *liest und schreibt* KAG 512 (Fill zwischen Partition Pack und Primer bleibt byte-genau), setzt aber den KAG-Wert des Ziels nicht um |
-| KLV-Fill (Padding) | bmx-Größen | nur der letzte Fill der Header-Region wird gekürzt/verlängert; bei KAG > 1 bleibt der Fill vor dem Primer unverändert | bewusst belassen | hält `HeaderByteCount` und alle Offsets/Indizes stabil; Sony-Fill-Größen sind unbekannt |
+| Partitionslayout / Index / KAG | Header, Essenz-Body, Index-Body, Footer (bmx), KAG 1 | unverändert (Patcher verschiebt nichts), **KAG wie die Quelle (hier 512)** | bewusst belassen, echte Sony-Werte **nicht geprüft** | `mxf2raw` zeigt das Layout nicht. Die synth. Quelle hat KAG 512 und die Reihenfolge Index vor Essenz (Generator), das Ziel dank `--kag-size-512` ebenfalls KAG 512, aber Essenz vor Index (so schreibt `raw2bmx` hier); beides ist kein Beleg für Sony. Der Patcher *liest und schreibt* KAG 512 (Fill zwischen Partition Pack und Primer bleibt byte-genau) |
+| KLV-Fill (Padding) | bmx-Größen | `--head-fill 65536` reserviert Platz; nur der letzte Fill der Header-Region wird gekürzt/verlängert (hier nach dem Patchen 364 Byte gegen 176 Byte in der Quelle); bei KAG > 1 bleibt der Fill vor dem Primer unverändert | bewusst belassen | hält `HeaderByteCount` und alle Offsets/Indizes stabil; Sony-Fill-Größen sind unbekannt |
+| MXFDump-Warnung „Length is zero“ | – | bei KAG 512 gelegentlich „Warning : Length is zero (following KLVFill key …)“ für Füll-KLVs in der Essenz | bekannt, harmlos | Lücke von genau 20 Byte, stammt aus bmx/libMXF; gültiges KLV, `mxf2raw` und `ffmpeg` lesen fehlerfrei. Gemessen: bei 2-s-Clips (6 Dateien, Quelle und Ziel) nie, bei einem von zwei 20-s-Zielclips dreimal. Die Quelle (bmx erzeugt) zeigte sie in keiner Messung |
 | Footer-Partition | keine Header-Metadaten im Footer | gleich | nicht nötig | der Patcher bearbeitet alle Partitionen mit `HeaderByteCount > 0` (hier nur die Header-Partition) |
 | Sony-eigene Sets / weitere Items echter Dateien | – | nicht übernommen | nicht geprüft | ohne MXFDump-Ausgabe echter Dateien nicht beurteilbar (siehe Hinweis oben) |
 | Timecode-Track (ID, Name) | 901 / `TC1` | wie Quelle (ID 1) | behoben (für synth. Quelle) | Patcher paart nach Art und Reihenfolge |
@@ -125,7 +130,7 @@ Unterschieden nur Zeitstempel, Generation-UID und das TextObject.
 
 ## 4. Generierter Vergleichsbericht (Quelle synthetisch, gekürzt)
 
-Erzeugt mit `scripts/mxf_vergleich.py` am Stand nach den Fix-Runden (Ausschnitte; der vollständige Bericht hat rund 1150 Zeilen). Die Quell-Spalte ist **synthetisch**. Alle nicht aufgeführten
+Erzeugt mit `scripts/mxf_vergleich.py`, neu gemessen (Ausschnitte; der vollständige Bericht hat rund 1100 Zeilen). Die Quell-Spalte ist **synthetisch**. Alle nicht aufgeführten
 Sätze (Preface, ContentStorage, EssenceContainerData, Material Package inkl. Tracks/Sequences/SourceClips, File Package inkl.
 Tracks, 8 Sound-Deskriptoren, ANC-Deskriptor) sind in Quelle und Ziel identisch.
 
@@ -179,13 +184,13 @@ Abweichungen Quelle ≠ Ziel (Standardlauf ohne eingebettetes XML): **30** in 3 
 
 | # | Art | Status | KAG | Header-Metadaten | BodySID | IndexSID |
 |---|---|---|---|---|---|---|
-| 0 | header | 4 | 1 | ja | 0 | 0 |
-| 1 | body | 4 | 1 | nein | 2 | 0 |
-| 2 | body | 4 | 1 | nein | 0 | 1 |
-| 3 | footer | 4 | 1 | nein | 0 | 0 |
+| 0 | header | 4 | 512 | ja | 0 | 0 |
+| 1 | body | 4 | 512 | nein | 2 | 0 |
+| 2 | body | 4 | 512 | nein | 0 | 1 |
+| 3 | footer | 4 | 512 | nein | 0 | 0 |
 
-Laut MXFDump (Partition Packs): Quelle `Header (KAG 512, Header-Metadaten ja, BodySID 0, IndexSID 0); Body (KAG 512, Header-Metadaten nein, BodySID 0, IndexSID 1); Body (KAG 512, Header-Metadaten nein, BodySID 2, IndexSID 0); Footer (KAG 512, Header-Metadaten nein, BodySID 0, IndexSID 0)`; Ziel `Header (KAG 1, Header-Metadaten ja, BodySID 0, IndexSID 0); Body (KAG 1, Header-Metadaten nein, BodySID 2, IndexSID 0); Body (KAG 1, Header-Metadaten nein, BodySID 0, IndexSID 1); Footer (KAG 1, Header-Metadaten nein, BodySID 0, IndexSID 0)`.
-MXFDump meldet für Quelle und Ziel keine Auffälligkeiten (keine Zeilen mit error/warning/invalid/unexpected/mismatch);
+Laut MXFDump (Partition Packs): Quelle `Header (KAG 512, Header-Metadaten ja, BodySID 0, IndexSID 0); Body (KAG 512, Header-Metadaten nein, BodySID 0, IndexSID 1); Body (KAG 512, Header-Metadaten nein, BodySID 2, IndexSID 0); Footer (KAG 512, Header-Metadaten nein, BodySID 0, IndexSID 0)`; Ziel `Header (KAG 512, Header-Metadaten ja, BodySID 0, IndexSID 0); Body (KAG 512, Header-Metadaten nein, BodySID 2, IndexSID 0); Body (KAG 512, Header-Metadaten nein, BodySID 0, IndexSID 1); Footer (KAG 512, Header-Metadaten nein, BodySID 0, IndexSID 0)`.
+MXFDump meldet für Quelle und Ziel dieser 2-s-Testkarte keine Auffälligkeiten (keine Zeilen mit error/warning/invalid/unexpected/mismatch; zur „Length is zero“-Warnung bei längeren Clips siehe Abschnitt 2);
 die Satzzählung von MXFDump stimmt mit dem eigenen Parser überein.
 
 ### 4.3 Identification
@@ -268,9 +273,9 @@ Klasse: `AES3AudioDescriptor`
 ## 5. Grenzen
 
 - Quelle des Vergleichs ist eine synthetische Datei; sie bestätigt die **Mechanik** (Track-IDs, Verweise, Strings, Deskriptor-Items
-  werden konsistent geändert; KAG 512 wird gelesen und geschrieben; MXFDump und mxf2raw lesen das Ergebnis ohne Auffälligkeiten;
+  werden konsistent geändert; KAG 512 wird gelesen und geschrieben; mxf2raw und ffmpeg lesen das Ergebnis ohne Auffälligkeiten, MXFDump bis auf die harmlose „Length is zero“-Warnung bei längeren Clips (Abschnitt 2);
   ffmpeg dekodiert es vollständig), nicht den Inhalt echter Sony-Dateien.
-- Das Ziel hat KAG 1 (so schreibt `raw2bmx`); ob Sony-XAVC-L (FX6) und XAVC-I (F55) KAG 512 nutzen, ist nicht belegt (`mxf2raw` zeigt es nicht).
+- Das Ziel übernimmt das KAG der Quelle (512 mit `--kag-size-512`; bei KAG 1 der Quelle bmx-Standard); ob Sony-XAVC-L (FX6) und XAVC-I (F55) tatsächlich KAG 512 nutzen, ist nicht belegt (`mxf2raw` zeigt es nicht) – `--mxf-info` auf einen echten Clip klärt das (Abschnitt 6). Nicht-nachbildbare KAG-Werte (weder 1 noch 512) werden mit Hinweis auf KAG 1 gesetzt.
 - Nicht geprüft: Verhalten von Schnittprogrammen und Sony-Software mit den Dateien.
 
 ## 6. Was der Autor lokal prüfen muss
@@ -282,9 +287,10 @@ Mit den echten Dateien (lokal, Pfade nach Bedarf einsetzen; Berichte enthalten k
    ```
    python -m xdroot_converter.cli --mxf-info <F55-Clip.MXF>
    ```
-   Zu prüfen: Wird die Datei fehlerfrei gelesen? KAG (Partitionsliste oben in der Ausgabe), Track-IDs, Track-Namen,
-   Items der Sound-Deskriptoren (z. B. `SequenceOffset`, `AvgBps`), Art des Video-Deskriptor-Sets, Sony-eigene Sets.
-2. **Umwandlung der F5-Testkarte und Prüfung gegen die Quelle**
+   Zu prüfen: Wird die Datei fehlerfrei gelesen? KAG (Partitionsliste oben in der Ausgabe), Track-IDs (auch der Timecode-Track),
+   Track-Namen, Items der Sound-Deskriptoren (z. B. `SequenceOffset`, `AvgBps`), Art des Video-Deskriptor-Sets, Sony-eigene Sets,
+   Anzahl der Identifications. Vor dem Weitergeben Seriennummern/UMIDs/Pfade entfernen.
+2. **Umwandlung der F5-Testkarte und Prüfung gegen die Quelle** (inkl. Toninhalts-Vergleich je Spur)
    ```
    python -m xdroot_converter.cli <F5-Testkarte> <Ziel-Ordner>
    python -m xdroot_converter.cli --verify <Ziel-Ordner> --source <F5-Testkarte> --deep

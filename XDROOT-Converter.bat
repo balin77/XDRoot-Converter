@@ -26,7 +26,7 @@ set "PYMODE=python"
 rem GUI ohne Konsolenfenster starten, dieses Fenster schliesst sich danach
 if "%PYMODE%"=="py" goto :startpy
 set "PYW="
-for /f "delims=" %%i in ('python -c "import sys,os;print(os.path.join(os.path.dirname(sys.executable),'pythonw.exe'))"') do set "PYW=%%i"
+for /f "delims=" %%i in ('where python') do if not defined PYW set "PYW=%%~dpipythonw.exe"
 if not defined PYW goto :startconsole
 if not exist "%PYW%" goto :startconsole
 start "" "%PYW%" -m xdroot_converter

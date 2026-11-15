@@ -85,13 +85,16 @@ Ergebnis laut mxf2raw: `AVC_High_422`, coding_label und ec_label identisch zur F
      (XAVC-I) 1920×1080. Die Bildrate wird aus der Quelle übernommen (25p/50p/29.97p/59.94p
      usw.; GOP = ca. 0,5 s, bei 50p N=24). Clips, die schon Long GOP oder ein anderer Codec
      sind (z. B. `MPEG2HD50…`, 4K-XAVC), werden **unverändert kopiert** und im Log genannt.
-     4K-Umwandlung ist nicht Teil von Version 1.
+     4K-Umwandlung ist nicht Teil von Version 1. Dasselbe gilt für Quellen mit unbekannter Dauer. **Nicht analysierbare**
+     `.MXF`-Dateien (Müll, 0 Byte, abgebrochene Aufnahme) werden unverändert kopiert und mit Warnung gemeldet, sofern im Ziel kein
+     umgewandelter Clip dieses Namens liegt (dann Fehler, Ziel bleibt erhalten). Dateien, deren Name mit `.` beginnt (macOS
+     `._*.MXF`), sind keine Clips und werden wie Begleitdateien kopiert.
    - Transcode + Wrap in einen temporären Ordner im Ziel (`_tmp_xdroot_converter`),
      dann atomar nach `Clip/` verschieben; temporäre Dateien löschen. Große Clips
      (56 GB, 31 min) müssen funktionieren: Video-Elementarstream liegt temporär auf
      der Zielplatte (~12 GB), das ist akzeptiert.
    - Verifizieren: Dauer (Frames) Ziel == Quelle, UMIDs gleich, Start-TC gleich,
-     Anzahl Audiospuren gleich, essence_type `AVC_High_422`. Bei Abweichung: Clip als
+     Anzahl Audiospuren gleich, Toninhalt je Spur gleich (siehe „Tonspuren“ unten), essence_type `AVC_High_422`. Bei Abweichung: Clip als
      fehlgeschlagen markieren, Fehler klar melden.
 4. XML anpassen (textbasiert, damit Formatierung/Namespaces/Zeilenenden der Kamera
    erhalten bleiben – kein Re-Serialisieren mit ElementTree):
@@ -170,6 +173,8 @@ Nur Python-Standardbibliothek (Python 3.11), keine pip-Abhängigkeiten (Tests mi
 - Eingebettetes XML (`--embed-xml`, `--xml-scheme-id`, `--xml-lang und`) funktioniert, wird aber nur eingebettet, wenn die Quelle auch ein TextObject hat (`--embed-xml auto`, Standard). F5/F55-Quellen haben keins.
 - `--create-date` (Format `YYYY-MM-DDThh:mm:ss:qm`) übernimmt das Datum der Quell-Identification; `--signal-std st274`, `--color-siting cositing` werden aus der Quelle abgeleitet.
 - Mit raw2bmx allein (Version 1) nicht erreichbar, seit Runde 2 per Nachbearbeitung gelöst (siehe „Umsetzungsstand Runde 2"): Identification (bmx statt Sony „Mem "), Track-IDs (1001/2001/3001 statt 2,3,…), mime_type des TextObject (`application/xml` statt `text/xml`), TextObject-description.
+- Seit den Fix-Runden zusätzlich an `raw2bmx`: `--kag-size-512` (wenn die Quelle KAG 512 hat; sonst bmx-Standard KAG 1), `--head-fill 65536`
+  (Fill-Reserve für den Patcher) und `--seq-off` (aus der Quelle).
 - ffmpeg braucht `-color_range tv` (sonst markiert x264 den Strom als Full Range).
 - Auf der Testkarte liegen 147 MXF, `MEDIAPRO.XML` listet nur 19. Option `--unlisted skip` bzw. GUI-Haken.
 
@@ -288,24 +293,62 @@ steht bewusst nicht hier; maßgeblich ist die Ausgabe von `python -m unittest di
   erst nach erfolgreicher Neuerzeugung ersetzt.
 - **Fremdes Ziel:** Gehört ein vorhandenes Ziel-XDROOT nicht zur Quelle (andere `systemId`/`mediaId`, fremde Clips/Dateien,
   MXF ohne `MEDIAPRO.XML`), Abbruch vor jeder Änderung. Quelle = Ziel (oder darin enthalten) wird abgelehnt.
-- **Sperre:** `_xdroot_converter.lock` im Zielordner (PID + Startzeit, `O_EXCL`); ein zweiter Lauf bricht ab; eine verwaiste
-  Sperre (Prozess weg oder älter als der letzte Systemstart) wird übernommen.
+- **Sperre:** `_xdroot_converter.lock` im Zielordner (PID + Prozess-Startzeit, `O_EXCL`); ein zweiter Lauf bricht ab; eine verwaiste
+  Sperre (Prozess weg, andere Startzeit oder älter als der letzte Systemstart) wird übernommen.
 - **Strukturprüfung** (`verify.check_structure`): Header-Partition geschlossen, FooterPartition-Offset zeigt auf ein
   Partition Pack, RIP am Dateiende konsistent, Dateigröße = Ende des RIP, Mindestgröße aus Frames × Tonbytes. Erkennt
-  abgeschnittene Clips beim Fortsetzen und in `--verify`; dazu ein Decode-Test am Clip-Ende.
+  abgeschnittene Clips beim Fortsetzen und in `--verify`; dazu ein Decode-Test am Clip-Ende (auch beim Fortsetzen).
 - **Einstellungsdatei** `konvertierung_einstellungen.json` im Zielordner: Einstellungen je fertigem Clip; beim Fortsetzen
-  Warnung bei Abweichung, kein Neuerzeugen.
+  Warnung bei Abweichung, kein Neuerzeugen. Ein Rückfall (ANC-Spur oder eingebettetes XML mussten für den Clip weggelassen werden,
+  `anc_dropped`/`xml_dropped`) wird **je Clip** gemerkt, damit Fortsetzen und `--verify` ihn nicht als Fehler werten; ebenso
+  `--unlisted skip`/`--only` des Laufs.
+- **Ersetzen von Ziel-Clips:** Ein fertiger XAVC-L-Ziel-Clip wird nie durch eine Kopie (z. B. einer als nicht umwandelbar eingestuften
+  Quelle) ersetzt; ein vorhandener Clip wird erst nach erfolgreicher Neuerzeugung ersetzt. `--max-frames` ersetzt keine vollständigen
+  Clips. Verschieben/Ersetzen wird bei gesperrten Dateien (Windows: Virenscanner, Indexdienst) mehrfach wiederholt (`card.replace_retry`).
 - Außerdem: Speicherschätzung vor dem Start, Fortschritt je Clip und gesamt, Strg+C unter Windows (CLI), `--max-frames`-Schutz
   (Testlauf nie über fertige Clips), Ton ≠ Mono/24 Bit/48 kHz nur kopiert, fehlende Nicht-MXF-Dateien sind in `--verify --source`
   Abweichungen.
 
+### Tonspuren
+
+- **Zuordnung:** ffmpeg nummeriert die Audiostreams in der Reihenfolge des Tracks-Arrays des Material Packages, mxf2raw/bmx
+  sortieren anders. `converter.audio_stream_map` ordnet über die Material-Package-Track-ID ausdrücklich zu (`read_audio_order` liest
+  die Reihenfolge aus dem Header der Quelle). Nicht eindeutig (Anzahl abweichend, doppelte/fehlende Track-IDs) → Fehler für den Clip,
+  kein Raten.
+- **Inhaltsvergleich** (`verify.check_audio_content`, in `--verify --source` und im Ablauf): je Tonspur die erste Sekunde von Ziel und
+  Quelle dekodieren und vergleichen; bei Stille weitere Fenster. Abweichung → Meldung, ggf. mit Hinweis auf vertauschte Spuren.
+  Nur mit synthetischem Ton belegt.
+
+### Identification, Header-Details (Ergänzungen)
+
+- Mehrere Identifications in der Quelle: die **erste** ist maßgeblich.
+- `GenerationUID` der Sound-Deskriptoren bleibt die des Ziels; `AvgBps` wie in der Quelle; unbekannte Verweis-Arrays werden nicht
+  übernommen; zusätzliche Timecode-Tracks der Quelle werden mit übernommen.
+
+### KAG und MXFDump-Hinweis
+
+Hat die Quelle KAG 512, hat auch das Ziel KAG 512 (`--kag-size-512`); die frühere Aussage „Ziel hat KAG 1“ gilt nur noch für Quellen
+mit KAG 1. `MXFDump` meldet bei KAG 512 gelegentlich „Warning : Length is zero (following KLVFill key …)“ für Füll-KLVs in der Essenz
+(Lücke von genau 20 Byte; stammt aus bmx/libMXF). Das KLV ist gültig, `mxf2raw` und `ffmpeg` lesen fehlerfrei. Gemessen: bei den
+synthetischen 2-s-Clips nie, bei einem von zwei 20-s-Clips dreimal. Bekannte, harmlose Eigenheit.
+
+### Nicht analysierbare Dateien, fehlende Clips in --verify
+
+- Nicht analysierbare `.MXF`-Dateien: siehe Ablauf Punkt 3. Beobachtet mit Müll- und 0-Byte-Datei: Kopie mit Warnung, Zählung „kopiert“;
+  `--verify` meldet solche Dateien als Struktur-Abweichung (sie sind keine gültige MXF).
+- `--verify --source` meldet im Ziel fehlende Quell-Clips, die weder gelistet sind noch durch die Einstellungsdatei als bewusst
+  übersprungen (`--unlisted skip`/`--only`) belegt sind, als Abweichung. Geprüft: mit Einstellungsdatei nur Hinweis, ohne sie
+  Abweichung.
+
 ### GUI / Start
 
-Abschlussfenster nach jedem Lauf (Fertig / mit Fehlern / abgebrochen / fehlgeschlagen), Rückfrage „Fortsetzen?“ bei vorhandenem
-Ziel, robustes Polling und Schließen während des Laufs. `XDROOT-Converter.bat` sucht Python ≥ 3.11 mit tkinter (`py -3`, dann
+Abschlussfenster nach jedem Lauf (Fertig / mit Fehlern / abgebrochen / fehlgeschlagen) mit Zählzeile, Fehlergrund je Clip und Hinweis
+auf eine unvollständige Zielkarte, Rückfragen beim Start (u. a. „Fortsetzen?“ bei vorhandenem Ziel), Hinweise in der Oberfläche,
+robustes Polling und Schließen während des Laufs. `XDROOT-Converter.bat` sucht Python ≥ 3.11 mit tkinter (`py -3`, dann
 `python`) und zeigt sonst eine Anleitung.
 
 ### Noch nicht belegt
 
-Verhalten gegenüber echten Kameradateien (Parser, Patcher, Prüfungen), Windows-Pfade (.bat, GUI, Sperre, Strg+C), 56-GB-Clips
-(WAV > 4 GB), Schnittprogramme und Sony-Werkzeuge. Siehe `docs/NAECHSTE-SCHRITTE.md`.
+Verhalten gegenüber echten Kameradateien (Parser, Patcher, Prüfungen, Toninhalts-Vergleich mit echtem AES3), Windows-Pfade (.bat, GUI,
+Sperre, Strg+C, Wiederholungen bei gesperrten Dateien), 56-GB-Clips (WAV > 4 GB), Schnittprogramme und Sony-Werkzeuge. Review-Stand:
+drei Runden paralleler Opus-Reviews (Metadaten/MXF, Ablauf/Robustheit, Oberfläche), die dritte ohne grobe Befunde. Siehe `docs/NAECHSTE-SCHRITTE.md`.

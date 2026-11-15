@@ -604,6 +604,40 @@ class VerifyCardMocked(unittest.TestCase):
         rep = self._verify()
         self.assertTrue(any("M01.XML videoCodec" in p and "passt nicht" in p for p in rep.problems), rep.problems)
 
+    def test_unreadable_clip_identical_to_source_is_only_a_note(self):
+        """K1: nicht analysierbare Quelle wird unveraendert kopiert -> kein Clip-Befund, nur Hinweis (nur mit Quelle)."""
+        (self.root / "Clip" / "JUNK.MXF").write_bytes(b"\x01" * 100)
+        src_root = self.tmp / "SRC" / "XDROOT"
+        (src_root / "Clip").mkdir(parents=True)
+        (src_root / "MEDIAPRO.XML").write_bytes(_MP_EMPTY)
+        (src_root / "Clip" / "FX6ENG10562.MXF").write_bytes(b"x")
+        (src_root / "Clip" / "FX6ENG10562M01.XML").write_bytes(self.xml)
+        (src_root / "Clip" / "JUNK.MXF").write_bytes(b"\x01" * 100)
+        info = self.info
+
+        def read(p, cancel=None):
+            if "JUNK" in p:
+                raise RuntimeError("mxf2raw kaputt")
+            return info
+
+        def run(**kw):
+            with mock.patch.object(mxfinfo, "read_mxf_info", side_effect=read), \
+                    mock.patch.object(mxfinfo, "run_ffprobe", return_value=self.probe), \
+                    mock.patch.object(verify, "check_structure", return_value=[]), \
+                    mock.patch.object(verify, "measure_gop", return_value=[24, 24]), \
+                    mock.patch.object(verify, "tail_decode_check", return_value=[]), \
+                    mock.patch.object(verify, "check_audio_content", return_value=[]), \
+                    mock.patch.object(verify, "check_header", return_value=[]):
+                return verify.verify_card(str(self.root), **kw)
+
+        rep = run(source=str(src_root))
+        self.assertEqual(rep.problems, [])
+        self.assertTrue(any("JUNK.MXF: nicht analysierbar, unveraendert uebernommen" in n for n in rep.notes), rep.notes)
+        self.assertEqual((rep.clips_checked, rep.clips_ok), (2, 2))
+        self.assertTrue(any("JUNK.MXF: MXF nicht lesbar" in p for p in run().problems))  # ohne Quelle: nicht belegbar
+        (src_root / "Clip" / "JUNK.MXF").write_bytes(b"\x02" * 100)  # Quelle inzwischen anders -> Abweichung
+        self.assertTrue(any("JUNK.MXF: MXF nicht lesbar" in p for p in run(source=str(src_root)).problems))
+
     def test_structure_problem_reported(self):
         with mock.patch.object(mxfinfo, "read_mxf_info", return_value=self.info), \
                 mock.patch.object(mxfinfo, "run_ffprobe", return_value=self.probe), \
@@ -687,9 +721,10 @@ class CompareFilesMissing(unittest.TestCase):
             if not rel.startswith("Clip/A_0002") or rel.endswith(".BIM"):
                 (self.tgt / rel).write_bytes(b"data " + rel.encode())
 
-    def _run(self):
+    def _run(self, selection=None, has_settings=False):
         rep = verify.VerifyReport()
-        verify._compare_files(self.src, self.tgt, card.MediaPro(), card.MediaPro(), rep)
+        verify._compare_files(self.src, self.tgt, card.MediaPro(), card.MediaPro(), rep,
+                              selection=selection, has_settings=has_settings)
         return rep
 
     def test_all_present_is_clean(self):
@@ -704,20 +739,79 @@ class CompareFilesMissing(unittest.TestCase):
         for rel in ("DISCMETA.XML", "CUEUP.XML", "Take/A_0001U01.SMI", "Thmbnl/A_0001T01.JPG", "Clip/A_0002R01.BIM"):
             self.assertIn(rel, probs)
 
-    def test_skipped_clip_companions_only_a_note(self):
-        # Clip A_0002 fehlt im Ziel (--only / --unlisted skip): MXF, BIM und Thumbnail fehlen bewusst
+    def _drop_a2(self):
         (self.tgt / "Clip" / "A_0002R01.BIM").unlink()
         (self.tgt / "Thmbnl" / "A_0002T01.JPG").unlink()
+
+    def test_unlisted_missing_clip_without_settings_is_deviation(self):
+        """K2: nicht gelisteter, im Ziel fehlender Quell-Clip ist ohne Beleg eine ABWEICHUNG (Companions nur Hinweis)."""
+        self._drop_a2()
         rep = self._run()
-        self.assertEqual(rep.problems, [])
-        self.assertTrue(any("bewusst" in n and "1 Quell-Clip" in n for n in rep.notes), rep.notes)
+        self.assertEqual(len(rep.problems), 1, rep.problems)
+        self.assertIn("Clip/A_0002.MXF", rep.problems[0])
+        self.assertIn("bewusst uebersprungen mit --only/--unlisted skip?", rep.problems[0])
+        self.assertTrue(any("Begleitdatei" in n for n in rep.notes), rep.notes)
+
+    def test_unlisted_missing_clip_with_skip_selection_is_note(self):
+        self._drop_a2()
+        for sel in ({"unlisted": "skip", "only": []}, {"unlisted": "convert", "only": ["A_0001"]}):
+            rep = self._run(selection=sel, has_settings=True)
+            self.assertEqual(rep.problems, [], sel)
+            self.assertTrue(any("bewusst" in n and "1 Quell-Clip" in n for n in rep.notes), rep.notes)
+
+    def test_unlisted_missing_clip_selected_by_only_is_deviation(self):
+        self._drop_a2()
+        rep = self._run(selection={"unlisted": "convert", "only": ["A_0002"]}, has_settings=True)
+        self.assertEqual(len(rep.problems), 1)
+        self.assertIn("nicht bewusst ausgelassen", rep.problems[0])
+        rep = self._run(selection={"unlisted": "convert", "only": []}, has_settings=True)
+        self.assertEqual(len(rep.problems), 1)
+
+    def test_settings_without_selection_is_deviation(self):
+        self._drop_a2()
+        rep = self._run(selection=None, has_settings=True)
+        self.assertEqual(len(rep.problems), 1)
+        self.assertIn("keine Angabe zur Auswahl", rep.problems[0])
+
+    def test_listed_missing_clip_not_reported_twice(self):
+        self._drop_a2()
+        mp = card.MediaPro(materials=[card.Material(uri="./Clip/A_0002.MXF")])
+        rep = verify.VerifyReport()
+        verify._compare_files(self.src, self.tgt, mp, mp, rep)
+        self.assertEqual(rep.problems, [])  # verify_card meldet den Eintrag in MEDIAPRO.XML separat
+
+    def test_selection_record_reads_defensively(self):
+        d = self.tmp / "tdir"
+        d.mkdir()
+        self.assertIsNone(verify._selection_record(d))
+        f = d / verify.SETTINGS_NAME
+        f.write_text("{kaputt", encoding="utf-8")
+        self.assertIsNone(verify._selection_record(d))
+        f.write_text('{"clips": {}}', encoding="utf-8")
+        self.assertIsNone(verify._selection_record(d))
+        f.write_text('{"auswahl": {"unlisted": "skip", "only": ["A", 3, ""]}}', encoding="utf-8")
+        self.assertEqual(verify._selection_record(d), {"unlisted": "skip", "only": ["A"]})
+        f.write_text('{"auswahl": {"unlisted": 5, "only": "x"}}', encoding="utf-8")
+        self.assertEqual(verify._selection_record(d), {"unlisted": "convert", "only": []})
 
     def test_skipped_clip_does_not_excuse_other_files(self):
         (self.tgt / "Clip" / "A_0002R01.BIM").unlink()
         (self.tgt / "Take" / "A_0001U01.SMI").unlink()
         (self.tgt / "Thmbnl" / "A_0001T01.JPG").unlink()
-        probs = self._run().problems
+        probs = self._run(selection={"unlisted": "skip", "only": []}, has_settings=True).problems
         self.assertEqual(len(probs), 2)  # A_0001 ist vorhanden -> seine fehlenden Dateien sind Abweichungen
+
+    def test_dotfile_mxf_is_compared_like_any_file(self):
+        """K1a: '._NAME.MXF' (AppleDouble) ist kein Clip, sondern eine Begleitdatei: Vergleich mit der Quelle."""
+        (self.tgt / "Clip" / "A_0002.MXF").write_bytes(b"x")
+        (self.src / "Clip" / "._A_0001.MXF").write_bytes(b"apple")
+        rep = self._run()
+        self.assertEqual(len(rep.problems), 1)
+        self.assertIn("Clip/._A_0001.MXF: Datei der Quelle fehlt im Ziel", rep.problems[0])
+        (self.tgt / "Clip" / "._A_0001.MXF").write_bytes(b"other")
+        self.assertIn("unterscheidet sich", self._run().problems[0])
+        (self.tgt / "Clip" / "._A_0001.MXF").write_bytes(b"apple")
+        self.assertEqual(self._run().problems, [])
 
 
 if __name__ == "__main__":

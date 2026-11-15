@@ -255,6 +255,19 @@ class Folders(unittest.TestCase):
         self.make_card(src)
         self.assertEqual([p.name for p in card.list_clip_mxf(src)], ["A B.MXF"])
 
+    def test_dotfile_mxf_is_not_a_clip_but_copied(self):
+        """K1a: '._A B.MXF' (macOS-AppleDouble) ist kein Clip; copy_structure kopiert die Datei 1:1."""
+        src = self.tmp / "card" / "XDROOT"
+        self.make_card(src)
+        (src / "Clip" / "._A B.MXF").write_bytes(b"\x00\x05\x16\x07apple")
+        self.assertEqual([p.name for p in card.list_clip_mxf(src)], ["A B.MXF"])
+        self.assertFalse(card.is_clip_mxf_name("._A B.MXF"))
+        self.assertTrue(card.is_clip_mxf_name("a b.mxf"))
+        dst = self.tmp / "out" / "XDROOT"
+        card.copy_structure(src, dst, skip_stems={"a b"})  # selbst bei uebersprungenem Clip 'A B' bleibt sie kopiert
+        self.assertEqual((dst / "Clip" / "._A B.MXF").read_bytes(), b"\x00\x05\x16\x07apple")
+        self.assertFalse((dst / "Clip" / "A B.MXF").exists())
+
 
 class ExistingTarget(unittest.TestCase):
     """G2: ein vorhandenes Ziel muss zur selben Karte gehoeren."""
@@ -275,6 +288,18 @@ class ExistingTarget(unittest.TestCase):
             (self.out / "MEDIAPRO.XML").write_bytes(mp_bytes)
         for n in mxf:
             (self.out / "Clip" / n).write_bytes(b"y")
+
+    def test_dotfile_mxf_in_target_is_not_a_foreign_mxf(self):
+        """K1a: '._*.MXF' im Ziel wird nicht als fremder Clip gewertet (auch ohne MEDIAPRO.XML nicht als MXF gezaehlt)."""
+        (self.src / "Clip" / "._PDW-F55_6753.MXF").write_bytes(b"apple")
+        self._make_target(fixture_bytes("f55_MEDIAPRO.XML"))
+        (self.out / "Clip" / "._ZZZ.MXF").write_bytes(b"apple")
+        card.check_existing_target(self.src, self.out, self.mp)
+        for f in (self.out / "MEDIAPRO.XML", self.out / "Clip" / "PDW-F55_6753.MXF"):
+            f.unlink()
+        (self.out / "Clip" / "._PDW-F55_6753.MXF").write_bytes(b"apple")
+        (self.out / "Clip" / "._ZZZ.MXF").unlink()
+        card.check_existing_target(self.src, self.out, self.mp)  # kein 'MXF ohne MEDIAPRO.XML'
 
     def test_media_id_parsed(self):
         self.assertTrue(self.mp.media_id)

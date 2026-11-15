@@ -423,7 +423,10 @@ class G2_ForeignTarget(RunTestBase):
         s, rep, _ = self.run_conv()
         res = {r.name: r for r in s.results}
         self.assertEqual(res["A.MXF"].status, converter.ST_FAILED)
-        self.assertIn("andere Datei", " ".join(res["A.MXF"].notes))
+        self.assertIn("fremde) Datei", " ".join(res["A.MXF"].notes))
+        self.assertTrue(res["A.MXF"].foreign)
+        self.assertIn("fremde Datei(en) im Ziel", s.incomplete_text())
+        self.assertNotIn("unbrauchbar", s.incomplete_text())
         self.assertEqual(self.out("Clip/A.MXF").read_bytes(), foreign)
         self.assertEqual(res["B.MXF"].status, converter.ST_SKIPPED_DONE)
         self.assertGreater(s.failed, 0)
@@ -871,14 +874,74 @@ class F2_G1_ExistingTargetProtected(RunTestBase):
         self.assertIn("bleibt unveraendert erhalten", s.text())
         self.assertNotIn("unbrauchbar", s.incomplete_text())
 
-    def test_unreadable_source_without_target_is_failed_and_not_copied(self):
+    def test_unreadable_source_without_target_is_copied_unchanged_with_warning(self):
+        """K1b: nicht analysierbare Quelle ohne Ziel-Clip: unveraendert kopieren + WARNUNG, kein Fehler."""
         (self.src / "Clip" / "A.MXF").write_bytes(b"\0" * 64)
+        s, rep, _ = self.run_conv()
+        r = _status(s)["A.MXF"]
+        self.assertEqual(r.status, converter.ST_COPIED)
+        self.assertEqual(s.failed, 0)
+        self.assertEqual(self.out("Clip/A.MXF").read_bytes(), b"\0" * 64)
+        self.assertEqual(s.incomplete_text(), "")
+        self.assertIn("nicht analysierbar, unveraendert kopiert", rep.text("warn"))
+        self.assertTrue(any("WARNUNG" in n for n in r.notes))
+        self.assert_consistent(("B",))
+        self.assertFalse(self.out("Clip/A.MXF" + card.TMP_SUFFIX).exists())
+
+    def test_unreadable_source_second_run_skips_existing_copy(self):
+        (self.src / "Clip" / "A.MXF").write_bytes(b"\0" * 64)
+        self.run_conv()
+        s, rep, _ = self.run_conv()
+        r = _status(s)["A.MXF"]
+        self.assertEqual((r.status, s.failed), (converter.ST_COPIED, 0))
+        self.assertIn("bereits im Ziel vorhanden", " ".join(r.notes))
+        self.assertIn("nicht analysierbar, unveraendert kopiert", rep.text("warn"))
+
+    def test_zero_byte_and_unlisted_junk_are_copied(self):
+        (self.src / "Clip" / "LEER.MXF").write_bytes(b"")
+        (self.src / "Clip" / "JUNK.MXF").write_bytes(os.urandom(300))
+        (self.src / "Clip" / "._A.MXF").write_bytes(os.urandom(100))  # AppleDouble: kein Clip
+        s, rep, _ = self.run_conv()
+        self.assertEqual((s.failed, s.fatal), (0, ""))
+        self.assertEqual({r.name for r in s.results}, {"A.MXF", "B.MXF", "LEER.MXF", "JUNK.MXF"})
+        for n in ("LEER.MXF", "JUNK.MXF", "._A.MXF"):
+            self.assertEqual(self.out(f"Clip/{n}").read_bytes(), (self.src / "Clip" / n).read_bytes(), n)
+        self.assertEqual(_status(s)["LEER.MXF"].status, converter.ST_COPIED)
+        s2, _, _ = self.run_conv()  # zweiter Lauf
+        self.assertEqual((s2.failed, s2.fatal), (0, ""))
+
+    def test_unreadable_source_never_replaces_other_target_file(self):
+        self.run_conv()
+        (self.src / "Clip" / "C.MXF").write_bytes(b"\0" * 64)
+        self.out("Clip/C.MXF").parent.mkdir(exist_ok=True)
+        self.out("Clip/C.MXF").write_bytes(b"irgendwas anderes")
+        s, _, _ = self.run_conv()
+        r = _status(s)["C.MXF"]
+        self.assertEqual(r.status, converter.ST_FAILED)
+        self.assertEqual(self.out("Clip/C.MXF").read_bytes(), b"irgendwas anderes")
+
+    def test_unreadable_source_with_foreign_l_target_is_failed(self):
+        self.run_conv()
+        (self.src / "Clip" / "A.MXF").write_bytes(b"\0" * 64)
+        foreign = b"DST|A|L|FREMD"
+        self.out("Clip/A.MXF").write_bytes(foreign)
         s, _, _ = self.run_conv()
         r = _status(s)["A.MXF"]
-        self.assertEqual(r.status, converter.ST_FAILED)
-        self.assertFalse(r.target_ok)
-        self.assertFalse(self.out("Clip/A.MXF").exists())
-        self.assertIn("fehlen: A.MXF", s.incomplete_text())
+        self.assertEqual((r.status, r.target_ok, r.foreign), (converter.ST_FAILED, False, True))
+        self.assertEqual(self.out("Clip/A.MXF").read_bytes(), foreign)
+
+    def test_disk_estimate_counts_old_target_in_copy_path(self):
+        (self.src / "Clip" / "A.MXF").write_bytes(b"\0" * 64)
+        self.run_conv(only=["B"])
+        self.out("Clip/A.MXF").write_bytes(b"x" * 5000)  # alte, abweichende Datei bleibt bis zum Ersetzen liegen
+        self.fx.free = 200 * 1024 * 1024 + 6000  # reicht fuer 64 Byte + Reserve, nicht fuer + 5000
+        conv = converter.Converter(converter.Options(source=str(self.src), target=str(self.tgt)), Rep())
+        src_root = card.find_xdroot(str(self.src))
+        mp = card.parse_mediapro((src_root / "MEDIAPRO.XML").read_bytes())
+        plans = [p for p in conv.scan(src_root, mp, card.list_clip_mxf(src_root)) if p.name == "A.MXF"]
+        conv._out_root = self.tgt / "XDROOT"
+        with self.assertRaises(RuntimeError):
+            conv._check_disk_space(self.tgt, plans)
 
     def test_copy_path_never_overwrites_finished_l_target(self):
         """Vorher: Clip, der jetzt nicht mehr umgewandelt wird (hier SequenceOffset), ueberschrieb das fertige Ziel."""
@@ -957,12 +1020,22 @@ class F2_G1_AudioMapping(RunTestBase):
     def test_unclear_mapping_is_failed_not_converted_not_copied(self):
         self.fx.audio_order = [101]  # Header meldet nur 1 Sound-Track, mxf2raw 2
         s, rep, _ = self.run_conv()
-        for r in s.results:
-            self.assertEqual(r.status, converter.ST_FAILED)
+        for r in s.results:  # K1d: lesbare Quelle, Zuordnung unklar -> nie umwandeln, ohne Ziel unveraendert kopieren
+            self.assertEqual(r.status, converter.ST_COPIED)
         self.assertEqual(self.fx.transcodes, [])
-        self.assertFalse(self.out("Clip/A.MXF").exists())
-        self.assertIn("Tonspuren", rep.text("error"))
-        self.assertGreater(s.failed, 0)
+        self.assertEqual(self.out("Clip/A.MXF").read_bytes(), (self.src / "Clip" / "A.MXF").read_bytes())
+        self.assertIn("Ton-Zuordnung nicht bestimmbar", rep.text("warn"))
+        self.assertIn("nicht analysierbar, unveraendert kopiert", rep.text("warn"))
+        self.assertEqual(s.failed, 0)
+
+    def test_unclear_mapping_with_finished_target_is_failed_target_ok(self):
+        self.run_conv()
+        before = self.out("Clip/A.MXF").read_bytes()
+        self.fx.audio_order = [101]
+        s, _, _ = self.run_conv()
+        r = _status(s)["A.MXF"]
+        self.assertEqual((r.status, r.target_ok), (converter.ST_FAILED, True))
+        self.assertEqual(self.out("Clip/A.MXF").read_bytes(), before)
 
     def test_ffprobe_audio_count_mismatch_is_failed(self):
         orig = mxfinfo.run_ffprobe
@@ -974,7 +1047,7 @@ class F2_G1_AudioMapping(RunTestBase):
 
         with mock.patch.object(mxfinfo, "run_ffprobe", probe3):
             s, _, _ = self.run_conv()
-        self.assertEqual({r.status for r in s.results}, {converter.ST_FAILED})
+        self.assertEqual({r.status for r in s.results}, {converter.ST_COPIED})
         self.assertEqual(self.fx.transcodes, [])
 
     def test_transcode_uses_mapped_audio_streams(self):
@@ -1069,6 +1142,92 @@ class F2_K2_Lock(RunTestBase):
         with self.assertRaises(converter.TargetBusy):
             converter.acquire_lock(self.tgt)
         converter.release_lock(lock)
+
+
+class K3_LockClockJump(RunTestBase):
+    def test_active_lock_with_matching_pstart_survives_clock_jump(self):
+        """K3: aktive Sperre (gleiche PID + Startzeit) ist auch dann aktiv, wenn 'start' vor dem Systemstart liegt."""
+        mine = converter._proc_start_time(os.getpid())
+        if mine is None:
+            self.skipTest("Prozess-Startzeit auf dieser Plattform nicht ermittelbar")
+        self.tgt.mkdir()
+        (self.tgt / converter.LOCK_NAME).write_text(json.dumps(
+            {"pid": os.getpid(), "start": 1.0, "host": __import__("socket").gethostname(), "pstart": mine}))
+        with mock.patch.object(converter, "_boot_time", lambda: 10 ** 9):
+            with self.assertRaises(converter.TargetBusy):
+                converter.acquire_lock(self.tgt)
+        self.assertTrue((self.tgt / converter.LOCK_NAME).exists())
+
+    def test_boot_check_used_when_pstart_not_determinable(self):
+        self.tgt.mkdir()
+        (self.tgt / converter.LOCK_NAME).write_text(json.dumps(
+            {"pid": os.getpid(), "start": 1.0, "host": __import__("socket").gethostname(), "pstart": 12345}))
+        with mock.patch.object(converter, "_boot_time", lambda: 10 ** 9), \
+                mock.patch.object(converter, "_proc_start_time", lambda pid: None):
+            lock = converter.acquire_lock(self.tgt)
+        self.assertTrue(lock.exists())
+        converter.release_lock(lock)
+
+    def test_lock_that_is_a_directory_gives_clear_message(self):
+        self.tgt.mkdir()
+        (self.tgt / converter.LOCK_NAME).mkdir()
+        with self.assertRaises(converter.TargetBusy) as cm:
+            converter.acquire_lock(self.tgt)
+        self.assertIn("ist ein Ordner", str(cm.exception))
+        self.assertNotIn("Verwaiste", str(cm.exception))
+        self.assertTrue((self.tgt / converter.LOCK_NAME).is_dir())
+
+
+class K4_SettingsFile(RunTestBase):
+    def test_broken_settings_file_is_quarantined_with_warning(self):
+        self.run_conv()
+        f = self.tgt / converter.SETTINGS_NAME
+        f.write_text("{kaputt", encoding="utf-8")
+        s, rep, _ = self.run_conv()
+        bad = self.tgt / (converter.SETTINGS_NAME + ".defekt")
+        self.assertEqual(bad.read_text(encoding="utf-8"), "{kaputt")
+        self.assertIn("defekt", rep.text("warn"))
+        data = json.loads(f.read_text(encoding="utf-8"))  # neue, gueltige Datei (Clips waren schon fertig)
+        self.assertIsInstance(data["clips"], dict)
+        self.assertEqual(s.count(converter.ST_SKIPPED_DONE), 2)
+
+    def test_wrong_structure_is_quarantined_too(self):
+        self.tgt.mkdir()
+        (self.tgt / converter.SETTINGS_NAME).write_text("[1, 2]", encoding="utf-8")
+        s, rep, _ = self.run_conv()
+        self.assertEqual((self.tgt / (converter.SETTINGS_NAME + ".defekt")).read_text(encoding="utf-8"), "[1, 2]")
+
+    def test_selection_of_last_run_is_recorded(self):
+        self.run_conv(unlisted="skip", only=["A"])
+        data = json.loads((self.tgt / converter.SETTINGS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(data["auswahl"], {"unlisted": "skip", "only": ["A"]})
+        self.assertIn("Clip/A.MXF", data["clips"])
+        self.run_conv()
+        data = json.loads((self.tgt / converter.SETTINGS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(data["auswahl"], {"unlisted": "convert", "only": []})
+        self.assertIn("Clip/A.MXF", data["clips"])  # bestehende Struktur bleibt
+
+    def test_no_false_warning_when_kill_happened_before_settings_update(self):
+        """K4a: Kopfdaten wurden nachgezogen, der Eintrag sony_header aber nicht mehr geschrieben (Kill)."""
+        self.run_conv(sony_header=False)
+        s, rep, _ = self.run_conv()  # Ziel besteht die Kopfdaten-Pruefung bereits (Fake: keine Abweichung)
+        self.assertEqual(s.count(converter.ST_SKIPPED_DONE), 2)
+        self.assertNotIn("Kopfdaten-Angleichung", rep.text("warn"))
+        data = json.loads((self.tgt / converter.SETTINGS_NAME).read_text(encoding="utf-8"))
+        self.assertIs(data["clips"]["Clip/A.MXF"]["sony_header"], True)
+
+
+class K5_IncompleteText(unittest.TestCase):
+    def test_mediapro_hint_only_for_listed_clips(self):
+        res = [converter.ClipResult("a.MXF", converter.ST_FAILED, 10, 0, listed=True),
+               converter.ClipResult("u.MXF", converter.ST_FAILED, 10, 0, listed=False)]
+        t = converter.RunSummary(results=res).incomplete_text()
+        self.assertIn("in MEDIAPRO.XML stehen aber: a.MXF", t)
+        self.assertNotIn("u.MXF)", t.split("stehen aber:")[1])
+        only_unlisted = converter.RunSummary(results=[res[1]]).incomplete_text()
+        self.assertNotIn("MEDIAPRO", only_unlisted)
+        only_listed = converter.RunSummary(results=[res[0]]).incomplete_text()
+        self.assertIn("(die Clips stehen aber in MEDIAPRO.XML)", only_listed)
 
 
 class F2_K3_HeaderAdoptedUpdatesSettings(RunTestBase):

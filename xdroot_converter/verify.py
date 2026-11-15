@@ -748,6 +748,39 @@ def _anc_dropped_clips(target_dir: Path) -> dict:
     return out
 
 
+def _same_content(a: Path, b: Path, chunk: int = 4 * 1024 * 1024) -> bool:
+    """Byte-gleich (Groesse + Inhalt, blockweise gelesen); False bei jedem Fehler."""
+    try:
+        if a.stat().st_size != b.stat().st_size:
+            return False
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            while True:
+                x, y = fa.read(chunk), fb.read(chunk)
+                if x != y:
+                    return False
+                if not x:
+                    return True
+    except OSError:
+        return False
+
+
+def _selection_record(target_dir: Path) -> Optional[dict]:
+    """``auswahl`` (``{"unlisted": "skip"|"convert", "only": [...]}``) des letzten Laufs laut
+    ``konvertierung_einstellungen.json`` im Zielordner; None = nicht vorhanden/unlesbar/ohne Auswahl.
+    Defensiv gelesen: unbekannte oder falsch typisierte Felder werden ignoriert."""
+    try:
+        data = json.loads((target_dir / SETTINGS_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    sel = data.get("auswahl") if isinstance(data, dict) else None
+    if not isinstance(sel, dict):
+        return None
+    only = sel.get("only")
+    only = [t for t in only if isinstance(t, str) and t] if isinstance(only, list) else []
+    unlisted = sel.get("unlisted") if sel.get("unlisted") in ("skip", "convert") else "convert"
+    return {"unlisted": unlisted, "only": only}
+
+
 def verify_card(
     target: str,
     source: Optional[str] = None,
@@ -792,6 +825,12 @@ def verify_card(
         except tools.Cancelled:
             raise
         except Exception as e:  # noqa: BLE001
+            if src_root is not None and _same_content(src_root / "Clip" / mxf_path.name, mxf_path):
+                # nicht analysierbare Quelle (Muell, 0 Byte, abgebrochene Aufnahme): der Konverter kopiert sie unveraendert
+                first = (str(e).strip().splitlines() or ["?"])[0][:120]
+                rep.notes.append(f"{rel}: nicht analysierbar, unveraendert uebernommen (byte-gleich mit der Quelle): {first}")
+                rep.clips_ok += 1
+                continue
             prob(f"MXF nicht lesbar: {e}")
             for m in check_structure(mxf_path):
                 prob(f"Struktur: {m}")
@@ -942,7 +981,8 @@ def verify_card(
         rep.notes.append(f"GOP-Laenge N={sorted(set(gop_ok))} bei {len(gop_ok)} Clips (Keyframe-Abstaende der ersten 400 Pakete geprueft)")
     # restliche Dateien gegen Quelle
     if src_root is not None:
-        _compare_files(src_root, tgt, mp, src_mp, rep)
+        _compare_files(src_root, tgt, mp, src_mp, rep, selection=_selection_record(tgt.parent),
+                       has_settings=(tgt.parent / SETTINGS_NAME).is_file())
     return rep
 
 
@@ -956,7 +996,8 @@ def _xavcl_codec_of_xml(data: bytes) -> str:
     return c if card.is_xavcl_codec(c) else ""
 
 
-def _compare_files(src: Path, tgt: Path, tgt_mp: "card.MediaPro", src_mp: "card.MediaPro", rep: VerifyReport) -> None:
+def _compare_files(src: Path, tgt: Path, tgt_mp: "card.MediaPro", src_mp: "card.MediaPro", rep: VerifyReport,
+                   selection: Optional[dict] = None, has_settings: bool = False) -> None:
     import os
 
     converted_xavcl = {m.rel_path.casefold(): m.video_type for m in tgt_mp.materials if card.is_xavcl_codec(m.video_type)}
@@ -968,16 +1009,17 @@ def _compare_files(src: Path, tgt: Path, tgt_mp: "card.MediaPro", src_mp: "card.
     tgt_clip = tgt / "Clip"
     tgt_mxf = {p.name.casefold() for p in tgt_clip.iterdir()} if tgt_clip.is_dir() else set()
     src_clip = src / "Clip"
-    absent_pats = []
+    absent_clips: list[Path] = []
     if src_clip.is_dir():
-        absent_pats = [card.related_pattern(p.stem) for p in sorted(src_clip.iterdir())
-                       if p.is_file() and p.suffix.upper() == ".MXF" and p.name.casefold() not in tgt_mxf]
+        absent_clips = [p for p in sorted(src_clip.iterdir())
+                        if p.is_file() and card.is_clip_mxf_name(p.name) and p.name.casefold() not in tgt_mxf]
+    absent_pats = [card.related_pattern(p.stem) for p in absent_clips]
     for root, _d, files in os.walk(src):
         rel_root = Path(root).relative_to(src)
         for fn in files:
             rel = (rel_root / fn).as_posix()
-            if rel.upper().startswith("CLIP/") and fn.upper().endswith(".MXF"):
-                continue
+            if rel.upper().startswith("CLIP/") and card.is_clip_mxf_name(fn):
+                continue  # Clip-MXF werden einzeln geprueft ('._*.MXF' o. ae. sind Begleitdateien und werden verglichen)
             t = tgt / rel
             n_files += 1
             if not t.is_file():
@@ -1007,9 +1049,35 @@ def _compare_files(src: Path, tgt: Path, tgt_mp: "card.MediaPro", src_mp: "card.
                     rep.problems.append(f"{rel}: Datei unterscheidet sich von der Quelle")
             else:
                 rep.problems.append(f"{rel}: Datei unterscheidet sich von der Quelle")
-    if absent_pats:
-        n_abs = len(absent_pats)
+    if absent_clips:
+        # In MEDIAPRO.XML gelistete, im Ziel fehlende Clips meldet verify_card bereits einzeln als Abweichung.  Nicht
+        # gelistete fehlende Clips sind eine Abweichung, ausser die Einstellungsdatei belegt, dass sie bewusst nicht
+        # ausgewaehlt wurden (--only bzw. --unlisted skip im letzten Lauf).
+        only = (selection or {}).get("only") or []
+        skip_unlisted = (selection or {}).get("unlisted") == "skip"
+        deliberate: list[str] = []
+        for p in absent_clips:
+            rel = f"Clip/{p.name}"
+            if src_mp.find(rel) is not None or tgt_mp.find(rel) is not None:
+                continue
+            if only and not any(t.casefold() in p.stem.casefold() for t in only):
+                deliberate.append(rel)
+            elif skip_unlisted:
+                deliberate.append(rel)
+            elif selection is not None:
+                rep.problems.append(f"{rel}: Quell-Clip (nicht in MEDIAPRO.XML gelistet) fehlt im Ziel - laut "
+                                    f"Einstellungsdatei nicht bewusst ausgelassen")
+            elif has_settings:
+                rep.problems.append(f"{rel}: Quell-Clip (nicht in MEDIAPRO.XML gelistet) fehlt im Ziel - die "
+                                    f"Einstellungsdatei enthaelt keine Angabe zur Auswahl (bewusst uebersprungen mit "
+                                    f"--only/--unlisted skip?)")
+            else:
+                rep.problems.append(f"{rel}: Quell-Clip (nicht in MEDIAPRO.XML gelistet) fehlt im Ziel "
+                                    f"(bewusst uebersprungen mit --only/--unlisted skip?)")
         shown = ", ".join(skipped[:3]) + (" ..." if len(skipped) > 3 else "")
-        rep.notes.append(f"{n_abs} Quell-Clip(s) fehlen im Ziel (bewusst uebersprungen: --only / --unlisted skip?)"
-                         + (f"; {len(skipped)} zugehoerige Begleitdatei(en) fehlen ebenfalls: {shown}" if skipped else ""))
+        if deliberate:
+            rep.notes.append(f"{len(deliberate)} Quell-Clip(s) fehlen im Ziel, laut Einstellungsdatei bewusst nicht ausgewaehlt "
+                             f"(--only / --unlisted skip): {', '.join(deliberate[:3])}" + (" ..." if len(deliberate) > 3 else ""))
+        if skipped:
+            rep.notes.append(f"{len(skipped)} zu fehlenden Clips gehoerende Begleitdatei(en) fehlen ebenfalls: {shown}")
     rep.notes.append(f"{n_files - len(missing) - len(skipped)} Nicht-MXF-Dateien der Quelle verglichen")
