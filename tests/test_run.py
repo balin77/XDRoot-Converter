@@ -22,6 +22,7 @@ from unittest import mock
 from xdroot_converter import card, converter, mxfheader, mxfinfo, tools, verify
 
 REPO = Path(__file__).resolve().parent.parent
+_REAL_TRANSCODE = converter.Converter._transcode  # Original (Fakes ersetzt die Methode waehrend der Tests)
 CODEC_I = "AVC100CBG_1920_1080_H422IP@L42"
 CODEC_L = "AVC50_1920_1080_H422P@L42"
 FRAMES = 10
@@ -70,7 +71,8 @@ def make_card(root: Path, names=("A", "B"), unlisted=(), salt="", system_id="SYS
 
 
 def _mxf_info(path, cancel=None):
-    data = Path(path).read_bytes()
+    with open(path, "rb") as f:
+        data = f.read(512)  # genuegt (grosse Platzhalterdateien nicht komplett lesen)
     parts = data.decode("latin1").split("|")
     if len(parts) < 2 or parts[0] not in ("SRC", "DST", "OTHER"):
         raise RuntimeError("MXF nicht lesbar")
@@ -844,6 +846,468 @@ class Overview(RunTestBase):
     def test_overview_still_works(self):
         ov = converter.overview(converter.Options(source=str(self.src), target=str(self.tgt)))
         self.assertEqual((ov.clips, ov.to_convert), (2, 2))
+
+
+def _status(s):
+    return {r.name: r for r in s.results}
+
+
+class F2_G1_ExistingTargetProtected(RunTestBase):
+    """G1 (Ablauf): ein fertiger XAVC-L-Ziel-Clip wird nie durch eine (defekte oder nicht umwandelbare) Quelle ersetzt."""
+
+    def test_unreadable_source_keeps_finished_target(self):
+        """Vorher: 'Analyse fehlgeschlagen' -> unveraendert kopiert, Ziel = kaputte Quelle, rc 0."""
+        self.run_conv()
+        before = self.out("Clip/A.MXF").read_bytes()
+        (self.src / "Clip" / "A.MXF").write_bytes(b"\0" * 64)  # Quelle nicht lesbar
+        s, rep, _ = self.run_conv()
+        r = _status(s)["A.MXF"]
+        self.assertEqual(r.status, converter.ST_FAILED)
+        self.assertTrue(r.target_ok)
+        self.assertGreater(s.failed, 0)  # -> Exit-Code != 0
+        self.assertEqual(self.out("Clip/A.MXF").read_bytes(), before)
+        self.assertEqual(_status(s)["B.MXF"].status, converter.ST_SKIPPED_DONE)
+        self.assert_consistent()
+        self.assertIn("bleibt unveraendert erhalten", s.text())
+        self.assertNotIn("unbrauchbar", s.incomplete_text())
+
+    def test_unreadable_source_without_target_is_failed_and_not_copied(self):
+        (self.src / "Clip" / "A.MXF").write_bytes(b"\0" * 64)
+        s, _, _ = self.run_conv()
+        r = _status(s)["A.MXF"]
+        self.assertEqual(r.status, converter.ST_FAILED)
+        self.assertFalse(r.target_ok)
+        self.assertFalse(self.out("Clip/A.MXF").exists())
+        self.assertIn("fehlen: A.MXF", s.incomplete_text())
+
+    def test_copy_path_never_overwrites_finished_l_target(self):
+        """Vorher: Clip, der jetzt nicht mehr umgewandelt wird (hier SequenceOffset), ueberschrieb das fertige Ziel."""
+        self.run_conv()
+        before = self.out("Clip/A.MXF").read_bytes()
+        self.fx.seq_offs = [0, 2]
+        s, rep, _ = self.run_conv()
+        r = _status(s)["A.MXF"]
+        self.assertEqual(r.status, converter.ST_FAILED)
+        self.assertTrue(r.target_ok)
+        self.assertEqual(self.out("Clip/A.MXF").read_bytes(), before)
+        self.assertIn("nicht (mehr) umgewandelt", " ".join(r.notes))
+        self.assert_consistent()  # MEDIAPRO/M01.XML passen weiter zum tatsaechlichen XAVC-L-Ziel
+
+    def test_copy_path_replaces_unreadable_target_and_stays_consistent(self):
+        self.run_conv()
+        self.out("Clip/A.MXF").write_bytes(b"DST|A|TRUNC")  # kein brauchbares XAVC-L mehr
+        self.fx.seq_offs = [0, 2]
+        s, _, conv = self.run_conv()
+        self.assertEqual(_status(s)["A.MXF"].status, converter.ST_COPIED)
+        self.assertEqual(self.out("Clip/A.MXF").read_bytes(), (self.src / "Clip" / "A.MXF").read_bytes())
+        self.assertNotIn("Clip/A.MXF", conv.l_codecs)
+        self.assert_consistent()
+
+    def test_umid_check_without_plan_info(self):
+        """Vorher: ohne plan.info wurde nur MEDIAPRO verglichen; jetzt auch M01.XML, und das Ergebnis ist robust."""
+        conv = converter.Converter(converter.Options(source="s", target="t"), Rep())
+        ti = mxfinfo.MxfInfo(mp_uid=uid("A", "fremd"))
+        conv._tgt_info["a.mxf"] = ti
+        mat = card.Material(uri="./Clip/A.MXF", umid=uid("A"))
+        plan = converter.ClipPlan(mxf=Path("A.MXF"), stem="A", material=mat)
+        with self.assertRaises(RuntimeError):
+            conv._check_existing_umid(plan, Path("x"))
+        plan2 = converter.ClipPlan(mxf=Path("A.MXF"), stem="A", material=None)
+        x = self.tmp / "AM01.XML"
+        x.write_bytes(clip_xml("A"))
+        plan2.xml_path = x
+        with self.assertRaises(RuntimeError):
+            conv._check_existing_umid(plan2, Path("x"))
+        ti.mp_uid = uid("A").lower()  # Gross/Klein egal
+        conv._check_existing_umid(plan, Path("x"))
+        conv._check_existing_umid(plan2, Path("x"))
+
+
+class F2_G1_AudioMapping(RunTestBase):
+    """G1 (Metadaten): Tonspuren werden ueber die Material-Package-Track-ID dem ffmpeg-Audiostream zugeordnet."""
+
+    def _info(self, ids):
+        info = mxfinfo.MxfInfo()
+        info.tracks = [mxfinfo.MxfTrack(index=i + 1, kind="Sound", mp_track_id=t) for i, t in enumerate(ids)]
+        return info
+
+    def test_map_identity_and_reversed(self):
+        info = self._info([3, 4, 5])  # mxf2raw-Reihenfolge = aufsteigende Track-ID
+        self.assertEqual(converter.audio_stream_map(info, [3, 4, 5], 3), [0, 1, 2])
+        self.assertEqual(converter.audio_stream_map(info, [5, 4, 3], 3), [2, 1, 0])  # Tracks-Array umgekehrt
+        self.assertEqual(converter.audio_stream_map(info, [4, 5, 3], 3), [2, 0, 1])
+
+    def test_map_not_determinable_raises(self):
+        info = self._info([3, 4, 5])
+        for order, n in (([3, 4], 3), ([3, 4, 6], 3), ([3, 3, 4], 3), ([3, 4, 5], 2), ([3, None, 5], 3)):
+            with self.assertRaises(ValueError, msg=str((order, n))):
+                converter.audio_stream_map(info, order, n)
+        bad = self._info([3, None, 5])
+        with self.assertRaises(ValueError):
+            converter.audio_stream_map(bad, [3, 4, 5], 3)
+
+    def test_plan_gets_map_from_header_order(self):
+        self.fx.audio_order = [102, 101]  # Tracks-Array umgekehrt zur Track-ID
+        src_root = card.find_xdroot(str(self.src))
+        mp = card.parse_mediapro((src_root / "MEDIAPRO.XML").read_bytes())
+        conv = converter.Converter(converter.Options(source=str(self.src), target=str(self.tgt)), Rep())
+        plans = conv.scan(src_root, mp, card.list_clip_mxf(src_root))
+        self.assertEqual([p.audio_map for p in plans], [[1, 0], [1, 0]])
+
+    def test_unclear_mapping_is_failed_not_converted_not_copied(self):
+        self.fx.audio_order = [101]  # Header meldet nur 1 Sound-Track, mxf2raw 2
+        s, rep, _ = self.run_conv()
+        for r in s.results:
+            self.assertEqual(r.status, converter.ST_FAILED)
+        self.assertEqual(self.fx.transcodes, [])
+        self.assertFalse(self.out("Clip/A.MXF").exists())
+        self.assertIn("Tonspuren", rep.text("error"))
+        self.assertGreater(s.failed, 0)
+
+    def test_ffprobe_audio_count_mismatch_is_failed(self):
+        orig = mxfinfo.run_ffprobe
+
+        def probe3(path, cancel=None, extra=None):
+            r = orig(path)
+            r.streams.append({"codec_type": "audio"})
+            return r
+
+        with mock.patch.object(mxfinfo, "run_ffprobe", probe3):
+            s, _, _ = self.run_conv()
+        self.assertEqual({r.status for r in s.results}, {converter.ST_FAILED})
+        self.assertEqual(self.fx.transcodes, [])
+
+    def test_transcode_uses_mapped_audio_streams(self):
+        """Echtes _transcode: Tonspur j kommt aus 0:a:<audio_map[j]> (nicht blind 0:a:j)."""
+        seen = []
+
+        def fake_run(args, **kw):
+            seen.append(list(args))
+            kw["on_stdout_line"]("frame=10")
+            return tools.ProcResult(0, "", "")
+
+        info = mxfinfo.MxfInfo(mp_uid="AA", fp_uid="BB")
+        plan = converter.ClipPlan(mxf=Path("A.MXF"), stem="A", material=None, info=info)
+        plan.audio_map = [1, 0]
+        plan.new_codec = CODEC_L
+        conv = converter.Converter(converter.Options(source="s", target="t"), Rep())
+        wavs = [Path("a0.wav"), Path("a1.wav")]
+        with mock.patch.object(tools, "run_capture", fake_run), mock.patch.object(tools, "find_tool", lambda n: n):
+            _REAL_TRANSCODE(conv, plan, Fraction(50), 10, Path("v.h264"), wavs)
+        a = seen[0]
+        maps = [a[i + 1] for i, x in enumerate(a) if x == "-map"]
+        self.assertEqual(maps, ["0:v:0", "0:a:1", "0:a:0"])
+        self.assertEqual(a[a.index("0:a:1") + 5], "a0.wav")  # erste WAV (Tonspur 1) aus Stream 1
+
+
+class F2_K1_MaxFramesPerClip(RunTestBase):
+    def test_max_frames_never_replaces_full_clip_even_with_marker(self):
+        self.run_conv()
+        (self.tgt / verify.TEST_MARKER).write_text("TESTAUSGABE\nmax_frames=5\n")  # Marker 'luegt'
+        before = {n: self.out(f"Clip/{n}.MXF").read_bytes() for n in "AB"}
+        s, rep, _ = self.run_conv(max_frames=5)
+        self.assertEqual(s.fatal, "")
+        for n in "AB":
+            self.assertEqual(self.out(f"Clip/{n}.MXF").read_bytes(), before[n])
+        self.assertEqual(self.fx.transcodes, ["A.MXF", "B.MXF"])  # nur vom ersten Lauf
+        self.assertIn("NICHT ersetzt", rep.text("warn"))
+        self.assert_consistent()
+
+    def test_max_frames_replaces_shorter_test_clip(self):
+        self.run_conv(max_frames=5)
+        s, _, _ = self.run_conv(max_frames=5)
+        self.assertEqual(s.fatal, "")
+        self.assertEqual(s.failed, 0)
+
+
+class F2_K2_Lock(RunTestBase):
+    def test_full_disk_leaves_no_empty_lock(self):
+        self.tgt.mkdir()
+        real = os.fdopen
+
+        class Boom:
+            def __init__(self, f):
+                self.f = f
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                self.f.close()
+
+            def write(self, data):
+                raise OSError(28, "Auf dem Geraet ist kein Speicherplatz mehr verfuegbar")
+
+        with mock.patch.object(converter.os, "fdopen", lambda fd, *a, **k: Boom(real(fd, *a, **k))):
+            with self.assertRaises(OSError):
+                converter.acquire_lock(self.tgt)
+        self.assertFalse((self.tgt / converter.LOCK_NAME).exists())
+
+    def test_lock_released_on_keyboard_interrupt(self):
+        with mock.patch.object(converter.Converter, "scan", side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_conv()
+        self.assertFalse((self.tgt / converter.LOCK_NAME).exists())
+
+    def test_reused_pid_with_other_start_time_is_stale(self):
+        """PID gehoert einem lebenden Prozess, der aber nicht der damalige ist (PID-Wiederverwendung)."""
+        mine = converter._proc_start_time(os.getpid())
+        if mine is None:
+            self.skipTest("Prozess-Startzeit auf dieser Plattform nicht ermittelbar")
+        self.tgt.mkdir()
+        host = __import__("socket").gethostname()
+        (self.tgt / converter.LOCK_NAME).write_text(
+            json.dumps({"pid": os.getpid(), "start": 1e12, "host": host, "pstart": mine + 12345}))
+        lock = converter.acquire_lock(self.tgt)  # uebernommen statt TargetBusy
+        self.assertEqual(json.loads(lock.read_text())["pstart"], mine)
+        converter.release_lock(lock)
+
+    def test_same_start_time_is_kept(self):
+        self.tgt.mkdir()
+        lock = converter.acquire_lock(self.tgt)
+        self.assertIn("pstart", json.loads(lock.read_text()))
+        with self.assertRaises(converter.TargetBusy):
+            converter.acquire_lock(self.tgt)
+        converter.release_lock(lock)
+
+
+class F2_K3_HeaderAdoptedUpdatesSettings(RunTestBase):
+    def test_no_false_settings_warning_after_header_adopt(self):
+        self.run_conv(sony_header=False)
+        self.fx.header_problems = ["Identification abweichend"]
+        s, rep, _ = self.run_conv(only=["A"])  # jetzt mit Kopfdaten-Angleichung
+        self.assertEqual(_status(s)["A.MXF"].status, converter.ST_SKIPPED_DONE)
+        self.assertNotIn("Kopfdaten-Angleichung", rep.text("warn"))
+        data = json.loads((self.tgt / converter.SETTINGS_NAME).read_text(encoding="utf-8"))
+        self.assertIs(data["clips"]["Clip/A.MXF"]["sony_header"], True)
+
+
+class F2_K4_BestEffortAncXml(RunTestBase):
+    def setUp(self):
+        super().setUp()
+        orig = _mxf_info
+
+        def with_anc(path, cancel=None):
+            i = orig(path)
+            if i.video.essence_type.startswith("AVCI"):
+                i.tracks.append(mxfinfo.MxfTrack(index=9, kind="Data", essence_type="ANC_Data"))
+            return i
+
+        for p in (mock.patch.object(mxfinfo, "read_mxf_info", with_anc),
+                  mock.patch.object(converter.Converter, "_extract_anc", self._extract)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    def _extract(conv, plan, tmpd):
+        f = tmpd / "anc.klv"
+        f.write_bytes(b"anc")
+        return f
+
+    def test_anc_dropped_is_remembered_and_not_retranscoded(self):
+        self.fx.fail_wrap_anc = {"A"}
+        s, rep, _ = self.run_conv()
+        self.assertEqual(s.failed, 0)
+        self.assertEqual(self.fx.wraps.count("A.MXF"), 2)  # mit ANC gescheitert, ohne ANC erfolgreich
+        data = json.loads((self.tgt / converter.SETTINGS_NAME).read_text(encoding="utf-8"))
+        self.assertIs(data["clips"]["Clip/A.MXF"]["anc_dropped"], True)
+        self.assertNotIn("anc_dropped", data["clips"]["Clip/B.MXF"])
+        s2, rep2, _ = self.run_conv()
+        self.assertEqual(_status(s2)["A.MXF"].status, converter.ST_SKIPPED_DONE)  # keine Endlos-Neuerzeugung
+        self.assertEqual(self.fx.transcodes.count("A.MXF"), 1)
+        self.assertIn("ANC-Spur fehlt im Ziel", rep2.text("warn"))
+
+    def test_unrelated_check_failure_does_not_fall_back_to_no_anc(self):
+        self.fx.always_probs = ["Dauer 5 Frames statt 10"]
+        s, rep, _ = self.run_conv()
+        self.assertEqual(_status(s)["A.MXF"].status, converter.ST_FAILED)
+        self.assertEqual(self.fx.wraps.count("A.MXF"), 1)  # kein Versuch ohne ANC
+
+    def test_anc_related_check_failure_falls_back(self):
+        calls = [0]
+        self.fx.always_probs = []
+        orig = verify.check_clip
+
+        def flaky(path, exp, cancel=None, source=None, source_info=None):
+            r = orig(path, exp, cancel=cancel, source=source, source_info=source_info)
+            if exp.expect_anc and Path(path).name == "out.mxf":
+                calls[0] += 1
+                return r + ["ANC-Spur fehlt"]
+            return r
+
+        with mock.patch.object(verify, "check_clip", flaky):
+            s, _, _ = self.run_conv()
+        self.assertEqual(s.failed, 0)
+        self.assertEqual(self.fx.wraps.count("A.MXF"), 2)
+        self.assertEqual(calls[0], 2)  # je Clip einmal mit ANC
+
+
+class F2_K5_DiskEstimateCountsOldFile(RunTestBase):
+    def test_existing_bad_target_counts_old_size_too(self):
+        self.run_conv()
+        old = self.out("Clip/A.MXF")
+        with open(old, "wb") as f:  # 3 GB (sparse), nicht lesbar -> wird neu erzeugt, alte Datei bleibt liegen
+            f.write(b"DST|A|TRUNC|")
+            f.truncate(3 * 1024 ** 3)
+        self.fx.free = 2 * 1024 ** 3
+        s, _, _ = self.run_conv()
+        self.assertIn("Zu wenig freier Speicher", s.fatal)
+
+
+class F2_K6_ResumeAndFsync(RunTestBase):
+    def test_tail_check_on_resume_regenerates_clip_with_broken_end(self):
+        self.run_conv()
+        self.fx.tails.clear()
+        self.fx.tail_problems = ["Clip-Ende: nur 3 von 10 erwarteten Frames dekodierbar"]
+        self.fx.transcodes.clear()
+        s, rep, _ = self.run_conv(only=["A"])
+        self.assertIn("A.MXF", self.fx.tails)
+        self.assertEqual(_status(s)["A.MXF"].status, converter.ST_CONVERTED)
+        self.assertEqual(self.fx.transcodes, ["A.MXF"])
+        self.assertIn("Ende:", rep.text("warn"))
+
+    def test_tail_check_ok_skips(self):
+        self.run_conv()
+        s, _, _ = self.run_conv()
+        self.assertEqual(s.count(converter.ST_SKIPPED_DONE), 2)
+
+    def test_fsync_before_replace(self):
+        order = []
+        real_fsync, real_replace = os.fsync, card.replace_retry
+
+        def spy_replace(a, b, *args, **kw):
+            order.append(("replace", Path(a).name))
+            return real_replace(a, b, *args, **kw)
+
+        with mock.patch.object(converter.Converter, "_fsync_file", staticmethod(lambda p: order.append(("fsync", Path(p).name)))), \
+                mock.patch.object(card, "replace_retry", spy_replace):
+            self.run_conv(only=["A"])
+        self.assertLess(order.index(("fsync", "out.mxf")), order.index(("replace", "out.mxf")))
+
+
+class F2_K7_WindowsRobustness(RunTestBase):
+    def test_read_only_source_gives_writable_copy(self):
+        z = self.src / "Clip" / "Z.MXF"
+        z.write_bytes(b"OTHER|Z" + b"." * 20)
+        os.chmod(z, 0o444)
+        self.addCleanup(os.chmod, z, 0o644)
+        s, _, _ = self.run_conv()
+        self.assertEqual(_status(s)["Z.MXF"].status, converter.ST_COPIED)
+        self.assertTrue(os.stat(self.out("Clip/Z.MXF")).st_mode & 0o200)
+
+    def test_replace_retry_used_for_final_replace(self):
+        calls = []
+        real = os.replace
+
+        def flaky(a, b):
+            if Path(a).name == "out.mxf" and len(calls) < 2:
+                calls.append(1)
+                raise PermissionError("Zugriff verweigert (Virenscanner)")
+            return real(a, b)
+
+        with mock.patch("os.replace", flaky), mock.patch.object(card.time, "sleep", lambda s: None):
+            s, _, _ = self.run_conv(only=["A"])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(_status(s)["A.MXF"].status, converter.ST_CONVERTED)
+
+
+class F2_K8_UnknownDuration(RunTestBase):
+    def test_unknown_duration_is_copied_with_warning(self):
+        (self.src / "Clip" / "A.MXF").write_bytes(b"SRC|A|NODUR" + b"." * 40)
+        s, rep, _ = self.run_conv()
+        r = _status(s)
+        self.assertEqual(r["A.MXF"].status, converter.ST_COPIED)
+        self.assertEqual(r["B.MXF"].status, converter.ST_CONVERTED)
+        self.assertIn("Dauer der Quelle unbekannt", rep.text("warn"))
+        self.assertIn("ACHTUNG", " ".join(r["A.MXF"].notes))
+        self.assertEqual(self.fx.transcodes, ["B.MXF"])
+
+    def test_unknown_duration_with_finished_target_keeps_target(self):
+        self.run_conv()
+        before = self.out("Clip/A.MXF").read_bytes()
+        (self.src / "Clip" / "A.MXF").write_bytes(b"SRC|A|NODUR" + b"." * 40)
+        s, _, _ = self.run_conv()
+        self.assertEqual(_status(s)["A.MXF"].status, converter.ST_FAILED)
+        self.assertEqual(self.out("Clip/A.MXF").read_bytes(), before)
+        self.assert_consistent()
+
+
+class F2_Wrap(unittest.TestCase):
+    """K9 (--head-fill) und K10 (KAG wie Quelle)."""
+
+    def _args(self, kag):
+        seen = []
+
+        def fake_run(args, **kw):
+            seen.append(list(args))
+            return tools.ProcResult(0, "", "")
+
+        info = mxfinfo.MxfInfo(mp_uid="AA", fp_uid="BB", start_tc="00:00:00:00", ident_modified="2025-01-01 10:00:00.000")
+        info.tracks = [mxfinfo.MxfTrack(index=0, kind="Picture", descriptor={}),
+                       mxfinfo.MxfTrack(index=1, kind="Sound", descriptor={"locked": "true", "audio_ref_level": "0"})]
+        plan = converter.ClipPlan(mxf=Path("A.MXF"), stem="A", material=None, info=info)
+        plan.kag = kag
+        conv = converter.Converter(converter.Options(source="s", target="t", sony_header=False))
+        with mock.patch.object(tools, "run_capture", fake_run), mock.patch.object(tools, "find_tool", lambda n: n):
+            self.assertEqual(conv._wrap(plan, Fraction(50), 30, Path("v"), [Path("w")], Path("o"), None, None), "")
+        return seen[0]
+
+    def test_head_fill(self):
+        a = self._args(1)
+        i = a.index("--head-fill")
+        self.assertEqual(a[i + 1], "65536")
+        self.assertLess(i, a.index("--avc_high_422"))
+
+    def test_kag512_only_when_source_has_it(self):
+        a = self._args(512)
+        self.assertLess(a.index("--kag-size-512"), a.index("--avc_high_422"))
+        self.assertNotIn("--kag-size-512", self._args(1))
+        self.assertNotIn("--kag-size-512", self._args(0))
+
+    def test_scan_reads_kag(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        with Fakes() as fx:
+            fx.kag = 512
+            src = make_card(d / "c")
+            mp = card.parse_mediapro((src / "MEDIAPRO.XML").read_bytes())
+            conv = converter.Converter(converter.Options(source=str(src), target=str(d / "t")), Rep())
+            plans = conv.scan(src, mp, card.list_clip_mxf(src))
+        self.assertEqual([p.kag for p in plans], [512, 512])
+
+
+class F2_K11_Summary(RunTestBase):
+    def test_fatal_without_clips_has_no_fehler_0_line(self):
+        self.tgt.mkdir()
+        lock = converter.acquire_lock(self.tgt)
+        try:
+            s, rep, _ = self.run_conv()
+        finally:
+            converter.release_lock(lock)
+        self.assertIn("bereits von einem anderen Lauf benutzt", s.fatal)
+        self.assertNotIn("Fehler: 0", s.text())
+        self.assertIn("FEHLER: ", s.text())
+
+    def test_normal_summary_keeps_counts(self):
+        s, _, _ = self.run_conv()
+        self.assertIn("Fehler: 0", s.text())
+
+    def test_other_card_message_has_hint(self):
+        self.run_conv()
+        (self.src / "Clip" / "B.MXF").unlink()  # Clip auf der Quellkarte geloescht
+        (self.src / "Clip" / "BM01.XML").unlink()
+        s, _, _ = self.run_conv()
+        self.assertIn("andere Karte", s.fatal)
+        self.assertIn("geloescht", s.fatal)
+        self.assertIn("neuen, leeren Zielordner", s.fatal)
+
+
+class F2_K12_Job(unittest.TestCase):
+    def test_assign_to_job_is_harmless_here(self):
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        self.assertIn(tools._assign_to_job(p), (True, False))  # nie eine Ausnahme
+
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
+import os
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tests.helpers import fixture_bytes
 from xdroot_converter import card
@@ -336,6 +338,94 @@ class ExistingTarget(unittest.TestCase):
         (self.out / "CUEUP.XML").write_text("c")
         (self.out / ("x.XML" + card.TMP_SUFFIX)).write_text("t")
         card.check_existing_target(self.src, self.out, self.mp)
+
+
+class WindowsRobustness(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_replace_retry_retries_permission_error(self):
+        a, b = self.tmp / "a", self.tmp / "b"
+        a.write_bytes(b"x")
+        real, n = os.replace, [0]
+
+        def flaky(s, d):
+            n[0] += 1
+            if n[0] < 4:
+                raise PermissionError("Zugriff verweigert")
+            return real(s, d)
+
+        with mock.patch("os.replace", flaky), mock.patch.object(card.time, "sleep") as sl:
+            card.replace_retry(a, b)
+        self.assertEqual((n[0], sl.call_count), (4, 3))
+        self.assertEqual(b.read_bytes(), b"x")
+
+    def test_replace_retry_gives_up(self):
+        a, b = self.tmp / "a", self.tmp / "b"
+        a.write_bytes(b"x")
+        with mock.patch("os.replace", side_effect=PermissionError("dauerhaft")), \
+                mock.patch.object(card.time, "sleep") as sl:
+            with self.assertRaises(PermissionError):
+                card.replace_retry(a, b, tries=5, delay=0.1)
+        self.assertEqual(sl.call_count, 4)
+
+    def test_replace_retry_does_not_swallow_other_errors(self):
+        with mock.patch("os.replace", side_effect=FileNotFoundError("weg")), mock.patch.object(card.time, "sleep") as sl:
+            with self.assertRaises(FileNotFoundError):
+                card.replace_retry(self.tmp / "a", self.tmp / "b")
+        self.assertEqual(sl.call_count, 0)
+
+    def test_atomic_writers_use_retry(self):
+        calls = []
+        real = card.replace_retry
+        with mock.patch.object(card, "replace_retry", lambda a, b, *x, **k: (calls.append(1), real(a, b))[1]):
+            card.write_bytes_atomic(self.tmp / "w.xml", b"1")
+            (self.tmp / "s").write_bytes(b"2")
+            card.copy_file_atomic(self.tmp / "s", self.tmp / "d")
+        self.assertEqual(len(calls), 2)
+
+    def test_copy_of_read_only_source_is_writable(self):
+        s = self.tmp / "ro"
+        s.write_bytes(b"abc")
+        os.utime(s, (1_000_000_000, 1_000_000_000))
+        os.chmod(s, 0o444)
+        self.addCleanup(os.chmod, s, 0o644)
+        d = self.tmp / "copy"
+        card.copy_file_atomic(s, d)
+        self.assertTrue(os.stat(d).st_mode & 0o200)
+        self.assertEqual(int(os.stat(d).st_mtime), 1_000_000_000)  # Zeitstempel bleiben
+        d2 = self.tmp / "written"
+        card.write_bytes_atomic(d2, b"x", stat_from=s)
+        self.assertTrue(os.stat(d2).st_mode & 0o200)
+        self.assertEqual(int(os.stat(d2).st_mtime), 1_000_000_000)
+
+    def test_copy_structure_read_only_dir_stays_usable(self):
+        src, dst = self.tmp / "src", self.tmp / "dst"
+        (src / "Sub").mkdir(parents=True)
+        (src / "Sub" / "f.txt").write_text("1")
+        os.chmod(src / "Sub", 0o555)
+        self.addCleanup(os.chmod, src / "Sub", 0o755)
+        card.copy_structure(src, dst)
+        self.assertTrue(os.stat(dst / "Sub").st_mode & 0o200)
+        (dst / "Sub" / "neu.txt").write_text("ok")  # Ziel-Ordner bleibt beschreibbar (Folgelauf)
+
+    def test_make_writable_missing_file_is_silent(self):
+        card.make_writable(self.tmp / "gibt-es-nicht")
+
+
+class ForeignTargetHint(unittest.TestCase):
+    def test_deleted_source_clip_message_has_hint(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        src, out = tmp / "src", tmp / "out"
+        for r in (src, out):
+            (r / "Clip").mkdir(parents=True)
+        mp = card.parse_mediapro(fixture_bytes("f55_MEDIAPRO.XML"))
+        (out / "MEDIAPRO.XML").write_bytes(fixture_bytes("f55_MEDIAPRO.XML"))
+        (out / "Clip" / "ZZ.MXF").write_bytes(b"x")  # in der Quelle (geloescht) nicht mehr vorhanden
+        with self.assertRaisesRegex(ValueError, "geloescht.*neuen, leeren Zielordner"):
+            card.check_existing_target(src, out, mp)
 
 
 if __name__ == "__main__":

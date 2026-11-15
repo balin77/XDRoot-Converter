@@ -1631,6 +1631,8 @@ def overview(opts: Options, cancel: Optional[tools.CancelToken] = None) -> CardO
             ov.convert_bytes += size
             ov.frames += p.frames
             ov.est_target_bytes += estimate_clip_bytes(p.frames, p.info.edit_rate, len(p.info.audio), opts.bitrate_mbps)
+        elif p.error:
+            ov.notes.append(f"{p.name}: FEHLER - {p.error}")
         elif p.decision is not None:
             unchanged[p.decision.reason] = unchanged.get(p.decision.reason, 0) + 1
     for reason, n in unchanged.items():
