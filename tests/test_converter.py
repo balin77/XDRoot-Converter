@@ -43,6 +43,12 @@ class Helpers(unittest.TestCase):
         for bad in ("", None, "x", "0", "-3"):
             self.assertIsNone(converter.level_from_probe(bad))
 
+    def test_level_from_fps(self):
+        from fractions import Fraction
+        for f, lv in ((Fraction(25), "4.1"), (Fraction(30000, 1001), "4.1"), (Fraction(30), "4.1"),
+                      (Fraction(50), "4.2"), (Fraction(60000, 1001), "4.2")):
+            self.assertEqual(converter.level_from_fps(f), lv)
+
     def test_make_expect_level_only_if_supported(self):
         kw = dict(frames=1, mp_uid="a", fp_uid="b", start_tc="00:00:00:00", n_audio=1, fps=Fraction(50))
         e = converter.make_expect(level="4.2", **kw)

@@ -713,10 +713,19 @@ class SoundRuleTests(Base):
                       "Tonspur 1", "QuantizationBits", "16", "24")
         self.conflict(with_item("WaveAudioDescriptor.BlockAlign", struct.pack(">H", 2)), None, "BlockAlign")
         self.conflict(with_item("GenericSoundEssenceDescriptor.ChannelCount", u32(2)), None, "ChannelCount")
-        self.conflict(with_item("WaveAudioDescriptor.AvgBps", u32(96000)), None, "AvgBps", "96000", "144000")
         self.conflict(with_item("GenericSoundEssenceDescriptor.AudioSamplingRate", struct.pack(">ii", 48000, 1)),
                       with_item("GenericSoundEssenceDescriptor.AudioSamplingRate", struct.pack(">ii", 44100, 1)),
                       "AudioSamplingRate", "48000/1", "44100/1")
+
+    def test_avgbps_difference_adopts_source_with_hint(self):
+        ab = "WaveAudioDescriptor.AvgBps"
+        s, t = sound_pair(with_item(ab, u32(96000)), None)
+        src, tgt = self.pair(s, t)
+        log = mh.adopt_from_source(tgt, src)
+        self.assertTrue(any("HINWEIS: Tonspur 1: AvgBps wie Quelle (96000 statt 144000)" in l for l in log), log)
+        hm, st = structure(tgt)
+        self.assertEqual({hm.get(d, ab) for d in sound_descs(hm, st)}, {u32(96000)})
+        self.assertEqual(mh.compare_with_source(tgt, src), [])
 
     def test_all_conflicts_listed_for_all_tracks(self):
         msg = self.conflict(with_item("GenericSoundEssenceDescriptor.QuantizationBits", u32(16)), None)

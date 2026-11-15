@@ -700,24 +700,26 @@ class K7_CopyErrors(RunTestBase):
 class K9_NoCodecString(RunTestBase):
     def test_clip_without_xml_and_mediapro_is_converted(self):
         make_card(self.tmp / "c9", unlisted=("U",), no_xml=("U",))
-        self.fx.probe_level = "41"
+        self.fx.probe_level = "50"  # ungueltiges Quell-Level darf nicht uebernommen werden
         s, rep, conv = self.run_conv(source=self.tmp / "c9")
         res = {r.name: r for r in s.results}
         self.assertEqual(res["U.MXF"].status, converter.ST_CONVERTED)
         self.assertEqual(self.out("Clip/U.MXF").read_bytes(), b"DST|U|L")
         self.assertFalse(self.out("Clip/UM01.XML").exists())  # kein XML zu patchen
         self.assertIn("kein Codec-String", rep.text("warn"))
-        self.assertIn("4.1", rep.text("warn"))
+        self.assertIn("4.2", rep.text("warn"))  # 50 fps -> 4.2
+        self.assertNotIn("5.0", rep.text("warn"))
         self.assert_consistent()
 
-    def test_level_from_probe_is_passed_to_expect(self):
+    def test_level_from_fps_is_passed_to_expect(self):
         make_card(self.tmp / "c9", unlisted=("U",), no_xml=("U",))
-        self.fx.probe_level = "41"
+        self.fx.probe_level = "50"
         seen = []
         orig = converter.make_expect
         with mock.patch.object(converter, "make_expect", lambda **kw: seen.append(kw.get("level")) or orig(**kw)):
             self.run_conv(source=self.tmp / "c9")
-        self.assertIn("4.1", seen)
+        self.assertIn("4.2", seen)
+        self.assertNotIn("5.0", seen)
 
     def test_unknown_codec_string_is_not_guessed(self):
         xr = make_card(self.tmp / "c9")

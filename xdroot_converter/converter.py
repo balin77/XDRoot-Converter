@@ -411,6 +411,11 @@ def level_from_probe(level) -> Optional[str]:
     return f"{n // 10}.{n % 10}"
 
 
+def level_from_fps(fps) -> str:
+    """Ziel-Level ohne Codec-String: bis einschliesslich 30 fps 4.1, darueber 4.2."""
+    return "4.1" if fps is not None and fps <= 30 else "4.2"
+
+
 def make_expect(level: Optional[str] = None, **kw) -> "verify.ClipExpect":
     """ClipExpect bauen; ``level`` nur setzen, wenn verify.ClipExpect das Feld kennt."""
     if level and "level" in {f.name for f in dataclasses.fields(verify.ClipExpect)}:
@@ -433,7 +438,7 @@ class ClipPlan:
     frames: int = 0  # zu erzeugende Frames
     notes: list = field(default_factory=list)
     codec_free: bool = False  # kein Codec-String (kein XML, kein MEDIAPRO-Eintrag); MXF ist eindeutig XAVC-I
-    probe_level: str = ""  # H.264-Level aus ffprobe der Quelle ('4.2')
+    fallback_level: str = ""  # nur ohne Codec-String: Level aus der Bildrate ('4.1' bis 30 fps, sonst '4.2')
     seq_off: Optional[int] = None  # SequenceOffset der Quell-Tonspuren (None = unbekannt/0)
 
     @property
@@ -442,7 +447,7 @@ class ClipPlan:
 
     @property
     def level(self) -> str:
-        return card.level_from_codec(self.new_codec) or self.probe_level or "4.2"
+        return card.level_from_codec(self.new_codec) or self.fallback_level or "4.2"
 
     @property
     def name(self) -> str:
@@ -541,8 +546,6 @@ class Converter:
                 plan.info = mxfinfo.read_mxf_info(str(mxf), cancel=self.cancel)
                 probe = mxfinfo.run_ffprobe(str(mxf), cancel=self.cancel)
                 plan.decision = mxfinfo.decide_source(plan.info, probe)
-                if probe.video:
-                    plan.probe_level = level_from_probe(probe.video.get("level")) or ""
             except tools.Cancelled:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -554,9 +557,11 @@ class Converter:
                     # K9: weder XML noch MEDIAPRO nennen einen Codec, die MXF ist aber eindeutig XAVC-I
                     plan.codec_free = True
                     plan.new_codec = ""
+                    # Level aus der Bildrate (nicht aus ffprobe der Quelle: dort kann ein ungueltiges Level stehen)
+                    plan.fallback_level = level_from_fps(plan.decision.fps)
                     plan.notes.append(
                         "kein Codec-String in M01.XML/MEDIAPRO.XML - Clip wird anhand der MXF als XAVC-I erkannt und umgewandelt "
-                        f"(H.264-Level {plan.probe_level or '4.2'} aus der Quelle, kein XML anzupassen)"
+                        f"(H.264-Level {plan.level} aus der Bildrate, kein XML anzupassen)"
                     )
                 elif not plan.new_codec:
                     plan.decision = mxfinfo.SourceDecision(

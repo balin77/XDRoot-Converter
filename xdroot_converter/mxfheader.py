@@ -1155,8 +1155,9 @@ def _adopt_tracks(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: S
 
 # Essenzbeschreibende Items des Sound-Deskriptors: Widerspruch zwischen Quelle und Ziel = Fehler
 _SOUND_ESSENCE = ("GenericSoundEssenceDescriptor.QuantizationBits", "WaveAudioDescriptor.BlockAlign",
-                  "GenericSoundEssenceDescriptor.ChannelCount", "GenericSoundEssenceDescriptor.AudioSamplingRate",
-                  "WaveAudioDescriptor.AvgBps")
+                  "GenericSoundEssenceDescriptor.ChannelCount", "GenericSoundEssenceDescriptor.AudioSamplingRate")
+# AvgBps ist abgeleitet (Hersteller rechnen unterschiedlich): bei Abweichung gilt die Quelle, nur Hinweis
+_AVGBPS = "WaveAudioDescriptor.AvgBps"
 _SEQ_OFFSET = "WaveAudioDescriptor.SequenceOffset"
 # Klassenhierarchie der Sound-Deskriptoren (Klasse -> Praefixe der erlaubten Item-Namen)
 _SOUND_ANCESTORS = {
@@ -1245,6 +1246,10 @@ def _adopt_sound(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: St
         raise HeaderPatchError("Audio-Daten von Quelle und Ziel passen nicht zusammen - " + "; ".join(problems))
     for n, t, td, sd in pairs:
         before = (td.key, list(td.items))
+        sv_a, tv_a = src.get(sd, _AVGBPS), tgt.get(td, _AVGBPS)
+        if sv_a is not None and tv_a is not None and sv_a != tv_a:
+            log.append("HINWEIS: Tonspur %d: AvgBps wie Quelle (%s statt %s)" % (
+                n, _sound_value_text(_AVGBPS, sv_a), _sound_value_text(_AVGBPS, tv_a)))
         keep = {q: tgt.get(td, q) for q in _SOUND_KEEP}
         s_ec, t_ec = src.get(sd, "FileDescriptor.EssenceContainer"), keep["FileDescriptor.EssenceContainer"]
         same_ec = _ec_equal(s_ec, t_ec)
