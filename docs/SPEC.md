@@ -100,6 +100,10 @@ Ergebnis laut mxf2raw: `AVC_High_422`, coding_label und ec_label identisch zur F
    - Ziel-Codec-String aus Quell-String ableiten: `AVC100CBG_1920_1080_H422IP@L42` →
      `AVC50_1920_1080_H422P@L42`; Level aus Quelle übernehmen (`@L41` bei ≤30p → `@L41`).
      Unbekannte Muster: nicht raten, Clip kopieren statt wandeln und warnen.
+   - Clip ohne Codec-String (weder `M01.XML` noch `MEDIAPRO.XML`-Eintrag), MXF aber eindeutig XAVC-I: wird umgewandelt,
+     es gibt kein XML anzupassen. Das H.264-Level kommt aus der **Bildrate** (bis einschließlich 30 fps 4.1, darüber 4.2);
+     das ffprobe-Level der Quelle wird nicht verwendet (eine synthetische Quelle meldet dort z. B. 50, kein gültiges Sony-Format).
+     Die Prüfung (`ClipExpect.level`) erwartet dann dasselbe Level; `--verify` prüft das Level nur, wenn ein Codec-String vorhanden ist.
 5. Abschlussbericht: pro Clip Status, Größe vorher/nachher, Gesamtersparnis, Log-Datei
    `konvertierung.log` im Zielordner (neben `XDROOT`).
 
@@ -132,17 +136,19 @@ xdroot_converter/   __init__.py, __main__.py (GUI-Start), gui.py, cli.py,
                     mxfinfo.py (ffprobe/mxf2raw-Parsing), tools.py (Programme finden),
                     mxfheader.py (MXF-Header-Metadaten lesen/ändern, Runde 2),
                     verify.py (Prüfung Einzelclip + Karte)
+setup_tools.bat/.ps1  FFmpeg + bmx nach tools/ laden
 scripts/            make_test_card.py (synthetische XAVC-I-Testkarte),
                     mxf_vergleich.py (Satz-für-Satz-Vergleich der Header-Metadaten)
-tests/              unittest für card.py/mxfinfo.py/mxfheader.py/verify.py/converter.py (ohne Medien;
-                    Fixtures: Kopien aus docs/analysis)
+tests/              unittest (ohne Medien; Fixtures: Kopien aus docs/analysis, Hilfen in helpers.py):
+                    test_card, test_converter, test_run (Ablauf mit Attrappen für ffmpeg/raw2bmx),
+                    test_verify, test_mxfheader, test_mxfinfo, test_gui
 docs/               SPEC.md, MXF-VERGLEICH.md, NAECHSTE-SCHRITTE.md, analysis/
-XDROOT-Converter.bat, README.md (Deutsch, kurz), .gitignore
+XDROOT-Converter.bat (prüft Python ≥ 3.11 + tkinter, startet die GUI), README.md (Deutsch), CONTRIBUTING.md, .gitignore
 ```
 
 CLI: `python -m xdroot_converter.cli <quelle> <ziel> [--bitrate 50] [--preset medium]
 [--max-frames N] [--unlisted convert|skip] [--only TEXT] [--embed-xml auto|always|never] [--no-anc]
-[--no-sony-header]`, `--verify <ziel-xdroot> [--source <quell-xdroot>] [--deep]` und
+[--no-sony-header] [--verbose]`, `--verify <ziel-xdroot> [--source <quell-xdroot>] [--deep]` und
 `--mxf-info <datei.MXF>` (Header-Metadaten ausgeben).
 `--max-frames` (nur Test) wandelt nur die ersten N Frames und passt dann
 `dur`/`Duration` **nicht** an – Ausgabe als Testausgabe kennzeichnen.
@@ -252,3 +258,54 @@ Ausgabe von Version 1: 117 Abweichungen zur Quelle in 45 Sätzen; Runde 2: 30 Ab
 Grenzen: Belegt nur gegen eine **synthetische** Quelle (mit bmx erzeugt, auf Sony-Track-IDs gesetzt) und gegen die
 `mxf2raw`-Ausgaben echter Dateien; `MXFDump`-Ausgaben echter Kameradateien liegen nicht im Repository. Siehe Hinweis oben in
 `docs/MXF-VERGLEICH.md`. Fehlt noch: lokaler Lauf von `scripts/mxf_vergleich.py` mit F55-Quelle, FX6-Referenz und Ziel.
+
+## Umsetzungsstand nach den Fix-Runden (Runde 2, ergänzt)
+
+Alles unten ist nur mit **synthetischem Material unter Linux** belegt (siehe `README.md`, „Getesteter Stand“). Die Testanzahl
+steht bewusst nicht hier; maßgeblich ist die Ausgabe von `python -m unittest discover -s tests`.
+
+### Patcher (`mxfheader.py`)
+
+- **KAG 512:** Bei KAG > 1 steht zwischen Partition Pack und Primer ein KLV-Fill. `HeaderByteCount` zählt ab dem Primer; der
+  Fill vor dem Primer bleibt byte-genau unverändert. Ohne RIP und bei offenem Header (FooterPartition = 0) wird nur gelesen.
+- **Regeln der Übernahme** (`adopt_from_source`, Quelle wird nur gelesen):
+  - Identification: Company, Product, Version, Product-UID aus der Quelle; Toolkit/Platform entfallen; `ThisGenerationUID` bleibt je Datei neu.
+  - Spurpaarung zwischen Quelle und Ziel über die **TrackNumber** (nicht nur über die Reihenfolge); Track-IDs, Reihenfolge und
+    Namen kommen aus der Quelle, `SourceTrackID`/`LinkedTrackID` werden mitgezogen.
+  - Sound-Deskriptor: Struktur (Item-Liste) wie die Quelle. Die **essenzbeschreibenden Items** (Abtastrate, Bits, Kanäle,
+    Block-Align, Locked, Ref-Level usw.) müssen in Quelle und Ziel **übereinstimmen**, sonst ist es ein Fehler (der Clip gilt
+    als fehlgeschlagen, die Datei bleibt unverändert). `AvgBps` wie in der Quelle (nur wenn dort vorhanden). Verweise auf andere
+    Sets werden **nicht** übernommen. Die Set-Klasse wird nur bei gleichem `EssenceContainer` übernommen.
+  - TextObject: MIME-Typ und Description wie Quelle bzw. `text/xml` / leer.
+  - Vor dem Schreiben wird erneut geparst und validiert; bei Fehler bleibt die Datei unverändert.
+- `--seq-off`: Die `SequenceOffset`-Werte der Quell-Tonspuren (relevant bei 29,97/59,94 fps) werden aus der Quelle gelesen und
+  an `raw2bmx` gegeben; unterschiedliche Offsets in den Spuren eines Clips → Clip wird nicht umgewandelt (nur kopiert, Hinweis).
+
+### Robustheit (`converter.py`)
+
+- `MEDIAPRO.XML` und `M01.XML` werden aus dem **Ist-Zustand des Ziels** abgeleitet (welcher Clip ist tatsächlich XAVC-L) und
+  **atomar** geschrieben (Temp-Datei + Ersetzen); ein Folgelauf fällt nicht auf XAVC-I zurück. Vorhandene Ziel-Dateien werden
+  erst nach erfolgreicher Neuerzeugung ersetzt.
+- **Fremdes Ziel:** Gehört ein vorhandenes Ziel-XDROOT nicht zur Quelle (andere `systemId`/`mediaId`, fremde Clips/Dateien,
+  MXF ohne `MEDIAPRO.XML`), Abbruch vor jeder Änderung. Quelle = Ziel (oder darin enthalten) wird abgelehnt.
+- **Sperre:** `_xdroot_converter.lock` im Zielordner (PID + Startzeit, `O_EXCL`); ein zweiter Lauf bricht ab; eine verwaiste
+  Sperre (Prozess weg oder älter als der letzte Systemstart) wird übernommen.
+- **Strukturprüfung** (`verify.check_structure`): Header-Partition geschlossen, FooterPartition-Offset zeigt auf ein
+  Partition Pack, RIP am Dateiende konsistent, Dateigröße = Ende des RIP, Mindestgröße aus Frames × Tonbytes. Erkennt
+  abgeschnittene Clips beim Fortsetzen und in `--verify`; dazu ein Decode-Test am Clip-Ende.
+- **Einstellungsdatei** `konvertierung_einstellungen.json` im Zielordner: Einstellungen je fertigem Clip; beim Fortsetzen
+  Warnung bei Abweichung, kein Neuerzeugen.
+- Außerdem: Speicherschätzung vor dem Start, Fortschritt je Clip und gesamt, Strg+C unter Windows (CLI), `--max-frames`-Schutz
+  (Testlauf nie über fertige Clips), Ton ≠ Mono/24 Bit/48 kHz nur kopiert, fehlende Nicht-MXF-Dateien sind in `--verify --source`
+  Abweichungen.
+
+### GUI / Start
+
+Abschlussfenster nach jedem Lauf (Fertig / mit Fehlern / abgebrochen / fehlgeschlagen), Rückfrage „Fortsetzen?“ bei vorhandenem
+Ziel, robustes Polling und Schließen während des Laufs. `XDROOT-Converter.bat` sucht Python ≥ 3.11 mit tkinter (`py -3`, dann
+`python`) und zeigt sonst eine Anleitung.
+
+### Noch nicht belegt
+
+Verhalten gegenüber echten Kameradateien (Parser, Patcher, Prüfungen), Windows-Pfade (.bat, GUI, Sperre, Strg+C), 56-GB-Clips
+(WAV > 4 GB), Schnittprogramme und Sony-Werkzeuge. Siehe `docs/NAECHSTE-SCHRITTE.md`.

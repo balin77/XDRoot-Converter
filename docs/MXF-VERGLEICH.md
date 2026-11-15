@@ -1,4 +1,4 @@
-# MXF-Kopfdaten-Vergleich (Runde 2)
+# MXF-Kopfdaten-Vergleich (Runde 2, Stand nach den Fix-Runden)
 
 > **Wichtig zur Beleglage (bitte zuerst lesen)**
 >
@@ -14,26 +14,31 @@
 > behandelten Felder (Identification, Track-IDs, Track-Namen, Sound-Deskriptor-Items, MIME-Typ/Description
 > des TextObjects) zur Laufzeit aus der echten Quell-MXF; alles darüber hinaus wird nicht angefasst.
 >
-> **Offene Aufgabe für den Autor** (lokal, mit echtem Material):
-> `python scripts/mxf_vergleich.py <F55-Quelle.MXF> <Ziel.MXF> --referenz <FX6-Clip.MXF> -o bericht.md`
-> und den Bericht (er enthält keine Pfade und nur "dateispezifisch" statt UIDs/Zeiten, Option
-> `--rohwerte` nicht verwenden) durchsehen. Abweichungen `Q≠Z`, die nicht in der Tabelle unten stehen,
-> sind neue Befunde.
+> **Die synthetische Quelle ist nicht die echte F55.** Sie zeigt Eigenschaften, die bei der echten F55 laut
+> `docs/analysis/f55_mxf2raw.txt` **anders** sind (an den Stellen unten mit „synth.“ gekennzeichnet): z. B.
+> `stored_height` 1080 (synthetisch) gegen 1088 (echte F55), Partitionsreihenfolge (Index vor Essenz, vom
+> Generator so gebaut), Spurzahl/Track-Namen, die Art des Video-Deskriptor-Sets (die echte F55 wurde nie mit `MXFDump`
+> geöffnet; `mxf2raw` unterscheidet MPEG-Video- und CDCI-Deskriptor nicht). Keine Zeile der Quell-Spalte unten ist
+> eine Aussage über Sony.
+>
+> Die auf der echten Hardware offenen Prüfungen stehen in Abschnitt 6 („Was der Autor lokal prüfen muss“).
 
 ## 1. Methode und Befehle
 
 ```
-# Testkarte (Quelle ist "Sony-aehnlich": Track-IDs 2/3..10/11, Identification Sony/"Mem "/2.00)
+# Testkarte (Quelle ist "Sony-aehnlich": Track-IDs 2/3..10/11, Identification Sony/"Mem "/2.00;
+# Standard KAG 512, --kag1 waehlt KAG 1)
 python scripts/make_test_card.py _test_out/synth_card
 
 # Umwandlung (Runde 2: Kopfdaten werden aus der Quell-MXF uebernommen)
-python -m xdroot_converter.cli _test_out/synth_card _test_out/out2
+python -m xdroot_converter.cli _test_out/synth_card _test_out/out2 --embed-xml always
 
 # Pruefung (mit und ohne Quelle)
 python -m xdroot_converter.cli --verify _test_out/out2 --source _test_out/synth_card --deep
 python -m xdroot_converter.cli --verify _test_out/out2
 
-# Satz-fuer-Satz-Vergleich (eigener Parser + MXFDump-Gegenprobe, falls MXFDump im PATH/tools/ liegt)
+# Satz-fuer-Satz-Vergleich (eigener Parser + MXFDump-Gegenprobe, falls MXFDump im PATH/tools/ liegt;
+# ohne --embed-xml always fehlen im Ziel DMSchemes und das TextObject, die Zahl der Abweichungen sinkt von 45 auf 30)
 python scripts/mxf_vergleich.py "_test_out/synth_card/XDROOT/Clip/<clip>.MXF" \
                                 "_test_out/out2/XDROOT/Clip/<clip>.MXF" -o vergleich.md
 # dasselbe fuer eine Ausgabe der Version 1 (--no-sony-header) zeigt den Unterschied:
@@ -54,8 +59,10 @@ mxf2raw-Felder).
 
 ## 2. Abweichungen bmx-Version 1 → Runde 2
 
-Grundlage: Vergleich Quelle (synthetisch, Sony-ähnlich) gegen Ausgabe Version 1 (117 Abweichungen in
-45 Sätzen) bzw. Runde 2 (30 Abweichungen in 3 Sätzen, alle im Video-Deskriptor, siehe Abschnitt 4).
+Grundlage: Vergleich Quelle (**synth.**, Sony-ähnlich, KAG 512) gegen Ausgabe Version 1 (`--no-sony-header`: 117 Abweichungen in
+45 Sätzen) bzw. Runde 2 (Standard, ohne eingebettetes XML: 30 Abweichungen in 3 Sätzen, alle im Video-Deskriptor; mit
+`--embed-xml always` 45 Abweichungen in 10 Sätzen, die zusätzlichen 15 sind das gewollte TextObject, siehe Abschnitt 4).
+Zahlen gemessen am Stand nach den Fix-Runden (Linux, bmx 1.6).
 
 | Bereich | bmx-Version 1 | Runde 2 | Status | Begründung |
 |---|---|---|---|---|
@@ -73,17 +80,19 @@ Grundlage: Vergleich Quelle (synthetisch, Sony-ähnlich) gegen Ausgabe Version 1
 | Track-Nummern der Tonspuren | `0x1608 03xx` | gleich | identisch | `--aes-3` |
 | TextObject `mime_type` | `application/xml` | `text/xml` (bzw. Wert der Quelle) | behoben | Patcher; in raw2bmx nicht setzbar |
 | TextObject `description` | bmx-Wert | leer wie FX6 (bzw. Wert der Quelle) | behoben | Patcher |
-| Video-Deskriptor | MPEG-Video-Deskriptor (XAVC-I der Quelle) | `CDCIEssenceDescriptor` + `AVCSubDescriptor`, `PictureEssenceCoding` `…0d.04010202.01316001`, StoredHeight 1088 u. a. | bewusst belassen | das ist der Zweck der Umwandlung (XAVC-L); entspricht der FX6-Referenz (`stored_height 1088`, `display_x/y_offset 0`) |
-| Partitionslayout / Index | Header, Essenz-Body, Index-Body, Footer (bmx) | unverändert (Patcher verschiebt nichts) | bewusst belassen, echte Sony-Reihenfolge **nicht geprüft** | `mxf2raw` zeigt das Layout nicht; die synthetische Quelle hat die Reihenfolge Index vor Essenz (Generator), das ist kein Beleg für Sony |
-| KLV-Fill (Padding) | bmx-Größen | nur der letzte Fill der Header-Region wird gekürzt/verlängert | bewusst belassen | hält `HeaderByteCount` und alle Offsets/Indizes stabil; Sony-Fill-Größen sind unbekannt |
+| Video-Deskriptor | MPEG-Video-Deskriptor (**synth.** Quelle; Art des Sets bei der echten F55 ungeprüft) | `CDCIEssenceDescriptor` + `AVCSubDescriptor`, `PictureEssenceCoding` `…0d.04010202.01316001`, StoredHeight 1088 u. a. | bewusst belassen | das ist der Zweck der Umwandlung (XAVC-L); entspricht der FX6-Referenz (`stored_height 1088`, `display_x/y_offset 0`). Die synth. Quelle hat 1080, die **echte F55 laut `mxf2raw` 1088**, dort wird dieser Unterschied also nicht auftreten |
+| Partitionslayout / Index / KAG | Header, Essenz-Body, Index-Body, Footer (bmx), KAG 1 | unverändert (Patcher verschiebt nichts), **KAG 1** | bewusst belassen, echte Sony-Werte **nicht geprüft** | `mxf2raw` zeigt das Layout nicht. Die synth. Quelle hat KAG 512 und die Reihenfolge Index vor Essenz (Generator), das Ziel KAG 1 und Essenz vor Index (so schreibt `raw2bmx` hier); beides ist kein Beleg für Sony. Der Patcher *liest und schreibt* KAG 512 (Fill zwischen Partition Pack und Primer bleibt byte-genau), setzt aber den KAG-Wert des Ziels nicht um |
+| KLV-Fill (Padding) | bmx-Größen | nur der letzte Fill der Header-Region wird gekürzt/verlängert; bei KAG > 1 bleibt der Fill vor dem Primer unverändert | bewusst belassen | hält `HeaderByteCount` und alle Offsets/Indizes stabil; Sony-Fill-Größen sind unbekannt |
 | Footer-Partition | keine Header-Metadaten im Footer | gleich | nicht nötig | der Patcher bearbeitet alle Partitionen mit `HeaderByteCount > 0` (hier nur die Header-Partition) |
 | Sony-eigene Sets / weitere Items echter Dateien | – | nicht übernommen | nicht geprüft | ohne MXFDump-Ausgabe echter Dateien nicht beurteilbar (siehe Hinweis oben) |
 | Timecode-Track (ID, Name) | 901 / `TC1` | wie Quelle (ID 1) | behoben (für synth. Quelle) | Patcher paart nach Art und Reihenfolge |
 
 ## 3. mxf2raw: Ziel gegen die echten Referenzen
 
-Ziel = Ausgabe der Synthetik-Karte (`--embed-xml always` für das TextObject), Referenzen = `docs/analysis/*_mxf2raw.txt`.
-Verglichen wurde die normalisierte `mxf2raw -i`-Ausgabe (ohne `file_uri`, Package-UIDs, Datumswerte, Dauern).
+Ziel = Ausgabe der synthetischen Karte (`--embed-xml always` für das TextObject), Referenzen = `docs/analysis/*_mxf2raw.txt`.
+Verglichen wurde die normalisierte `mxf2raw -i`-Ausgabe (ohne `file_uri`, Package-UIDs, Datumswerte, Dauern). Das Ziel ist hier
+ein am Stand nach den Fix-Runden frisch erzeugter Clip; ein `diff` gegen die F55-Ausgabe zeigt außer den gelisteten, gewollten
+Unterschieden nur Zeitstempel, Generation-UID und das TextObject.
 
 **Gegen F55 (XAVC-I, 8 Tonspuren, ANC mit 1 Element)** – gleiche Spurzahl, daher vollständig vergleichbar:
 
@@ -116,12 +125,12 @@ Verglichen wurde die normalisierte `mxf2raw -i`-Ausgabe (ohne `file_uri`, Packag
 
 ## 4. Generierter Vergleichsbericht (Quelle synthetisch, gekürzt)
 
-Erzeugt mit `scripts/mxf_vergleich.py` (Ausschnitte; der vollständige Bericht hat gut 1000 Zeilen). Alle nicht aufgeführten
+Erzeugt mit `scripts/mxf_vergleich.py` am Stand nach den Fix-Runden (Ausschnitte; der vollständige Bericht hat rund 1150 Zeilen). Die Quell-Spalte ist **synthetisch**. Alle nicht aufgeführten
 Sätze (Preface, ContentStorage, EssenceContainerData, Material Package inkl. Tracks/Sequences/SourceClips, File Package inkl.
 Tracks, 8 Sound-Deskriptoren, ANC-Deskriptor) sind in Quelle und Ziel identisch.
 
 ### 4.1 Zusammenfassung der Abweichungen Quelle ≠ Ziel
-Abweichungen Quelle ≠ Ziel: **30** in 3 Sätzen – alle im Video-Deskriptor (XAVC-I → XAVC-L, gewollt) und in der Liste der Unter-Deskriptoren.
+Abweichungen Quelle ≠ Ziel (Standardlauf ohne eingebettetes XML): **30** in 3 Sätzen – alle im Video-Deskriptor (XAVC-I → XAVC-L, gewollt) und in der Liste der Unter-Deskriptoren. Mit `--embed-xml always` kommen 15 weitere in 7 Sätzen dazu: `Preface.DMSchemes`, ein zusätzlicher `StaticTrack` (Track-ID 12) mit `DMSegment`/`TextBasedDMFramework`/`UTF8TextBasedSet` (`text/xml`, `und`, leere Beschreibung) – das ist das gewollte eingebettete XML; die Quelle hat keins.
 
 | Satz | Item | Quelle | Ziel |
 |---|---|---|---|
@@ -157,14 +166,14 @@ Abweichungen Quelle ≠ Ziel: **30** in 3 Sätzen – alle im Video-Deskriptor (
 | File Source Package / Deskriptor Picture #1 / AVCSubDescriptor | AVCPictureParameterSetFlag | (fehlt) | 176 |
 
 ### 4.2 Partitionen
-**Quelle**
+**Quelle (synth.; Standard KAG 512, Index vor Essenz – Generator, kein Sony-Beleg)**
 
 | # | Art | Status | KAG | Header-Metadaten | BodySID | IndexSID |
 |---|---|---|---|---|---|---|
-| 0 | header | 4 | 1 | ja | 0 | 0 |
-| 1 | body | 4 | 1 | nein | 0 | 1 |
-| 2 | body | 4 | 1 | nein | 2 | 0 |
-| 3 | footer | 4 | 1 | nein | 0 | 0 |
+| 0 | header | 4 | 512 | ja | 0 | 0 |
+| 1 | body | 4 | 512 | nein | 0 | 1 |
+| 2 | body | 4 | 512 | nein | 2 | 0 |
+| 3 | footer | 4 | 512 | nein | 0 | 0 |
 
 **Ziel**
 
@@ -175,7 +184,7 @@ Abweichungen Quelle ≠ Ziel: **30** in 3 Sätzen – alle im Video-Deskriptor (
 | 2 | body | 4 | 1 | nein | 0 | 1 |
 | 3 | footer | 4 | 1 | nein | 0 | 0 |
 
-Laut MXFDump (Partition Packs): Quelle `Header (KAG 1, Header-Metadaten ja, BodySID 0, IndexSID 0); Body (KAG 1, Header-Metadaten nein, BodySID 0, IndexSID 1); Body (KAG 1, Header-Metadaten nein, BodySID 2, IndexSID 0); Footer (KAG 1, Header-Metadaten nein, BodySID 0, IndexSID 0)`; Ziel `Header (KAG 1, Header-Metadaten ja, BodySID 0, IndexSID 0); Body (KAG 1, Header-Metadaten nein, BodySID 2, IndexSID 0); Body (KAG 1, Header-Metadaten nein, BodySID 0, IndexSID 1); Footer (KAG 1, Header-Metadaten nein, BodySID 0, IndexSID 0)`.
+Laut MXFDump (Partition Packs): Quelle `Header (KAG 512, Header-Metadaten ja, BodySID 0, IndexSID 0); Body (KAG 512, Header-Metadaten nein, BodySID 0, IndexSID 1); Body (KAG 512, Header-Metadaten nein, BodySID 2, IndexSID 0); Footer (KAG 512, Header-Metadaten nein, BodySID 0, IndexSID 0)`; Ziel `Header (KAG 1, Header-Metadaten ja, BodySID 0, IndexSID 0); Body (KAG 1, Header-Metadaten nein, BodySID 2, IndexSID 0); Body (KAG 1, Header-Metadaten nein, BodySID 0, IndexSID 1); Footer (KAG 1, Header-Metadaten nein, BodySID 0, IndexSID 0)`.
 MXFDump meldet für Quelle und Ziel keine Auffälligkeiten (keine Zeilen mit error/warning/invalid/unexpected/mismatch);
 die Satzzählung von MXFDump stimmt mit dem eigenen Parser überein.
 
@@ -218,7 +227,7 @@ Klasse: `AES3AudioDescriptor`
 | LinkedTrackID | 3 | 3 |  |
 | ContainerDuration | (dateispezifisch) | (dateispezifisch) |  |
 
-### 4.5 Video-Deskriptor (gewollte Abweichungen)
+### 4.5 Video-Deskriptor (gewollte Abweichungen; Quelle synth.)
 **Set-Klasse weicht ab:** Quelle `MPEGVideoDescriptor`, Ziel `CDCIEssenceDescriptor`.
 
 | Item | Quelle | Ziel | Abw. |
@@ -259,7 +268,31 @@ Klasse: `AES3AudioDescriptor`
 ## 5. Grenzen
 
 - Quelle des Vergleichs ist eine synthetische Datei; sie bestätigt die **Mechanik** (Track-IDs, Verweise, Strings, Deskriptor-Items
-  werden konsistent geändert; MXFDump und mxf2raw lesen das Ergebnis ohne Auffälligkeiten; ffmpeg dekodiert es vollständig),
-  nicht den Inhalt echter Sony-Dateien.
+  werden konsistent geändert; KAG 512 wird gelesen und geschrieben; MXFDump und mxf2raw lesen das Ergebnis ohne Auffälligkeiten;
+  ffmpeg dekodiert es vollständig), nicht den Inhalt echter Sony-Dateien.
+- Das Ziel hat KAG 1 (so schreibt `raw2bmx`); ob Sony-XAVC-L (FX6) und XAVC-I (F55) KAG 512 nutzen, ist nicht belegt (`mxf2raw` zeigt es nicht).
 - Nicht geprüft: Verhalten von Schnittprogrammen und Sony-Software mit den Dateien.
-- Ein erneuter Lauf von `mxf_vergleich.py` mit der F55-Quelle, der FX6-Referenz und einem Ziel-Clip ist der nächste Schritt (siehe Hinweis oben).
+
+## 6. Was der Autor lokal prüfen muss
+
+Mit den echten Dateien (lokal, Pfade nach Bedarf einsetzen; Berichte enthalten keine Pfade, UIDs/Zeiten nur als „dateispezifisch“ –
+`--rohwerte` und `--dump-dir` nicht für Veröffentlichungen verwenden):
+
+1. **Versteht der Parser echte Sony-Kopfdaten?** (liest nur, ändert nichts)
+   ```
+   python -m xdroot_converter.cli --mxf-info <F55-Clip.MXF>
+   ```
+   Zu prüfen: Wird die Datei fehlerfrei gelesen? KAG (Partitionsliste oben in der Ausgabe), Track-IDs, Track-Namen,
+   Items der Sound-Deskriptoren (z. B. `SequenceOffset`, `AvgBps`), Art des Video-Deskriptor-Sets, Sony-eigene Sets.
+2. **Umwandlung der F5-Testkarte und Prüfung gegen die Quelle**
+   ```
+   python -m xdroot_converter.cli <F5-Testkarte> <Ziel-Ordner>
+   python -m xdroot_converter.cli --verify <Ziel-Ordner> --source <F5-Testkarte> --deep
+   ```
+3. **Satz-für-Satz-Vergleich mit echter Quelle und echter Referenz**
+   ```
+   python scripts/mxf_vergleich.py <F55-Quelle.MXF> <Ziel-Clip.MXF> --referenz <FX6-Clip.MXF> -o bericht.md
+   ```
+   Abweichungen `Q≠Z`, die nicht in der Tabelle in Abschnitt 2 stehen, und alle `R≠Z` sind neue Befunde.
+4. **Öffnen in Schnittprogramm und Sony Catalyst** (Import, Abspielen, Spulen, Tonspuren, Timecode, Metadatenanzeige) mit einem
+   umgewandelten Clip und zum Vergleich einem FX6-Clip.

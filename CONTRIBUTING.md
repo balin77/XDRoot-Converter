@@ -24,6 +24,9 @@ python -m unittest discover -s tests
 
 Die Tests prüfen nur Logik anhand der Fixtures in `tests/fixtures` und brauchen weder Medien noch FFmpeg/bmx.
 Echte Umwandlungen lassen sich mit `python -m xdroot_converter.cli --verify <ziel> --source <quelle>` prüfen.
+Ohne Kamera geht es mit einer synthetischen Karte: `python scripts/make_test_card.py _test_out/karte` (braucht ffmpeg und
+`raw2bmx`; `--unlisted-no-xml` erzeugt zusätzlich einen Clip ohne `M01.XML`), danach umwandeln und mit `--verify` prüfen.
+Das ersetzt keinen Test mit echten Kameradateien.
 
 ## Pull Requests
 
