@@ -75,11 +75,11 @@ class CompletionTests(unittest.TestCase):
         self.assertIn("vor", text)  # Empfehlung zur Prüfung vor dem Löschen
 
     def test_fehler_nie_erfolg(self):
-        results = [_res(f"C{i}", converter.ST_FAILED) for i in range(13)]
+        results = [_res(f"Clip_mit_sehr_langem_Namen_fuer_den_Test_{i:02d}", converter.ST_FAILED) for i in range(13)]
         kind, _t, text = gui.completion_message(_summary(results=results))
         self.assertEqual(kind, "warning")
-        self.assertIn("C9", text)
-        self.assertNotIn("C10", text)
+        self.assertIn("_09", text)
+        self.assertNotIn("_10", text)
         self.assertIn("3 weitere", text)
         self.assertNotIn("Empfehlung", text)
 
@@ -99,10 +99,81 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(gui.finish_status(_summary(cancelled=True)), "Abgebrochen.")
 
 
+class CompletionDetailTests(unittest.TestCase):
+    def test_copy_errors_getrennt(self):
+        errs = [(f"General/F{i}.XML", "Zugriff verweigert") for i in range(12)]
+        kind, _t, text = gui.completion_message(_summary(results=[_res("A", converter.ST_CONVERTED)],
+                                                         copy_errors=errs))
+        self.assertEqual(kind, "warning")
+        self.assertIn("12 Datei(en) konnten nicht kopiert werden", text)
+        self.assertIn("General/F9.XML", text)
+        self.assertNotIn("General/F10.XML", text)
+        self.assertIn("2 weitere", text)
+        self.assertNotIn("Clip(s) sind fehlgeschlagen", text)
+        self.assertNotIn("Empfehlung", text)
+
+    def test_clipfehler_und_copy_errors(self):
+        s = _summary(results=[_res("C1", converter.ST_FAILED)], copy_errors=[("a.xml", "x")])
+        _k, _t, text = gui.completion_message(s)
+        self.assertIn("1 Clip(s) sind fehlgeschlagen", text)
+        self.assertIn("1 Datei(en) konnten nicht kopiert werden", text)
+
+    def test_incomplete_text(self):
+        r = _res("C1", converter.ST_FAILED)
+        s = _summary(results=[r])
+        self.assertTrue(s.incomplete_text())
+        _k, _t, text = gui.completion_message(s)
+        self.assertIn(s.incomplete_text(), text)
+        _k, _t, ok = gui.completion_message(_summary(results=[_res("A", converter.ST_CONVERTED)]))
+        self.assertNotIn("unvollstaendig", ok)
+
+    def test_abbruch_hinweis(self):
+        _k, _t, text = gui.completion_message(_summary(cancelled=True))
+        self.assertIn("Die Zielkarte ist unvollständig. Ein erneuter Lauf mit demselben Zielordner setzt fort.", text)
+
+    def test_fatal_ohne_zaehlzeile(self):
+        s = _summary(fatal="Der Zielordner enthaelt bereits eine andere Karte oder fremde Daten: x",
+                     log_path=Path("Z/log.txt"))
+        _k, _t, text = gui.completion_message(s)
+        self.assertNotIn("Fehler: 0", text)
+        self.assertNotIn("umgewandelt", text)
+        self.assertIn("leeren Ordner", text)
+        self.assertIn("log.txt", text)
+
+    def test_fatal_gesperrt(self):
+        s = _summary(fatal="Der Zielordner wird bereits von einem anderen Lauf benutzt. Datei 'X.lock' loeschen.")
+        _k, _t, text = gui.completion_message(s)
+        self.assertIn("anderen Lauf", text)
+        self.assertIn("Sperrdatei", text)
+
+
+class TargetFilesTests(unittest.TestCase):
+    def test_xdroot_has_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(gui.target_xdroot_has_files(d))
+            (Path(d) / "XDROOT").mkdir()
+            self.assertFalse(gui.target_xdroot_has_files(d))
+            (Path(d) / "XDROOT" / "MEDIAPRO.XML").write_text("x")
+            self.assertTrue(gui.target_xdroot_has_files(d))
+
+    def test_target_is_xdroot(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(gui.target_is_xdroot(d))
+            x = Path(d) / "XDROOT"
+            (x / "Clip").mkdir(parents=True)
+            self.assertTrue(gui.target_is_xdroot(str(x)))
+            self.assertFalse(gui.target_is_xdroot(d))
+            (Path(d) / "MEDIAPRO.XML").write_text("x")
+            self.assertTrue(gui.target_is_xdroot(d))
+
+
 class ProgressTextTests(unittest.TestCase):
-    def test_eta_none(self):
-        _c, t = gui.progress_texts("A", "Analysiere Clip 1/4", 0.1, None)
+    def test_eta_none_nur_beim_transkodieren(self):
+        _c, t = gui.progress_texts("A", "Transkodiere 10/100", 0.1, None)
         self.assertIn("Restzeit wird berechnet", t)
+        for phase in ("Analysiere Clip 1/4", "Pruefe vorhandenes Ziel 1/2", "Kopiere 1.00 MB / 2.00 MB"):
+            _c, t = gui.progress_texts("A", phase, 0.1, None)
+            self.assertNotIn("Restzeit", t, phase)
 
     def test_eta(self):
         _c, t = gui.progress_texts("A", "", 0.5, 75)

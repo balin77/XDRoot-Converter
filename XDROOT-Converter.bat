@@ -1,6 +1,11 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+pushd "%~dp0"
+if errorlevel 1 (
+    echo Der Programmordner konnte nicht geoeffnet werden: "%~dp0"
+    pause
+    exit /b 1
+)
 set "PYMODE="
 
 rem Python 3.11 oder neuer mit tkinter suchen: erst Python-Launcher (py -3), dann python

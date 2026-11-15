@@ -7,6 +7,7 @@ als tkinter-freie Funktionen am Anfang der Datei und ist ohne GUI testbar.
 from __future__ import annotations
 
 import datetime
+import os
 import queue
 import sys
 import threading
@@ -21,7 +22,7 @@ except ImportError:  # pragma: no cover
     tk = None  # type: ignore[assignment]
     filedialog = messagebox = ttk = None  # type: ignore[assignment]
 
-from . import __version__, converter, tools
+from . import __version__, card, converter, tools
 
 PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"]
 
@@ -30,6 +31,11 @@ BITRATE_MAX = 100.0
 LOG_MAX_LINES = 5000
 CLOSE_WAIT_S = 30.0
 MAX_LISTED_FAILED = 10
+MAX_INCOMPLETE_CHARS = 400
+ANALYSE_TEXT = "Analysiere Quelle …"
+HINT_FOLDERS = ("Die Quelle wird nur gelesen und nie verändert. Als Ziel einen leeren Ordner wählen; "
+                "darin entsteht der Ordner XDROOT.")
+HINT_BITRATE = "Kennung in den Metadaten bleibt AVC50"
 HIDDEN_LEVELS = ("detail",)
 
 
@@ -76,11 +82,40 @@ def target_has_xdroot(dst: str) -> bool:
         return False
 
 
+def target_xdroot_has_files(dst: str) -> bool:
+    """Liegen im Ziel-XDROOT (dst/XDROOT) tatsächlich Dateien oder Ordner?"""
+    try:
+        d = Path(dst) / "XDROOT"
+        if not d.is_dir():
+            return False
+        with os.scandir(d) as it:
+            return any(True for _ in it)
+    except OSError:
+        return False
+
+
+def target_is_xdroot(dst: str) -> bool:
+    """Ist der gewählte Zielordner selbst ein XDROOT (MEDIAPRO.XML oder Name XDROOT mit Clip/)?"""
+    try:
+        p = Path(dst)
+        if not p.is_dir():
+            return False
+        if (p / "MEDIAPRO.XML").is_file():
+            return True
+        return p.name.upper() == "XDROOT" and (p / "Clip").is_dir()
+    except OSError:
+        return False
+
+
+_TRANSCODE_PREFIXES = ("Starte Transkodierung", "Transkodiere")
+
+
 def progress_texts(name: str, text: str, total_frac: float, eta_s: Optional[float]) -> tuple[str, str]:
     """(Zeile über dem Clip-Balken, Zeile über dem Gesamt-Balken)."""
     clip = f"{name}  {text}".strip() if (name or text) else ""
     if eta_s is None:
-        rest = ", Restzeit wird berechnet …"
+        # Restzeit nur schätzbar, sobald transkodiert wird (nicht in Analyse-/Prüf-/Kopierphase)
+        rest = ", Restzeit wird berechnet …" if (text or "").startswith(_TRANSCODE_PREFIXES) else ""
     elif eta_s <= 0:
         rest = ""
     else:
@@ -88,26 +123,50 @@ def progress_texts(name: str, text: str, total_frac: float, eta_s: Optional[floa
     return clip, f"Gesamt {total_frac * 100:.1f} %{rest}"
 
 
+def _fatal_hint(fatal: str) -> str:
+    low = fatal.lower()
+    if "andere karte" in low or "anderen karte" in low:
+        return "Bitte einen leeren Ordner als Ziel wählen."
+    if "anderen lauf" in low:
+        return ("Bitte warten, bis der andere Lauf beendet ist. Läuft sicher kein anderer Lauf, "
+                "die in der Meldung genannte Sperrdatei löschen.")
+    return ""
+
+
 def completion_message(summary) -> tuple[str, str, str]:
     """Meldungsfenster nach einem Lauf: (art, titel, text); art = info | warning | error."""
+    log_path = getattr(summary, "log_path", None)
+    log_part = f"Protokolldatei:\n{log_path}" if log_path else ""
+    if summary.fatal:
+        parts = ["Die Umwandlung konnte nicht durchgeführt werden:\n" + str(summary.fatal)]
+        hint = _fatal_hint(str(summary.fatal))
+        if hint:
+            parts.append(hint)
+        if log_part:
+            parts.append(log_part)
+        return "error", "Umwandlung fehlgeschlagen", "\n\n".join(parts)
+
+    failed = [r for r in summary.results if r.status == converter.ST_FAILED]
+    copy_errors = list(getattr(summary, "copy_errors", None) or [])
     counts = (
         f"umgewandelt: {summary.count(converter.ST_CONVERTED)}, "
         f"bereits fertig: {summary.count(converter.ST_SKIPPED_DONE)}, "
         f"kopiert: {summary.count(converter.ST_COPIED)}, "
         f"Fehler: {summary.failed}"
     )
-    failed = [r for r in summary.results if r.status == converter.ST_FAILED]
     parts: list[str] = []
-    if summary.fatal:
-        kind, title = "error", "Umwandlung fehlgeschlagen"
-        parts.append("Die Umwandlung konnte nicht durchgeführt werden:\n" + str(summary.fatal))
-    elif summary.cancelled:
+    if summary.cancelled:
         kind, title = "warning", "Abgebrochen"
-        parts.append("Die Umwandlung wurde abgebrochen. Bereits fertige Clips bleiben erhalten; "
-                     "ein erneuter Lauf mit demselben Ziel setzt fort.")
-    elif summary.failed:
+        parts.append("Die Umwandlung wurde abgebrochen. Bereits fertige Clips bleiben erhalten.")
+        parts.append("Die Zielkarte ist unvollständig. Ein erneuter Lauf mit demselben Zielordner setzt fort.")
+    elif failed or copy_errors:
         kind, title = "warning", "Fertig mit Fehlern"
-        parts.append(f"Die Umwandlung ist beendet, aber {summary.failed} Clip(s) sind fehlgeschlagen.")
+        bits = []
+        if failed:
+            bits.append(f"{len(failed)} Clip(s) sind fehlgeschlagen")
+        if copy_errors:
+            bits.append(f"{len(copy_errors)} Datei(en) konnten nicht kopiert werden")
+        parts.append("Die Umwandlung ist beendet, aber " + " und ".join(bits) + ".")
     else:
         kind, title = "info", "Fertig"
         parts.append("Die Umwandlung ist erfolgreich beendet.")
@@ -119,8 +178,24 @@ def completion_message(summary) -> tuple[str, str, str]:
         if len(failed) > MAX_LISTED_FAILED:
             lines.append(f"  … und {len(failed) - MAX_LISTED_FAILED} weitere (siehe Protokoll)")
         parts.append("\n".join(lines))
-    if getattr(summary, "log_path", None):
-        parts.append(f"Protokolldatei:\n{summary.log_path}")
+    if copy_errors:
+        lines = [f"{len(copy_errors)} Datei(en) konnten nicht kopiert werden:"]
+        for rel, msg in copy_errors[:MAX_LISTED_FAILED]:
+            lines.append(f"  • {rel}: {msg}")
+        if len(copy_errors) > MAX_LISTED_FAILED:
+            lines.append(f"  … und {len(copy_errors) - MAX_LISTED_FAILED} weitere (siehe Protokoll)")
+        parts.append("\n".join(lines))
+    inc = ""
+    try:
+        inc = summary.incomplete_text()
+    except Exception:  # noqa: BLE001
+        inc = ""
+    if inc:
+        if len(inc) > MAX_INCOMPLETE_CHARS:
+            inc = inc[:MAX_INCOMPLETE_CHARS].rstrip() + " … (siehe Protokoll)"
+        parts.append(inc)
+    if log_part:
+        parts.append(log_part)
     if kind == "info":
         parts.append("Empfehlung: Bitte das Ergebnis prüfen (z. B. einige Clips abspielen), "
                      "bevor die Quellkarte gelöscht oder überschrieben wird.")
@@ -166,8 +241,14 @@ class App(_Base):  # type: ignore[misc,valid-type]
             s = max(1.0, float(self.winfo_fpixels("1i")) / 96.0)
         except Exception:  # noqa: BLE001
             s = 1.0
-        self.minsize(int(720 * s), int(520 * s))
-        self.geometry(f"{int(860 * s)}x{int(680 * s)}")
+        try:
+            sw, sh = int(self.winfo_screenwidth()), int(self.winfo_screenheight())
+        except Exception:  # noqa: BLE001
+            sw, sh = 10 ** 6, 10 ** 6
+        w = max(300, min(int(860 * s), sw - 80))
+        h = max(300, min(int(680 * s), sh - 120))
+        self.minsize(min(int(720 * s), w), min(int(520 * s), h))
+        self.geometry(f"{w}x{h}")
         self.q: "queue.Queue" = queue.Queue()
         self.worker: Optional[threading.Thread] = None
         self.cancel_token: Optional[tools.CancelToken] = None
@@ -181,6 +262,8 @@ class App(_Base):  # type: ignore[misc,valid-type]
         self._close_started = 0.0
         self._close_asked = 0.0
         self._locked_widgets: list = []
+        self._ui_running = False       # Knöpfe stehen im Lauf-Zustand
+        self._last_total = 0.0
 
         self.var_src = tk.StringVar()
         self.var_dst = tk.StringVar()
@@ -189,6 +272,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
         self.var_skip_unlisted = tk.BooleanVar(value=False)
         self.var_status = tk.StringVar(value="Bereit.")
         self.var_overview = tk.StringVar(value="Bitte Quellordner wählen.")
+        self.var_br_hint = tk.StringVar(value="")
         self.var_clip_label = tk.StringVar(value="")
         self.var_total_label = tk.StringVar(value="")
         self.settings_open = tk.BooleanVar(value=False)
@@ -196,6 +280,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
         self._build()
         self.var_skip_unlisted.trace_add("write", lambda *_a: self._schedule_overview(0))
         self.var_bitrate.trace_add("write", lambda *_a: self._schedule_overview(700))
+        self.var_bitrate.trace_add("write", lambda *_a: self._update_br_hint())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._after_id = self.after(100, self._poll)
 
@@ -205,7 +290,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
         root = ttk.Frame(self, padding=8)
         root.pack(fill="both", expand=True)
         root.columnconfigure(1, weight=1)
-        root.rowconfigure(7, weight=1)
+        root.rowconfigure(8, weight=1)
         lock = self._locked_widgets
 
         ttk.Label(root, text="Quellordner:").grid(row=0, column=0, sticky="w", **pad)
@@ -222,13 +307,17 @@ class App(_Base):  # type: ignore[misc,valid-type]
         b_dst = ttk.Button(root, text="Durchsuchen …", command=self._browse_dst)
         b_dst.grid(row=1, column=2, **pad)
 
+        self.lbl_hint = ttk.Label(root, text=HINT_FOLDERS, wraplength=700, justify="left", foreground="#555555")
+        self.lbl_hint.grid(row=2, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 4))
+        self.lbl_hint.bind("<Configure>", lambda e: self.lbl_hint.configure(wraplength=max(200, e.width - 8)))
+
         self.lbl_overview = ttk.Label(root, textvariable=self.var_overview, wraplength=700, justify="left")
-        self.lbl_overview.grid(row=2, column=0, columnspan=3, sticky="ew", **pad)
+        self.lbl_overview.grid(row=3, column=0, columnspan=3, sticky="ew", **pad)
         self.lbl_overview.bind("<Configure>", lambda e: self.lbl_overview.configure(wraplength=max(200, e.width - 8)))
 
         # Einstellungen (einklappbar)
         self.btn_settings = ttk.Button(root, text="Einstellungen anzeigen", command=self._toggle_settings)
-        self.btn_settings.grid(row=3, column=0, sticky="w", **pad)
+        self.btn_settings.grid(row=4, column=0, sticky="w", **pad)
         self.frm_settings = ttk.LabelFrame(root, text="Einstellungen", padding=8)
         ttk.Label(self.frm_settings, text="Bitrate (Mbit/s):").grid(row=0, column=0, sticky="w", padx=4, pady=2)
         sp = ttk.Spinbox(self.frm_settings, from_=10, to=100, increment=5, width=6, textvariable=self.var_bitrate)
@@ -236,6 +325,8 @@ class App(_Base):  # type: ignore[misc,valid-type]
         ttk.Label(self.frm_settings, text="x264-Preset:").grid(row=0, column=2, sticky="w", padx=(16, 4), pady=2)
         cb = ttk.Combobox(self.frm_settings, values=PRESETS, textvariable=self.var_preset, width=12, state="readonly")
         cb.grid(row=0, column=3, sticky="w", padx=4, pady=2)
+        ttk.Label(self.frm_settings, textvariable=self.var_br_hint, foreground="#9a6700").grid(
+            row=2, column=0, columnspan=4, sticky="w", padx=4, pady=2)
         ck = ttk.Checkbutton(
             self.frm_settings, text="Clips, die nicht in MEDIAPRO.XML stehen, überspringen",
             variable=self.var_skip_unlisted,
@@ -246,21 +337,21 @@ class App(_Base):  # type: ignore[misc,valid-type]
                      (sp, "normal"), (cb, "readonly"), (ck, "normal")])
 
         bf = ttk.Frame(root)
-        bf.grid(row=4, column=0, columnspan=3, sticky="w", **pad)
+        bf.grid(row=5, column=0, columnspan=3, sticky="w", **pad)
         self.btn_start = ttk.Button(bf, text="Konvertieren", command=self._start)
         self.btn_start.pack(side="left", padx=(0, 8))
         self.btn_cancel = ttk.Button(bf, text="Abbrechen", command=self._cancel, state="disabled")
         self.btn_cancel.pack(side="left")
 
-        ttk.Label(root, textvariable=self.var_clip_label).grid(row=5, column=0, columnspan=3, sticky="w", padx=8)
+        ttk.Label(root, textvariable=self.var_clip_label).grid(row=6, column=0, columnspan=3, sticky="w", padx=8)
         self.pb_clip = ttk.Progressbar(root, maximum=1000)
-        self.pb_clip.grid(row=5, column=0, columnspan=3, sticky="ew", padx=8, pady=(22, 2))
-        ttk.Label(root, textvariable=self.var_total_label).grid(row=6, column=0, columnspan=3, sticky="w", padx=8)
+        self.pb_clip.grid(row=6, column=0, columnspan=3, sticky="ew", padx=8, pady=(22, 2))
+        ttk.Label(root, textvariable=self.var_total_label).grid(row=7, column=0, columnspan=3, sticky="w", padx=8)
         self.pb_total = ttk.Progressbar(root, maximum=1000)
-        self.pb_total.grid(row=6, column=0, columnspan=3, sticky="ew", padx=8, pady=(22, 6))
+        self.pb_total.grid(row=7, column=0, columnspan=3, sticky="ew", padx=8, pady=(22, 6))
 
         logf = ttk.Frame(root)
-        logf.grid(row=7, column=0, columnspan=3, sticky="nsew", padx=8, pady=4)
+        logf.grid(row=8, column=0, columnspan=3, sticky="nsew", padx=8, pady=4)
         logf.rowconfigure(0, weight=1)
         logf.columnconfigure(0, weight=1)
         self.txt = tk.Text(logf, height=12, wrap="word", state="disabled", font=("Consolas", 9))
@@ -273,7 +364,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
         self.txt.tag_configure("sep", foreground="#666666")
 
         ttk.Label(root, textvariable=self.var_status, relief="sunken", anchor="w").grid(
-            row=8, column=0, columnspan=3, sticky="ew", padx=8, pady=(4, 0))
+            row=9, column=0, columnspan=3, sticky="ew", padx=8, pady=(4, 0))
 
     def _toggle_settings(self) -> None:
         if self.settings_open.get():
@@ -281,9 +372,17 @@ class App(_Base):  # type: ignore[misc,valid-type]
             self.btn_settings.configure(text="Einstellungen anzeigen")
             self.settings_open.set(False)
         else:
-            self.frm_settings.grid(row=3, column=1, columnspan=2, sticky="ew", padx=8, pady=4)
+            self.frm_settings.grid(row=4, column=1, columnspan=2, sticky="ew", padx=8, pady=4)
             self.btn_settings.configure(text="Einstellungen verbergen")
             self.settings_open.set(True)
+
+    def _update_br_hint(self) -> None:
+        try:
+            br = parse_bitrate(self.var_bitrate.get())
+        except ValueError:
+            self.var_br_hint.set("")
+            return
+        self.var_br_hint.set(HINT_BITRATE if br != 50 else "")
 
     def _set_inputs(self, enabled: bool) -> None:
         for w, normal in self._locked_widgets:
@@ -343,7 +442,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
         token = self.overview_token
         cancel = tools.CancelToken()
         self.ov_cancel = cancel
-        self.var_overview.set("Analysiere Quelle …")
+        self.var_overview.set(ANALYSE_TEXT)
 
         opts = converter.Options(
             source=src, target="", bitrate_mbps=bitrate, unlisted="skip" if skip else "convert",
@@ -379,9 +478,36 @@ class App(_Base):  # type: ignore[misc,valid-type]
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("XDROOT-Converter", str(e))
             return
-        if target_has_xdroot(dst):
-            if not messagebox.askyesno("XDROOT-Converter",
-                                       "Der Zielordner enthält bereits ein XDROOT. Fortsetzen?"):
+        # Ziel ist selbst ein XDROOT? Dann den Elternordner anbieten (ohne Seiteneffekte)
+        if target_is_xdroot(dst):
+            parent = str(Path(dst).parent)
+            if Path(dst).parent == Path(dst):
+                messagebox.showwarning("XDROOT-Converter", "Der gewählte Zielordner ist selbst ein XDROOT. "
+                                       "Bitte einen anderen Ordner als Ziel wählen.")
+                return
+            if not messagebox.askyesno(
+                    "XDROOT-Converter",
+                    f"Der gewählte Zielordner ist selbst ein XDROOT. "
+                    f"Soll der übergeordnete Ordner „{parent}“ als Ziel verwendet werden?"):
+                return
+            dst = parent
+            self.var_dst.set(dst)
+        # Grundprüfungen (Quelle ≠ Ziel) vor jeder Rückfrage
+        try:
+            src_root = card.find_xdroot(src)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showwarning("XDROOT-Converter", f"Quelle nicht nutzbar: {e}")
+            return
+        try:
+            card.check_target(src_root, Path(dst), chosen_source=Path(src))
+        except Exception as e:  # noqa: BLE001
+            messagebox.showwarning("XDROOT-Converter", str(e))
+            return
+        if target_xdroot_has_files(dst):
+            if not messagebox.askyesno(
+                    "XDROOT-Converter",
+                    "Der Zielordner enthält bereits ein XDROOT (z. B. von einem früheren Lauf). "
+                    "Fertige Clips werden übersprungen, fehlende ergänzt. Fortfahren?"):
                 return
         opts = converter.Options(
             source=src, target=dst, bitrate_mbps=bitrate, preset=self.var_preset.get() or "medium",
@@ -401,6 +527,10 @@ class App(_Base):  # type: ignore[misc,valid-type]
         self.var_clip_label.set("")
         self.var_total_label.set("")
         self.var_status.set("Läuft …")
+        self._ui_running = True
+        self._last_total = 0.0
+        if self.var_overview.get() == ANALYSE_TEXT:
+            self.var_overview.set("Umwandlung läuft – die Übersicht wird danach aktualisiert.")
         stamp = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
         self._append(f"──────── Neuer Lauf {stamp} ────────", "sep")
 
@@ -453,6 +583,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
             _k, name, cf, tf, eta, text = item
             self.pb_clip["value"] = max(0.0, min(1.0, cf or 0.0)) * 1000
             self.pb_total["value"] = max(0.0, min(1.0, tf or 0.0)) * 1000
+            self._last_total = max(0.0, min(1.0, tf or 0.0))
             clip_txt, total_txt = progress_texts(name, text, tf or 0.0, eta)
             self.var_clip_label.set(clip_txt)
             self.var_total_label.set(total_txt)
@@ -466,6 +597,8 @@ class App(_Base):  # type: ignore[misc,valid-type]
             self._finish(item[1])
         elif kind == "crashed":
             self._append("Unerwarteter Fehler: " + item[1], "error")
+            self.var_clip_label.set("")
+            self.var_total_label.set("")
             self._reset_buttons("Fehler.")
             if not self._closing:
                 self.after(50, lambda m=item[1]: messagebox.showerror(
@@ -484,6 +617,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
                     self._handle(item)
                 except Exception as e:  # noqa: BLE001
                     self._log_internal_error(str(item[0]) if item else "?", e)
+            self._watchdog()
             if self._closing:
                 self._poll_closing()
         except Exception as e:  # noqa: BLE001
@@ -494,14 +628,40 @@ class App(_Base):  # type: ignore[misc,valid-type]
 
     _destroyed = False
 
+    def _watchdog(self) -> None:
+        """Worker-Thread tot, Queue leer, Knöpfe noch im Lauf-Zustand -> Oberfläche zurücksetzen."""
+        if self._ui_running and not self._is_running() and self.q.empty():
+            self._append("Interner Fehler: Der Arbeitsthread wurde unerwartet beendet.", "error")
+            self._reset_buttons("Fehler.")
+            if not self._closing:
+                self.after(50, lambda: messagebox.showerror(
+                    "XDROOT-Converter",
+                    "Der Arbeitsthread wurde unerwartet beendet. Bitte das Protokoll prüfen; "
+                    "ein erneuter Lauf mit demselben Zielordner setzt fort."))
+
     def _finish(self, summary: "converter.RunSummary") -> None:
-        if not (summary.cancelled or summary.fatal or summary.failed):
-            self.pb_clip["value"] = 1000
-            self.pb_total["value"] = 1000
-        self._reset_buttons(finish_status(summary))
-        self._append(summary.text() if hasattr(summary, "text") else "")
-        if summary.log_path:
-            self._append(f"Protokoll: {summary.log_path}")
+        try:
+            ok = not (summary.cancelled or summary.fatal or summary.failed)
+            if ok:
+                self.pb_clip["value"] = 1000
+                self.pb_total["value"] = 1000
+                self.var_clip_label.set("")
+                self.var_total_label.set("Gesamt 100 %")
+            elif summary.fatal:
+                self.pb_clip["value"] = 0
+                self.pb_total["value"] = 0
+                self.var_clip_label.set("")
+                self.var_total_label.set("")
+            else:
+                self.var_clip_label.set("")
+                self.var_total_label.set(progress_texts("", "", self._last_total, 0)[1])
+            # Die Zusammenfassung steht bereits im Protokoll (converter.run schreibt sie über log)
+            if summary.log_path:
+                self._append(f"Protokoll: {summary.log_path}")
+        except Exception as e:  # noqa: BLE001
+            self._log_internal_error("finish", e)
+        finally:
+            self._reset_buttons(finish_status(summary))
         if not self._closing:
             self.after(50, lambda s=summary: self._show_result(s))
 
@@ -511,10 +671,17 @@ class App(_Base):  # type: ignore[misc,valid-type]
         show(title, text)
 
     def _reset_buttons(self, status: str) -> None:
-        self._set_inputs(True)
-        self.btn_start.configure(state="normal")
-        self.btn_cancel.configure(state="disabled")
-        self.var_status.set(status)
+        self._ui_running = False
+        try:
+            self._set_inputs(True)
+            self.btn_start.configure(state="normal")
+            self.btn_cancel.configure(state="disabled")
+            self.var_status.set(status)
+        finally:
+            # Übersicht neu anstoßen (Text könnte noch „Analysiere …“ zeigen)
+            self._last_overview_key = None
+            if not self._closing:
+                self._schedule_overview(300)
 
     # ------------------------------------------------------------------ Schließen
     def _on_close(self) -> None:
