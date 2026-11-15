@@ -17,6 +17,10 @@ Oeffentliche API:
 Low-Level (z. B. fuer scripts/make_test_card.py): find_partitions, patch_header,
 parse_header_metadata, HeaderMetadata/MxfSet, resolve, set_track_ids, relink_after_renumber.
 
+Bei KAG > 1 steht zwischen Partition Pack und Primer ein KLV-Fill; ``HeaderByteCount`` zaehlt ab dem
+Primer-Key (``Partition.pre_fill`` / ``meta_offset``), der Fill bleibt byte-genau unveraendert.
+Ohne RIP und mit FooterPartition = 0 (offener Header) wird nur gelesen, nie geschrieben.
+
 Es werden nur kleine Bereiche der Datei gelesen (Partition Packs, RIP, Header-Metadaten);
 die Quelldatei wird ausschliesslich im Modus 'rb' geoeffnet.  Nur Standardbibliothek.
 """
@@ -1149,70 +1153,161 @@ def _adopt_tracks(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: S
     return sound_map
 
 
+# Essenzbeschreibende Items des Sound-Deskriptors: Widerspruch zwischen Quelle und Ziel = Fehler
+_SOUND_ESSENCE = ("GenericSoundEssenceDescriptor.QuantizationBits", "WaveAudioDescriptor.BlockAlign",
+                  "GenericSoundEssenceDescriptor.ChannelCount", "GenericSoundEssenceDescriptor.AudioSamplingRate",
+                  "WaveAudioDescriptor.AvgBps")
+_SEQ_OFFSET = "WaveAudioDescriptor.SequenceOffset"
+# Klassenhierarchie der Sound-Deskriptoren (Klasse -> Praefixe der erlaubten Item-Namen)
+_SOUND_ANCESTORS = {
+    "AES3AudioDescriptor": ("AES3AudioDescriptor", "WaveAudioDescriptor", "GenericSoundEssenceDescriptor",
+                            "FileDescriptor", "GenericDescriptor", "InterchangeObject"),
+    "WaveAudioDescriptor": ("WaveAudioDescriptor", "GenericSoundEssenceDescriptor",
+                            "FileDescriptor", "GenericDescriptor", "InterchangeObject"),
+    "GenericSoundEssenceDescriptor": ("GenericSoundEssenceDescriptor", "FileDescriptor",
+                                      "GenericDescriptor", "InterchangeObject"),
+}
+
+
+def _int(v: bytes) -> int:
+    return int.from_bytes(v, "big")
+
+
+def _sound_value_text(name: str, v: Optional[bytes]) -> str:
+    if v is None:
+        return "(fehlt)"
+    if name.endswith("AudioSamplingRate") and len(v) == 8:
+        n, d = struct.unpack(">ii", v)
+        return "%d/%d" % (n, d)
+    return str(_int(v)) if len(v) <= 4 else v.hex()
+
+
+def _sound_conflicts(tgt: HeaderMetadata, src: HeaderMetadata, td: MxfSet, sd: MxfSet) -> list:
+    """Widersprueche zwischen essenzbeschreibenden Items von Quell- und Ziel-Deskriptor:
+    Liste (Feldname, Quellwert-Text, Zielwert-Text, Hinweis)."""
+    out = []
+    for q in _SOUND_ESSENCE:
+        sv, tv = src.get(sd, q), tgt.get(td, q)
+        if sv is None or tv is None:
+            continue
+        same = sv == tv
+        if q.endswith("AudioSamplingRate") and len(sv) == len(tv) == 8:
+            sn, sdn = struct.unpack(">ii", sv)
+            tn, tdn = struct.unpack(">ii", tv)
+            same = sdn != 0 and tdn != 0 and sn * tdn == tn * sdn
+        if not same:
+            out.append((q.split(".")[1], _sound_value_text(q, sv), _sound_value_text(q, tv), ""))
+    so = src.get(sd, _SEQ_OFFSET)
+    if so is not None:
+        to = tgt.get(td, _SEQ_OFFSET)
+        if _int(so) != (_int(to) if to is not None else 0):
+            out.append(("SequenceOffset", str(_int(so)), str(_int(to)) if to is not None else "(fehlt, gilt als 0)",
+                        " - raw2bmx muss mit --seq-off %d aufgerufen werden" % _int(so)))
+    return out
+
+
+def _is_ref_value(hm: HeaderMetadata, v: bytes) -> bool:
+    """Wert sieht wie Verweis auf ein Set aus (16-Byte-UID bzw. Array/Batch aus solchen UIDs)."""
+    idx = hm.by_uid()
+    if len(v) == 16:
+        return v in idx
+    uids = uid_list(v)
+    return bool(uids) and len(v) == 8 + 16 * len(uids) and all(u in idx for u in uids)
+
+
+def _ec_equal(a: Optional[bytes], b: Optional[bytes]) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    return len(a) == 16 and len(b) == 16 and _norm(a) == _norm(b)
+
+
 def _adopt_sound(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: Structure,
                  sound_map: dict, log: list) -> None:
     tdesc = ts.descriptor_by_track()
     sdesc = ss.descriptor_by_track()
-    keep_uls = [_ITEM_UL[k] for k in _SOUND_KEEP]
-    ref_uls = {_ITEM_UL[k] for k in _SOUND_REFS}
+    keep_uls = {_ITEM_UL[k] for k in _SOUND_KEEP}
     lt_ul = _ITEM_UL["FileDescriptor.LinkedTrackID"]
+    iu_ul = _ITEM_UL["InterchangeObject.InstanceUID"]
+    ref_uls = {_ITEM_UL[k] for k in _SOUND_REFS}
+    pairs = []
     for n, t in enumerate(ts.file.kind_tracks("sound"), 1):
         s = sound_map.get(id(t.set))
         td, sd = tdesc.get(id(t.set)), (sdesc.get(id(s.set)) if s is not None else None)
         if td is None or sd is None or s is None:
             raise HeaderPatchError("Tonspur %d: Sound-Deskriptor nicht eindeutig zuordenbar (LinkedTrackID)" % n)
+        pairs.append((n, t, td, sd))
+    # --- Vorpruefung: Widerspruch bei essenzbeschreibenden Items -> Fehler, nichts wird geaendert
+    problems = []
+    for n, t, td, sd in pairs:
+        for field_, sv, tv, hint in _sound_conflicts(tgt, src, td, sd):
+            problems.append("Tonspur %d: %s weicht ab (Quelle %s, Ziel %s)%s" % (n, field_, sv, tv, hint))
+    if problems:
+        raise HeaderPatchError("Audio-Daten von Quelle und Ziel passen nicht zusammen - " + "; ".join(problems))
+    for n, t, td, sd in pairs:
         before = (td.key, list(td.items))
-        # Basis: Ziel-Werte, die bleiben
-        keep = {}
-        for q in _SOUND_KEEP:
-            keep[q] = tgt.get(td, q)
+        keep = {q: tgt.get(td, q) for q in _SOUND_KEEP}
+        s_ec, t_ec = src.get(sd, "FileDescriptor.EssenceContainer"), keep["FileDescriptor.EssenceContainer"]
+        same_ec = _ec_equal(s_ec, t_ec)
+        if not same_ec:
+            log.append("WARNUNG: Tonspur %d: EssenceContainer-Label weicht von der Quelle ab (Ziel %s, Quelle %s) - "
+                       "Deskriptor-Klasse (%s) und EssenceContainer des Ziels bleiben" % (
+                           n, t_ec.hex() if t_ec else "-", s_ec.hex() if s_ec else "-", set_name(td.key)))
+        new_key = sd.key if same_ec else td.key
+        allowed = _SOUND_ANCESTORS.get(set_name(new_key))
         new_items: list = []
         dropped_refs: list = []
+        dropped_cls: list = []
         used_keep = set()
         for tag, val in sd.items:
             ul = src.ul_of_tag(tag)
             if ul is None:
                 raise HeaderPatchError("Quell-Deskriptor enthaelt Tag 0x%04x ohne Primer-Eintrag" % tag)
-            if ul in ref_uls:
-                dropped_refs.append(src.item_name(tag))
-                continue
-            ttag = tgt.tag_for_ul(ul, create=True, full_ul=src.raw_ul_of_tag(tag))
             if ul == lt_ul:
-                new_items.append((ttag, struct.pack(">I", t.track_id)))
+                new_items.append((tgt.tag_for_ul(ul, create=True, full_ul=src.raw_ul_of_tag(tag)),
+                                  struct.pack(">I", t.track_id)))
                 used_keep.add("lt")
                 continue
-            q = next((k for k in _SOUND_KEEP if _ITEM_UL[k] == ul), None)
-            if q is not None:
+            if ul in keep_uls:
+                q = next(k for k in _SOUND_KEEP if _ITEM_UL[k] == ul)
                 used_keep.add(q)
                 if keep[q] is not None:
-                    new_items.append((ttag, keep[q]))
-                if q == "FileDescriptor.EssenceContainer" and keep[q] is not None and keep[q] != val:
-                    log.append("WARNUNG: Tonspur %d: EssenceContainer-Label weicht von der Quelle ab (Ziel %s, Quelle %s)" % (
-                        n, keep[q].hex(), val.hex()))
+                    new_items.append((tgt.tag_for_ul(ul, create=True, full_ul=src.raw_ul_of_tag(tag)), keep[q]))
                 continue
-            new_items.append((ttag, val))
+            if ul in ref_uls or _is_ref_value(src, val):
+                dropped_refs.append(src.item_name(tag))
+                continue
+            if not same_ec and allowed is not None and ul in _ITEM_INFO \
+                    and _ITEM_INFO[ul][0].split(".")[0] not in allowed:
+                dropped_cls.append(src.item_name(tag))
+                continue
+            new_items.append((tgt.tag_for_ul(ul, create=True, full_ul=src.raw_ul_of_tag(tag)), val))
         for q in _SOUND_KEEP:
             if q not in used_keep and keep[q] is not None:
                 new_items.append((tgt.tag_for_ul(_ITEM_UL[q], create=True), keep[q]))
         if "lt" not in used_keep:
             new_items.append((tgt.tag_for_ul(lt_ul, create=True), struct.pack(">I", t.track_id)))
-        # Verweise, die das Ziel bisher hatte und die entfallen: Zielsets entfernen
+        # Verweise, die das Ziel bisher hatte und die entfallen: untergeordnete Zielsets entfernen
         old_refs = []
         for tag, val in td.items:
             ul = tgt.ul_of_tag(tag)
-            if ul in ref_uls:
-                old_refs.append((tag, val))
-        td.key = sd.key
+            if ul in (iu_ul, lt_ul) or ul in keep_uls or not (ul in ref_uls or _is_ref_value(tgt, val)):
+                continue
+            old_refs.append((tag, val))
+        td.key = new_key
         td.items = new_items
         for tag, val in old_refs:
-            for u in uid_list(val):
+            for u in ([val] if len(val) == 16 else uid_list(val)):
                 o = tgt.by_uid().get(u)
-                if o is not None:
+                if o is not None and (tgt.name(o).endswith("SubDescriptor") or "Locator" in tgt.name(o)):
                     tgt.remove_set(o)
             log.append("Tonspur %d: Verweis %s im Ziel entfernt (Quelle hat keinen solchen Verweis)" % (
                 n, tgt.item_name(tag)))
         if dropped_refs:
-            log.append("Tonspur %d: Verweise der Quelle (%s) nicht uebernommen" % (n, ", ".join(sorted(set(dropped_refs)))))
+            log.append("HINWEIS: Tonspur %d: Verweise der Quelle (%s) nicht uebernommen" % (
+                n, ", ".join(sorted(set(dropped_refs)))))
+        if dropped_cls:
+            log.append("HINWEIS: Tonspur %d: Items der Quell-Klasse (%s) passen nicht zur Ziel-Klasse und wurden "
+                       "nicht uebernommen" % (n, ", ".join(sorted(set(dropped_cls)))))
         after = (td.key, list(td.items))
         if after != before:
             log.append("Tonspur %d: Sound-Deskriptor an Quelle angeglichen (%s)" % (
@@ -1278,7 +1373,8 @@ def _adopt_text(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: Str
 
 def adopt_headers(tgt: HeaderMetadata, src: HeaderMetadata) -> list:
     """Ziel-Header-Metadaten (im Speicher) an die Quelle angleichen, Regeln a)-d) der SPEC.
-    Gibt deutsche Kurzbeschreibungen der Aenderungen zurueck (Warnungen beginnen mit 'WARNUNG:')."""
+    Gibt deutsche Kurzbeschreibungen der Aenderungen zurueck (Warnungen beginnen mit 'WARNUNG:',
+    bewusst nicht uebernommene Items mit 'HINWEIS:')."""
     log: list = []
     _adopt_identification(tgt, src, log)
     ts, ss = resolve(tgt), resolve(src)
@@ -1299,7 +1395,7 @@ def compare_headers(tgt: HeaderMetadata, src: HeaderMetadata) -> list:
         msgs = adopt_headers(work, src)
     except HeaderPatchError as e:
         return ["Abweichung: %s" % e]
-    return ["Abweichung: " + m for m in msgs if not m.startswith("WARNUNG:")]
+    return ["Abweichung: " + m for m in msgs if not m.startswith(("WARNUNG:", "HINWEIS:"))]
 
 
 def adopt_from_source(target: Union[str, Path], source: Union[str, Path]) -> list:

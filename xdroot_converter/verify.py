@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import struct
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
@@ -29,6 +31,208 @@ class ClipExpect:
     fps: Fraction
     expect_anc: bool = False
     expect_xml: bool = False
+    level: Optional[str] = None  # erwartetes H.264-Level, z. B. "4.2" (None = nicht pruefen)
+
+
+# --------------------------------------------------------------------------- Dateistruktur
+
+_PK_PREFIX = bytes.fromhex("060e2b34020501")  # Partition Pack / RIP: Bytes 0-6 (Byte 7 = Version)
+_PK_TAIL = bytes.fromhex("0d01020101")         # Bytes 8-12
+_MAX_RIP_ENTRIES = 20000
+
+
+def _is_pk_key(key: bytes, kinds: tuple = (2, 3, 4)) -> bool:
+    return (len(key) == 16 and key[:7] == _PK_PREFIX and key[8:13] == _PK_TAIL
+            and key[13] in kinds and key[14] in (1, 2, 3, 4) and key[15] == 0)
+
+
+def _read_pack(f, offset: int, size: int) -> dict:
+    """Partition Pack an ``offset`` lesen (nur wenige Bytes).  Wirft ValueError mit deutschem Text."""
+    if offset < 0 or offset + 16 + 1 > size:
+        raise ValueError(f"Partition Pack bei {offset} liegt ausserhalb der Datei ({size} Bytes)")
+    f.seek(offset)
+    head = f.read(16 + 9)
+    key = head[:16]
+    if not _is_pk_key(key):
+        raise ValueError(f"an Offset {offset} steht kein Partition Pack")
+    b = head[16]
+    if b < 0x80:
+        ln, nb = b, 1
+    else:
+        nb = (b & 0x7F) + 1
+        if nb > 9 or len(head) < 16 + nb:
+            raise ValueError(f"Partition Pack bei {offset}: ungueltige Laengenangabe")
+        ln = int.from_bytes(head[17:16 + nb], "big")
+    if ln < 88 or ln > (1 << 20):
+        raise ValueError(f"Partition Pack bei {offset}: unplausible Laenge {ln}")
+    if offset + 16 + nb + ln > size:
+        raise ValueError(f"Partition Pack bei {offset} ist abgeschnitten")
+    f.seek(offset + 16 + nb)
+    v = f.read(ln)
+    if len(v) != ln:
+        raise ValueError(f"Partition Pack bei {offset} ist abgeschnitten")
+    this, prev, footer, hbc, ibc = struct.unpack(">QQQQQ", v[8:48])
+    return {"offset": offset, "kind": key[13], "status": key[14], "this": this, "prev": prev,
+            "footer": footer, "hbc": hbc, "ibc": ibc, "end": offset + 16 + nb + ln}
+
+
+def check_structure(
+    path,
+    frames: Optional[int] = None,
+    n_audio: Optional[int] = None,
+    fps: Optional[Fraction] = None,
+) -> list[str]:
+    """Schnelle Strukturpruefung einer (Ziel-)MXF ohne mxf2raw/ffmpeg - liest nur kleine Bereiche,
+    auch bei sehr grossen Dateien.  Faengt abgeschnittene, nicht abgeschlossene und beschaedigte
+    Dateien ab: Header-Partition geschlossen+vollstaendig, FooterPartition-Offset zeigt auf ein
+    Footer-Partition-Pack, RIP am Dateiende (Laenge, Eintraege zeigen auf Partition Packs, letzter =
+    Footer), Dateigroesse = Ende des RIP.  Mit ``frames``/``n_audio``/``fps`` zusaetzlich die
+    Mindestgroesse (Header + Frames x Tonbytes).  Leere Liste = in Ordnung."""
+    out: list[str] = []
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            out = _structure_problems(f, size, frames, n_audio, fps)
+    except OSError as e:
+        return [f"Datei nicht lesbar: {e}"]
+    return out
+
+
+def _structure_problems(f, size: int, frames, n_audio, fps) -> list[str]:
+    out: list[str] = []
+    try:
+        hp = _read_pack(f, 0, size)
+    except ValueError as e:
+        return [f"Header-Partition: {e}"]
+    if hp["kind"] != 2:
+        return ["erste Partition ist keine Header-Partition"]
+    if hp["status"] != 4:
+        out.append(f"Header-Partition nicht geschlossen/vollstaendig (Status {hp['status']}) - Datei unvollstaendig geschrieben?")
+    if hp["this"] != 0:
+        out.append(f"Header-Partition: ThisPartition {hp['this']} statt 0")
+    foff = hp["footer"]
+    footer = None
+    if foff == 0:
+        out.append("FooterPartition im Header-Pack ist 0 (Datei nicht abgeschlossen)")
+    elif foff >= size:
+        out.append(f"FooterPartition-Offset {foff} liegt hinter dem Dateiende ({size} Bytes) - Datei abgeschnitten")
+    else:
+        try:
+            footer = _read_pack(f, foff, size)
+            if footer["kind"] != 4:
+                out.append(f"an FooterPartition-Offset {foff} steht kein Footer-Partition-Pack")
+                footer = None
+            elif footer["status"] != 4:
+                out.append(f"Footer-Partition nicht geschlossen/vollstaendig (Status {footer['status']})")
+            elif footer["this"] != foff:
+                out.append(f"Footer-Partition: ThisPartition {footer['this']} statt {foff}")
+        except ValueError as e:
+            out.append(f"Footer-Partition: {e}")
+            footer = None
+    # RIP am Dateiende
+    rip_start = None
+    if size < 16 + 1 + 4 + 4:
+        out.append("Datei zu klein fuer ein RIP")
+    else:
+        f.seek(size - 4)
+        (rip_len,) = struct.unpack(">I", f.read(4))
+        if rip_len < 16 + 1 + 4 + 12 or rip_len > size:
+            out.append(f"RIP fehlt oder ist beschaedigt (Laengenangabe {rip_len} am Dateiende) - Datei abgeschnitten?")
+        else:
+            f.seek(size - rip_len)
+            raw = f.read(rip_len)
+            ok = len(raw) == rip_len and raw[:7] == _PK_PREFIX and raw[8:13] == _PK_TAIL and raw[13:16] == b"\x11\x01\x00"
+            body = b""
+            if ok:
+                b = raw[16]
+                if b < 0x80:
+                    ln, nb = b, 1
+                else:
+                    nb = (b & 0x7F) + 1
+                    ln = int.from_bytes(raw[17:16 + nb], "big") if nb <= 9 else -1
+                body = raw[16 + nb:16 + nb + ln] if ln >= 0 else b""
+                ok = ln >= 4 + 12 and len(body) == ln and 16 + nb + ln == rip_len and ((ln - 4) % 12) == 0
+            if not ok:
+                out.append("RIP am Dateiende hat keine passende Laenge/Struktur - Datei abgeschnitten oder beschaedigt")
+            else:
+                rip_start = size - rip_len
+                entries = [struct.unpack(">IQ", body[i:i + 12]) for i in range(0, ln - 4, 12)]
+                out += _rip_problems(f, size, entries, footer, foff, rip_start)
+    # Mindestgroesse: Header + Frames x Tonbytes (faengt Abschneiden, nicht genullte Essenz)
+    if frames and n_audio and fps:
+        try:
+            per_frame = (48000 * fps.denominator) // fps.numerator * 3 * n_audio
+            header_end = hp["end"] + hp["hbc"] + hp["ibc"]
+            need = header_end + frames * per_frame
+            if size < need:
+                out.append(f"Datei zu klein: {size} Bytes, mindestens {need} erwartet ({frames} Frames Ton + Kopfdaten) - abgeschnitten?")
+        except (ZeroDivisionError, AttributeError):
+            pass
+    return out
+
+
+def _rip_problems(f, size: int, entries: list, footer, foff: int, rip_start: int) -> list[str]:
+    out: list[str] = []
+    if len(entries) > _MAX_RIP_ENTRIES:
+        return [f"RIP mit {len(entries)} Eintraegen unplausibel"]
+    offs = [o for _sid, o in entries]
+    if offs != sorted(offs) or len(set(offs)) != len(offs):
+        out.append("RIP: Offsets nicht aufsteigend/eindeutig")
+    if not offs or offs[0] != 0:
+        out.append("RIP: erster Eintrag zeigt nicht auf die Header-Partition (Offset 0)")
+    packs = []
+    for o in offs:
+        try:
+            if o >= rip_start:
+                raise ValueError(f"RIP-Eintrag {o} liegt hinter dem Beginn des RIP ({rip_start})")
+            pk = _read_pack(f, o, size)
+            if pk["this"] != o:
+                raise ValueError(f"ThisPartition {pk['this']} passt nicht zum RIP-Eintrag {o}")
+            packs.append(pk)
+        except ValueError as e:
+            out.append(f"RIP: {e}")
+    if packs and len(packs) == len(offs):
+        if packs[-1]["kind"] != 4:
+            out.append("RIP: letzter Eintrag ist keine Footer-Partition")
+        elif foff and packs[-1]["offset"] != foff:
+            out.append(f"RIP: letzter Eintrag ({packs[-1]['offset']}) != FooterPartition-Offset ({foff})")
+        for a, b in zip(packs, packs[1:]):
+            if a["end"] + a["hbc"] + a["ibc"] > b["offset"]:
+                out.append(f"Partition bei {a['offset']}: Header-/Index-Bytes ragen in die naechste Partition")
+        last = packs[-1]
+        if last["end"] + last["hbc"] + last["ibc"] > rip_start:
+            out.append("Footer-Partition: Header-/Index-Bytes ragen ueber das RIP hinaus")
+    return out
+
+
+# --------------------------------------------------------------------------- H.264-Eigenschaften
+
+
+def check_h264_props(probe: "mxfinfo.ProbeResult", n_audio: Optional[int] = None, level: Optional[str] = None) -> list[str]:
+    """Pflichteigenschaften des Ziel-Videos aus einem ffprobe-Ergebnis (gemeinsam fuer Fortsetzen
+    und --verify): H.264 High 4:2:2, yuv422p10le, 1920x1080, tv, bt709 (Space/Transfer/Primaries),
+    Level (z. B. "4.2"), Anzahl Audiostreams, Audio pcm_s24le/48000."""
+    out: list[str] = []
+    pv = probe.video or {}
+    if pv.get("codec_name") != "h264" or pv.get("profile") != "High 4:2:2":
+        out.append(f"H.264-Profil {pv.get('codec_name')}/{pv.get('profile')} statt h264/High 4:2:2")
+    if pv.get("pix_fmt") != "yuv422p10le":
+        out.append(f"pix_fmt {pv.get('pix_fmt')} statt yuv422p10le")
+    if (pv.get("width"), pv.get("height")) != ("1920", "1080"):
+        out.append(f"Aufloesung {pv.get('width')}x{pv.get('height')}")
+    for k in ("color_space", "color_transfer", "color_primaries"):
+        if pv.get(k) != "bt709":
+            out.append(f"{k} {pv.get(k)} statt bt709")
+    if pv.get("color_range") != "tv":
+        out.append(f"color_range {pv.get('color_range')} statt tv")
+    if level and pv.get("level") != level.replace(".", ""):
+        out.append(f"H.264-Level {pv.get('level')} statt {level.replace('.', '')}")
+    if n_audio is not None and len(probe.audio) != n_audio:
+        out.append(f"ffprobe sieht {len(probe.audio)} Audiospuren statt {n_audio}")
+    for i, a in enumerate(probe.audio):
+        if a.get("codec_name") != "pcm_s24le" or a.get("sample_rate") != "48000":
+            out.append(f"Audiostream {i + 1}: {a.get('codec_name')}/{a.get('sample_rate')} Hz statt pcm_s24le/48000")
+    return out
 
 
 def check_clip(
@@ -43,6 +247,10 @@ def check_clip(
     Mit ``source`` (Quell-MXF) werden zusaetzlich die Sony-Kopfdaten gegen die Quelle geprueft
     (``check_header``); ohne ``source`` nur die uebrigen Eigenschaften."""
     problems: list[str] = []
+    # 1. Dateistruktur (schnell): abgeschnittene/unvollstaendige Dateien sofort erkennen
+    problems = [f"Struktur: {m}" for m in check_structure(path, frames=exp.frames, n_audio=exp.n_audio, fps=exp.fps)]
+    if problems:
+        return problems
     try:
         info = mxfinfo.read_mxf_info(str(path), cancel=cancel)
     except tools.Cancelled:
@@ -84,6 +292,13 @@ def check_clip(
         problems.append("ANC-Spur fehlt")
     if exp.expect_xml and not any(t.get("scheme_id") == NRT_SCHEME_ID for t in info.text_objects):
         problems.append("eingebettetes XML fehlt")
+    # H.264-/Audio-Eigenschaften (ein ffprobe-Aufruf)
+    try:
+        problems += check_h264_props(mxfinfo.run_ffprobe(str(path), cancel=cancel), exp.n_audio, exp.level)
+    except tools.Cancelled:
+        raise
+    except Exception as e:  # noqa: BLE001
+        problems.append(f"ffprobe-Pruefung: {e}")
     if source is not None:
         problems += check_header(path, source, cancel=cancel, info=info, src_info=source_info)
     return problems
@@ -175,11 +390,14 @@ def check_header(
     der Kopfdaten (getrennt von den uebrigen Pruefungen, damit "nur Kopfdaten nachziehen" moeglich ist)."""
     out: list[str] = []
     try:
-        out += [m for m in mxfheader.compare_with_source(path, source)]
+        # compare_with_source beginnt seine Saetze mit "Abweichung: " - nicht doppelt praefixen
+        out += [m[len("Abweichung: "):] if m.startswith("Abweichung: ") else m
+                for m in mxfheader.compare_with_source(path, source)]
     except tools.Cancelled:
         raise
     except (mxfheader.HeaderPatchError, mxfheader.MxfParseError, OSError) as e:
         out.append(f"Kopfdaten nicht pruefbar: {e}")
+    out += check_header_direct(path, source)
     try:
         if info is None:
             info = mxfinfo.read_mxf_info(str(path), cancel=cancel)
@@ -191,6 +409,115 @@ def check_header(
         out.append(f"Kopfdaten (mxf2raw) nicht lesbar: {e}")
         return out
     out += compare_info_header(info, src_info)
+    return out
+
+
+_ZERO_UMIDS = (bytes(32), bytes(16))
+_IDENT_ITEMS = ("CompanyName", "ProductName", "VersionString", "ProductUID", "ProductVersion",
+                "ToolkitVersion", "Platform")
+
+
+def _track_ids(pkg) -> dict:
+    out: dict = {}
+    for t in pkg.tracks:
+        if t.kind in ("timecode", "picture", "sound", "data"):
+            out.setdefault(t.kind, []).append(t.track_id)
+    return {k: sorted(x for x in v if x is not None) for k, v in out.items()}
+
+
+def check_header_direct(path: Path, source: Path) -> list[str]:
+    """Direkte, vom Patcher (``compare_with_source``) unabhaengige Pruefung der Kopfdaten ueber
+    ``mxfheader.read_header`` (nur Lesen): je Package gleiche Track-IDs von Timecode-/Bild-/Ton-/
+    Daten-Tracks wie die Quelle; jeder SourceClip im Material Package zeigt auf einen existierenden
+    Track des File Packages; jede LinkedTrackID eines Deskriptors existiert; Identification-Felder
+    byte-gleich zur Quelle."""
+    out: list[str] = []
+    try:
+        ht, hs = mxfheader.read_header(path), mxfheader.read_header(source)
+        st, ss = mxfheader.resolve(ht), mxfheader.resolve(hs)
+    except (mxfheader.MxfParseError, mxfheader.HeaderPatchError, OSError, ValueError, KeyError, IndexError) as e:
+        return [f"Kopfdaten (direkt) nicht lesbar: {e}"]
+    try:
+        for label, tp, sp in (("Material Package", st.material, ss.material), ("File Package", st.file, ss.file)):
+            if tp is None or sp is None:
+                if (tp is None) != (sp is None):
+                    out.append(f"{label}: im Ziel {'fehlt' if tp is None else 'vorhanden'}, in der Quelle {'vorhanden' if tp is None else 'fehlt'}")
+                continue
+            a, b = _track_ids(tp), _track_ids(sp)
+            for kind in ("timecode", "picture", "sound", "data"):
+                x, y = a.get(kind, []), b.get(kind, [])
+                if kind == "data" and not x:
+                    continue  # ANC fehlt im Ziel: wird getrennt gemeldet (ggf. gewollt bei --no-anc)
+                if x != y:
+                    out.append(f"{label}: Track-IDs {kind} {x} statt {y} (Quelle)")
+        if st.file is not None:
+            fids = {t.track_id for t in st.file.tracks}
+            fuid = st.file.uid
+            if st.material is not None:
+                for t in st.material.tracks:
+                    for c in t.clips:
+                        pid = ht.get(c, "SourceClip.SourcePackageID")
+                        tid = ht.u32(c, "SourceClip.SourceTrackID")
+                        if pid is None or pid in _ZERO_UMIDS or pid != fuid:
+                            continue
+                        if tid not in fids:
+                            out.append(f"Material Package: SourceClip (Track {t.track_id}) verweist auf nicht vorhandenen "
+                                       f"Track {tid} des File Packages")
+            for d in st.file_descriptors():
+                for ref in ("FileDescriptor.LinkedTrackID", "AES3AudioDescriptor.LinkedTimecodeTrackID"):
+                    v = ht.u32(d, ref)
+                    if v is not None and v not in fids:
+                        out.append(f"Deskriptor {ref.split('.')[1]} {v} zeigt auf keinen Track des File Packages")
+        it = st.identifications[-1] if st.identifications else None
+        isr = ss.identifications[-1] if ss.identifications else None
+        if it is None or isr is None:
+            if (it is None) != (isr is None):
+                out.append("Identification: nur in " + ("der Quelle" if it is None else "im Ziel") + " vorhanden")
+        else:
+            for f in _IDENT_ITEMS:
+                x, y = ht.get(it, "Identification." + f), hs.get(isr, "Identification." + f)
+                if x != y:
+                    out.append(f"Identification {f}: {x.hex() if x is not None else '(fehlt)'} statt "
+                               f"{y.hex() if y is not None else '(fehlt)'} (Quelle, Hex)")
+    except tools.Cancelled:
+        raise
+    except Exception as e:  # noqa: BLE001
+        out.append(f"Kopfdaten (direkt) Pruefung fehlgeschlagen: {e}")
+    return out
+
+
+def tail_decode_check(path: str, frames: int, fps: Optional[Fraction], cancel: Optional[tools.CancelToken] = None,
+                      tail_frames: int = 25) -> list[str]:
+    """Kurzer Decode-Test am ENDE des Clips (ca. die letzten ``tail_frames`` Frames, Video und Ton):
+    faengt Clips mit fehlendem/defektem Ende auch ohne --deep.  Springt per Zeit-Seek (bmx-Indextabelle)
+    eine halbe Frame-Dauer vor das erste Test-Frame; erwartet mindestens so viele dekodierte Frames."""
+    if not frames or not fps or fps <= 0:
+        return []
+    n = min(tail_frames, frames)
+    start = frames - n
+    seek = max(0.0, (float(start) - 0.5) / float(fps))
+    got = [0]
+
+    def on_line(line: str) -> None:
+        if line.startswith("frame="):
+            try:
+                got[0] = int(line.split("=", 1)[1].strip())
+            except ValueError:
+                pass
+
+    res = tools.run_capture(
+        [tools.find_tool("ffmpeg"), "-hide_banner", "-nostdin", "-v", "error", "-nostats",
+         "-progress", "pipe:1", "-ss", f"{seek:.6f}", "-i", path, "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"],
+        cancel=cancel, on_stdout_line=on_line, keep_lines=200,
+    )
+    out: list[str] = []
+    errs = [l for l in res.stderr.splitlines() if l.strip()]
+    if errs:
+        out.append(f"Decodierfehler am Clip-Ende: {errs[:3]}")
+    elif res.returncode != 0:
+        out.append(f"ffmpeg Rueckgabewert {res.returncode} beim Decodieren des Clip-Endes")
+    if got[0] < n:
+        out.append(f"Clip-Ende: nur {got[0]} von {n} erwarteten Frames dekodierbar (Ende fehlt/defekt?)")
     return out
 
 
@@ -320,6 +647,8 @@ def verify_card(
             raise
         except Exception as e:  # noqa: BLE001
             prob(f"MXF nicht lesbar: {e}")
+            for m in check_structure(mxf_path):
+                prob(f"Struktur: {m}")
             continue
         v = info.video
         is_l = v is not None and v.essence_type == XAVCL_ESSENCE_TYPE
@@ -353,6 +682,8 @@ def verify_card(
                 prob(f"M01.XML Duration {cx.duration} != MXF Dauer {info.duration}")
             if cx.num_audio is not None and cx.num_audio != len(info.audio):
                 prob(f"M01.XML numOfChannel {cx.num_audio} != MXF Audiospuren {len(info.audio)}")
+            if card.is_xavcl_codec(cx.video_codec) != is_l:
+                prob(f"M01.XML videoCodec {cx.video_codec} passt nicht zu MXF essence_type {v.essence_type if v else None}")
         if not is_l:
             rep.notes.append(f"{rel}: kein XAVC-L ({v.essence_type if v else 'ohne Video'}) - unveraendert uebernommen?")
         else:
@@ -366,26 +697,14 @@ def verify_card(
                     prob(f"Audiospur {i + 1}: {d}")
             if any(a.duration != info.duration for a in info.audio):
                 prob("Audiospuren haben nicht dieselbe Dauer wie das Video")
+            for m in check_structure(mxf_path, frames=info.duration, n_audio=len(info.audio), fps=info.edit_rate):
+                prob(f"Struktur: {m}")
             # ffprobe
             try:
                 pr = mxfinfo.run_ffprobe(str(mxf_path), cancel=cancel)
-                pv = pr.video or {}
-                if pv.get("codec_name") != "h264" or pv.get("profile") != "High 4:2:2":
-                    prob(f"H.264-Profil {pv.get('codec_name')}/{pv.get('profile')} statt h264/High 4:2:2")
-                if pv.get("pix_fmt") != "yuv422p10le":
-                    prob(f"pix_fmt {pv.get('pix_fmt')} statt yuv422p10le")
-                if (pv.get("width"), pv.get("height")) != ("1920", "1080"):
-                    prob(f"Aufloesung {pv.get('width')}x{pv.get('height')}")
-                for k in ("color_space", "color_transfer", "color_primaries"):
-                    if pv.get(k) != "bt709":
-                        prob(f"{k} {pv.get(k)} statt bt709")
-                if pv.get("color_range") != "tv":
-                    prob(f"color_range {pv.get('color_range')} statt tv")
-                exp_level = card.level_from_codec(mat.video_type) if mat else None
-                if exp_level and pv.get("level") != exp_level.replace(".", ""):
-                    prob(f"H.264-Level {pv.get('level')} statt {exp_level.replace('.', '')}")
-                if len(pr.audio) != len(info.audio):
-                    prob(f"ffprobe sieht {len(pr.audio)} Audiospuren statt {len(info.audio)}")
+                exp_level = card.level_from_codec(mat.video_type if mat else (cx.video_codec if cx else ""))
+                for m in check_h264_props(pr, len(info.audio), exp_level):
+                    prob(m)
                 if info.edit_rate is not None:
                     want = mxfinfo.gop_length(info.edit_rate)
                     gaps = measure_gop(str(mxf_path), cancel=cancel)
@@ -401,6 +720,14 @@ def verify_card(
                 # ohne Quelle: Plausibilitaet gegen das Sony-Muster
                 for m in check_sony_pattern(info):
                     prob(f"Kopfdaten: {m}")
+            if not deep:
+                try:
+                    for m in tail_decode_check(str(mxf_path), info.duration, info.edit_rate, cancel=cancel):
+                        prob(m)
+                except tools.Cancelled:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    prob(f"Decode-Test am Clip-Ende: {e}")
             if deep:
                 log(f"  Tiefenpruefung (kompletter Decode): {rel}")
                 n, errs = deep_decode_check(str(mxf_path), cancel=cancel)
@@ -437,11 +764,10 @@ def verify_card(
                     if len(info.audio) != len(si.audio):
                         prob(f"Audiospuren {len(info.audio)} != Quelle {len(si.audio)}")
                     if bool(info.anc_tracks) != bool(si.anc_tracks):
-                        prob(f"ANC-Spur: Ziel {'ja' if info.anc_tracks else 'nein'}, Quelle {'ja' if si.anc_tracks else 'nein'}")
+                        extra = " (gewollt bei --no-anc)" if si.anc_tracks and not info.anc_tracks else ""
+                        prob(f"ANC-Spur: Ziel {'ja' if info.anc_tracks else 'nein'}, Quelle {'ja' if si.anc_tracks else 'nein'}{extra}")
                     elif si.anc_tracks and len(info.anc_tracks[0].anc_elements) != len(si.anc_tracks[0].anc_elements):
-                        rep.notes.append(
-                            f"{rel}: ANC-Manifest {len(info.anc_tracks[0].anc_elements)} Elemente (Quelle {len(si.anc_tracks[0].anc_elements)})"
-                        )
+                        prob(f"ANC-Manifest {len(info.anc_tracks[0].anc_elements)} Elemente statt {len(si.anc_tracks[0].anc_elements)} (Quelle)")
                     if bool(info.text_objects) != bool(si.text_objects):
                         rep.notes.append(
                             f"{rel}: eingebettetes XML: Ziel {'ja' if info.text_objects else 'nein'}, Quelle {'ja' if si.text_objects else 'nein'}"
@@ -477,7 +803,17 @@ def _compare_files(src: Path, tgt: Path, tgt_mp: "card.MediaPro", src_mp: "card.
 
     converted_xavcl = {m.rel_path.casefold(): m.video_type for m in tgt_mp.materials if card.is_xavcl_codec(m.video_type)}
     n_files = 0
-    missing: list[str] = []
+    missing: list[str] = []  # fehlt im Ziel, ohne dass der zugehoerige Clip bewusst fehlt
+    skipped: list[str] = []  # fehlt im Ziel, gehoert zu einem im Ziel fehlenden Clip (--only / --unlisted skip)
+    # Clips, deren MXF im Ziel nicht vorhanden ist: ihre Begleitdateien in Clip/ und Thmbnl/
+    # werden vom Konverter bewusst nicht kopiert (card.copy_structure)
+    tgt_clip = tgt / "Clip"
+    tgt_mxf = {p.name.casefold() for p in tgt_clip.iterdir()} if tgt_clip.is_dir() else set()
+    src_clip = src / "Clip"
+    absent_pats = []
+    if src_clip.is_dir():
+        absent_pats = [card.related_pattern(p.stem) for p in sorted(src_clip.iterdir())
+                       if p.is_file() and p.suffix.upper() == ".MXF" and p.name.casefold() not in tgt_mxf]
     for root, _d, files in os.walk(src):
         rel_root = Path(root).relative_to(src)
         for fn in files:
@@ -487,7 +823,12 @@ def _compare_files(src: Path, tgt: Path, tgt_mp: "card.MediaPro", src_mp: "card.
             t = tgt / rel
             n_files += 1
             if not t.is_file():
-                missing.append(rel)
+                top = rel_root.parts[0].casefold() if rel_root.parts else ""
+                if top in ("clip", "thmbnl") and any(pt.match(fn) for pt in absent_pats):
+                    skipped.append(rel)
+                else:
+                    missing.append(rel)
+                    rep.problems.append(f"{rel}: Datei der Quelle fehlt im Ziel")
                 continue
             sb, tb = (Path(root) / fn).read_bytes(), t.read_bytes()
             if sb == tb:
@@ -508,7 +849,9 @@ def _compare_files(src: Path, tgt: Path, tgt_mp: "card.MediaPro", src_mp: "card.
                     rep.problems.append(f"{rel}: Datei unterscheidet sich von der Quelle")
             else:
                 rep.problems.append(f"{rel}: Datei unterscheidet sich von der Quelle")
-    if missing:
-        shown = ", ".join(missing[:3]) + (" ..." if len(missing) > 3 else "")
-        rep.notes.append(f"{len(missing)} Nicht-MXF-Datei(en) der Quelle fehlen im Ziel (Clips bewusst uebersprungen?): {shown}")
-    rep.notes.append(f"{n_files - len(missing)} Nicht-MXF-Dateien der Quelle verglichen")
+    if absent_pats:
+        n_abs = len(absent_pats)
+        shown = ", ".join(skipped[:3]) + (" ..." if len(skipped) > 3 else "")
+        rep.notes.append(f"{n_abs} Quell-Clip(s) fehlen im Ziel (bewusst uebersprungen: --only / --unlisted skip?)"
+                         + (f"; {len(skipped)} zugehoerige Begleitdatei(en) fehlen ebenfalls: {shown}" if skipped else ""))
+    rep.notes.append(f"{n_files - len(missing) - len(skipped)} Nicht-MXF-Dateien der Quelle verglichen")

@@ -223,7 +223,10 @@ def mxfdump_summary(path: Path, timeout: float, dump_to: Path | None):
     t0 = time.time()
     out = open(dump_to, "w", encoding="utf-8", errors="replace") if dump_to else None
     try:
-        proc = subprocess.Popen([exe, str(path)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        # MXFDump kennt keine Option "nur Header-Metadaten": es laeuft immer ueber alle KLV der Datei
+        # (Essenz wird nur uebersprungen, nicht gelesen).  Die Ausgabe wird begrenzt: keine
+        # Essenz-Bytes (--limit-bytes 0), nur die ersten Index-Eintraege (--limit-entries 8).
+        proc = subprocess.Popen([exe, "--limit-bytes", "0", "--limit-entries", "8", str(path)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, text=True, errors="replace")
         n = 0
         for line in proc.stdout:

@@ -69,12 +69,25 @@ def _is_within(child: Path, parent: Path) -> bool:
         return False
 
 
-def check_target(src_xdroot: Path, target_dir: Path) -> Path:
-    """Liefert das Ziel-XDROOT (target_dir/XDROOT); wirft ValueError bei Konflikt mit der Quelle."""
+def check_target(src_xdroot: Path, target_dir: Path, chosen_source: Optional[Path] = None) -> Path:
+    """Liefert das Ziel-XDROOT (target_dir/XDROOT); wirft ValueError bei Konflikt mit der Quelle.
+
+    ``chosen_source``: der vom Nutzer GEWAEHLTE Quellordner (kann der Elternordner des XDROOT sein);
+    das Ziel darf auch nicht darin liegen, sonst wuerde die Kamerakarte beschrieben."""
     out_root = target_dir / "XDROOT"
     s, o = src_xdroot.resolve(), out_root.resolve()
     if s == o or _is_within(o, s) or _is_within(s, o):
         raise ValueError("Der Zielordner darf nicht gleich oder innerhalb der Quelle liegen (und umgekehrt).")
+    if chosen_source is not None:
+        try:
+            c = Path(chosen_source).resolve()
+        except OSError:
+            c = None
+        if c is not None and (_is_within(o, c) or _is_within(target_dir, c)):
+            raise ValueError(
+                "Der Zielordner darf nicht innerhalb des gewaehlten Quellordners liegen "
+                "(die Kamerakarte wuerde sonst beschrieben)."
+            )
     return out_root
 
 
@@ -105,6 +118,7 @@ class Material:
 class MediaPro:
     system_kind: str = ""
     system_id: str = ""
+    media_id: str = ""  # Attached@mediaId (Kennung des Datentraegers)
     materials: list = field(default_factory=list)  # nur type="MXF"
 
     def find(self, rel_path: str) -> Optional[Material]:
@@ -123,6 +137,8 @@ def parse_mediapro(data: bytes) -> MediaPro:
         if tag == "System":
             mp.system_kind = el.get("systemKind", "")
             mp.system_id = el.get("systemId", "")
+        elif tag == "Attached":
+            mp.media_id = el.get("mediaId", "")
         elif tag == "Material" and el.get("type", "").upper() == "MXF":
             dur = el.get("dur")
             ch = el.get("ch")
@@ -264,25 +280,168 @@ def related_pattern(stem: str) -> re.Pattern:
     return re.compile("^" + re.escape(stem) + r"([A-Za-z]\d{2})?\.[A-Za-z0-9]+$", re.I)
 
 
+TMP_SUFFIX = ".xdrctmp"
+_CLIP_XML_RE = re.compile(r"^(.*)M\d\d\.XML$", re.I)
+
+
+def clip_xml_stem(name: str) -> Optional[str]:
+    """'PDW F5_0001M01.XML' -> 'PDW F5_0001' (sonst None)."""
+    m = _CLIP_XML_RE.match(name)
+    return m.group(1) if m else None
+
+
+def write_bytes_atomic(dst: Path, data: bytes, stat_from: Optional[Path] = None) -> None:
+    """Datei atomar schreiben: Temp-Datei im selben Ordner, fsync, dann os.replace.
+    Zeitstempel/Rechte von ``stat_from`` werden uebernommen (soweit moeglich)."""
+    dst = Path(dst)
+    tmp = dst.with_name(dst.name + TMP_SUFFIX)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        if stat_from is not None:
+            try:
+                shutil.copystat(stat_from, tmp)
+            except OSError:
+                pass
+        os.replace(tmp, dst)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def copy_file_atomic(src: Path, dst: Path) -> None:
+    """Datei mit Zeitstempeln atomar kopieren (Temp-Datei im Zielordner + os.replace)."""
+    dst = Path(dst)
+    tmp = dst.with_name(dst.name + TMP_SUFFIX)
+    try:
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def same_file_stat(a: Path, b: Path) -> bool:
+    """Gleiche Groesse und (auf 2 s) gleicher Zeitstempel."""
+    try:
+        sa, sb = a.stat(), b.stat()
+    except OSError:
+        return False
+    return sa.st_size == sb.st_size and abs(sa.st_mtime - sb.st_mtime) < 2
+
+
+def remove_stray_temp_files(root: Path) -> int:
+    """Liegengebliebene Temp-Dateien (nach hartem Abbruch) entfernen."""
+    n = 0
+    if not root.is_dir():
+        return 0
+    for r, _d, files in os.walk(root):
+        for fn in files:
+            if fn.endswith(TMP_SUFFIX):
+                try:
+                    (Path(r) / fn).unlink()
+                    n += 1
+                except OSError:
+                    pass
+    return n
+
+
+def check_existing_target(src_root: Path, out_root: Path, src_mp: MediaPro) -> None:
+    """Prueft, dass ein bereits vorhandenes Ziel-XDROOT zur selben Karte gehoert.  Wirft ValueError
+    (Abbruch VOR jeder Aenderung).  Nicht vorhandenes oder leeres Ziel ist in Ordnung."""
+    if not out_root.exists():
+        return
+    prefix = "Der Zielordner enthaelt bereits eine andere Karte oder fremde Daten: "
+    if not out_root.is_dir():
+        raise ValueError(prefix + f"'{out_root}' ist keine Ordner.")
+    src_clip_names = {p.name.casefold() for p in list_clip_mxf(src_root)}
+    clip_dir = None
+    for c in out_root.iterdir():
+        if c.is_dir() and c.name.casefold() == "clip":
+            clip_dir = c
+    tgt_mxfs = list_clip_mxf(out_root) if clip_dir is not None else []
+    mp_file = out_root / "MEDIAPRO.XML"
+    if not mp_file.is_file():
+        if tgt_mxfs:
+            raise ValueError(prefix + f"{len(tgt_mxfs)} MXF-Datei(en) in Clip/ ohne MEDIAPRO.XML ({tgt_mxfs[0].name} ...). "
+                             "Bitte einen leeren oder neuen Zielordner waehlen.")
+        # Fremde Dateien (nicht aus der Quelle) in einem XDROOT ohne MEDIAPRO.XML
+        for r, _d, files in os.walk(out_root):
+            for fn in files:
+                if fn.endswith(TMP_SUFFIX):
+                    continue
+                rel = (Path(r) / fn).relative_to(out_root)
+                if not (src_root / rel).exists():
+                    raise ValueError(prefix + f"{rel.as_posix()} gehoert nicht zur Quelle und es gibt keine MEDIAPRO.XML. "
+                                     "Bitte einen leeren oder neuen Zielordner waehlen.")
+        return
+    try:
+        tmp = parse_mediapro(mp_file.read_bytes())
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(prefix + f"MEDIAPRO.XML im Ziel ist nicht lesbar ({e}). "
+                         "Bitte einen leeren oder neuen Zielordner waehlen.") from e
+    if src_mp.system_id and tmp.system_id and src_mp.system_id != tmp.system_id:
+        raise ValueError(prefix + f"systemId {tmp.system_id} im Ziel, {src_mp.system_id} in der Quelle.")
+    if src_mp.media_id and tmp.media_id and src_mp.media_id != tmp.media_id:
+        raise ValueError(prefix + f"mediaId {tmp.media_id} im Ziel, {src_mp.media_id} in der Quelle.")
+    src_umids = {m.umid for m in src_mp.materials if m.umid}
+    foreign = [m for m in tmp.materials if m.umid and m.umid not in src_umids]
+    if foreign:
+        raise ValueError(prefix + f"{len(foreign)} Clip(s) der MEDIAPRO.XML im Ziel stehen nicht in der Quelle "
+                         f"(z. B. {foreign[0].rel_path}).")
+    for p in tgt_mxfs:
+        if p.name.casefold() not in src_clip_names:
+            raise ValueError(prefix + f"Clip/{p.name} gehoert nicht zur Quelle.")
+
+
 def copy_structure(
     src: Path,
     dst: Path,
     skip_stems: Optional[set[str]] = None,
     log: Optional[Callable[[str], None]] = None,
     cancel_check: Optional[Callable[[], None]] = None,
+    errors: Optional[list] = None,
+    skip_xml: bool = True,
 ) -> int:
     """Kopiert alle Nicht-MXF-Dateien (und leere Ordner) 1:1 mit Zeitstempeln. Gibt Dateianzahl zurueck.
 
     ``skip_stems``: Clip-Namen (ohne Endung, casefold), deren Dateien ausgelassen werden (nur in Clip/ und Thmbnl/).
+    ``skip_xml`` (Standard): ``MEDIAPRO.XML`` und ``Clip/*M??.XML`` werden NICHT kopiert; sie schreibt der
+    Ablauf selbst (zustandsabhaengig, damit ein Folgelauf fertige Clips nicht auf XAVC-I zuruecksetzt).
+    ``errors``: Liste, in die Fehler je Datei als ``(relativer Pfad, Meldung)`` gesammelt werden; ohne diese
+    Liste wird der erste Fehler ausgeloest.  Abbruch (cancel_check) wird immer weitergereicht.
     """
     skip_pats = [related_pattern(s) for s in (skip_stems or set())]
     count = 0
     dirs: list[tuple[Path, Path]] = []
-    for root, dnames, fnames in os.walk(src):
+
+    def fail(rel: str, e: Exception) -> None:
+        if errors is None:
+            raise e
+        errors.append((rel, str(e)))
+        if log:
+            log(f"{rel}: {e}")
+
+    for root, dnames, fnames in os.walk(src, onerror=lambda e: fail(str(getattr(e, "filename", src)), e)):
         rootp = Path(root)
         rel = rootp.relative_to(src)
         target_dir = dst / rel
-        target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            fail(rel.as_posix() or ".", e)
+            continue
         dirs.append((rootp, target_dir))
         top = rel.parts[0].casefold() if rel.parts else ""
         for fn in fnames:
@@ -290,19 +449,21 @@ def copy_structure(
                 cancel_check()
             if top == "clip" and fn.upper().endswith(".MXF"):
                 continue
+            if skip_xml and not rel.parts and fn.upper() == "MEDIAPRO.XML":
+                continue
+            if skip_xml and top == "clip" and len(rel.parts) == 1 and clip_xml_stem(fn) is not None:
+                continue
             if top in ("clip", "thmbnl") and any(p.match(fn) for p in skip_pats):
                 continue
             s, d = rootp / fn, target_dir / fn
-            if d.exists():
-                try:
-                    ss, ds = s.stat(), d.stat()
-                    if ss.st_size == ds.st_size and abs(ss.st_mtime - ds.st_mtime) < 2:
-                        count += 1
-                        continue
-                except OSError:
-                    pass
-            shutil.copy2(s, d)
-            count += 1
+            try:
+                if d.exists() and same_file_stat(s, d):
+                    count += 1
+                    continue
+                copy_file_atomic(s, d)
+                count += 1
+            except OSError as e:
+                fail((rel / fn).as_posix(), e)
     for s_dir, d_dir in reversed(dirs):  # Ordner-Zeitstempel zuletzt
         try:
             shutil.copystat(s_dir, d_dir)

@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
@@ -91,6 +92,10 @@ class CancelToken:
 
     def cancel(self) -> None:
         self._event.set()
+        self.kill_all()
+
+    def kill_all(self) -> None:
+        """Alle registrierten Kindprozesse sofort hart beenden (auch fuer ein zweites Strg+C)."""
         with self._lock:
             procs = list(self._procs)
         for p in procs:
@@ -98,30 +103,37 @@ class CancelToken:
 
 
 def kill_process(proc: subprocess.Popen) -> None:
+    """Prozess (unter Windows samt Prozessbaum) beenden.  Schlaegt taskkill fehl oder fehlt es,
+    wird trotzdem ``proc.kill()`` versucht."""
+    try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        return
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=CREATE_NO_WINDOW,
+                timeout=15,
+            )
+        except Exception:
+            pass  # taskkill fehlt/haengt: unten trotzdem proc.kill()
     try:
         if proc.poll() is None:
-            if sys.platform == "win32":
-                # Prozessbaum beenden
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=CREATE_NO_WINDOW,
-                )
-            else:
-                proc.kill()
-    except Exception:
-        try:
             proc.kill()
-        except Exception:
-            pass
+    except Exception:
+        pass
 
 
 class ProcResult:
-    def __init__(self, returncode: int, stdout: str, stderr: str) -> None:
+    def __init__(self, returncode: int, stdout: str, stderr: str, timed_out: bool = False) -> None:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+        self.timed_out = timed_out
 
 
 def _popen(args: list[str], **kw) -> subprocess.Popen:
@@ -160,10 +172,15 @@ def run_capture(
     on_stdout_line: Optional[Callable[[str], None]] = None,
     on_stderr_line: Optional[Callable[[str], None]] = None,
     keep_lines: Optional[int] = None,
+    timeout: Optional[float] = None,
 ) -> ProcResult:
     """Prozess starten, stdout und stderr parallel lesen (kein Pipe-Deadlock), UTF-8/replace.
 
     ``keep_lines`` begrenzt die gespeicherten Zeilen (None = alles bei Ausgabe-Parsing).
+    ``timeout`` (Sekunden): danach wird der Prozess beendet, ``ProcResult.timed_out`` ist dann True.
+
+    Gewartet wird in kurzen Schritten (nie unbegrenzt blockierend), damit unter Windows der
+    SIGINT-Handler (Strg+C) laufen kann und ein Abbruch sofort greift.
     """
     args = [str(a) for a in args]
     keep = keep_lines if keep_lines is not None else 10**9
@@ -178,10 +195,27 @@ def run_capture(
     t2 = threading.Thread(target=_drain, args=(proc.stderr, err, on_stderr_line, keep), daemon=True)
     t1.start()
     t2.start()
+    timed_out = False
+    t_start = time.monotonic()
     try:
-        proc.wait()
-        t1.join()
-        t2.join()
+        while proc.poll() is None:
+            if cancel is not None and cancel.cancelled:
+                kill_process(proc)
+                break
+            if timeout is not None and time.monotonic() - t_start > timeout:
+                timed_out = True
+                kill_process(proc)
+                break
+            try:
+                proc.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                pass
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        t1.join(timeout=5)
+        t2.join(timeout=5)
     finally:
         if cancel is not None:
             cancel.unregister(proc)
@@ -189,4 +223,5 @@ def run_capture(
             kill_process(proc)
     if cancel is not None:
         cancel.check()
-    return ProcResult(proc.returncode, "\n".join(out), "\n".join(err))
+    rc = proc.returncode if proc.returncode is not None else -1
+    return ProcResult(rc, "\n".join(out), "\n".join(err), timed_out=timed_out)

@@ -163,17 +163,28 @@ def partition_pack(kind, status, this, prev, footer, hbc, body_sid=0):
     return klv(key, v, 4)
 
 
-def build_file(meta, *, footer_meta=None, body=b"\xab" * 777):
-    """Header-Pack + Metadaten + Body (Dummy) + Footer-Pack (+ Metadaten) + RIP."""
+def fill_klv(n):
+    """KLV-Fill mit n Bytes Gesamtlaenge (n >= 20) bzw. nichts (n = 0): KAG-Fuellung vor dem Primer."""
+    return klv(FILL_V1, bytes(n - 20), 4) if n else b""
+
+
+def build_file(meta, *, footer_meta=None, body=b"\xab" * 777, kag_fill=0, rip=True, open_header=False):
+    """Header-Pack + [Fill] + Metadaten + Body (Dummy) + Footer-Pack (+ Metadaten) + RIP.
+    kag_fill: Bytes KLV-Fill zwischen Partition Pack und Primer (KAG > 1).  open_header: nur ein
+    offener Header (FooterPartition = 0, kein Footer, kein RIP) wie nach einem Stromausfall."""
+    pf = fill_klv(kag_fill)
+    if open_header:
+        return partition_pack(2, 2, 0, 0, 0, len(meta)) + pf + meta + body
     hdr_len = len(partition_pack(2, 4, 0, 0, 0, len(meta)))
-    footer_off = hdr_len + len(meta) + len(body)
-    out = partition_pack(2, 4, 0, 0, footer_off, len(meta)) + meta + body
+    footer_off = hdr_len + len(pf) + len(meta) + len(body)
+    out = partition_pack(2, 4, 0, 0, footer_off, len(meta)) + pf + meta + body
     out += partition_pack(4, 4, footer_off, 0, footer_off, len(footer_meta) if footer_meta else 0)
     if footer_meta:
-        out += footer_meta
-    rip_body = struct.pack(">IQ", 0, 0) + struct.pack(">IQ", 0, footer_off)
-    rip_len = 16 + 1 + len(rip_body) + 4
-    out += klv(bytes.fromhex("060e2b34020501010d01020101110100"), rip_body, 1) + struct.pack(">I", rip_len)
+        out += pf + footer_meta
+    if rip:
+        rip_body = struct.pack(">IQ", 0, 0) + struct.pack(">IQ", 0, footer_off)
+        rip_len = 16 + 1 + len(rip_body) + 4
+        out += klv(bytes.fromhex("060e2b34020501010d01020101110100"), rip_body, 1) + struct.pack(">I", rip_len)
     return out
 
 
@@ -601,6 +612,312 @@ class FillAndErrorTests(Base):
             mh.adopt_from_source(tgt, src)
         finally:
             src.chmod(0o644)
+
+
+FAKE_UL2 = bytes.fromhex("060e2b34010101ff0f0f0f0f0f0f0e00")
+EC_LABEL_V2 = EC_LABEL[:7] + b"\x02" + EC_LABEL[8:]       # nur das Registry-Versionsbyte anders
+
+
+def sound_descs(hm, st):
+    return [d for d in st.file_descriptors() if hm.get(d, "GenericSoundEssenceDescriptor.ChannelCount") is not None]
+
+
+def edit_sound(card, fn, cls=None):
+    """Items aller Sound-Deskriptoren einer Builder-Karte aendern: fn(items, linked_track_id) -> items;
+    cls: Klassenname der Deskriptoren aendern."""
+    out = []
+    for n, items, u, k in card.sets:
+        if n == "AES3AudioDescriptor":
+            lt = struct.unpack(">I", dict(items)["FileDescriptor.LinkedTrackID"])[0]
+            items = fn(list(items), lt)
+            n = cls or n
+        out.append((n, items, u, k))
+    card.sets = out
+    return card
+
+
+def with_item(name, value):
+    return lambda items, lt: [i for i in items if i[0] != name] + ([(name, value)] if value is not None else [])
+
+
+def sound_pair(src_fn=None, tgt_fn=None, src_cls=None, tgt_cls=None):
+    s = make_card(SRC_TRACKS, ident=SONY_IDENT)
+    t = make_card(TGT_TRACKS, ident=BMX_IDENT)
+    if src_fn or src_cls:
+        edit_sound(s, src_fn or (lambda i, lt: i), src_cls)
+    if tgt_fn or tgt_cls:
+        edit_sound(t, tgt_fn or (lambda i, lt: i), tgt_cls)
+    return s, t
+
+
+class KagFillTests(Base):
+    """KAG > 1: KLV-Fill zwischen Partition Pack und Primer; HeaderByteCount zaehlt ab dem Primer."""
+
+    def test_pre_fill_is_skipped_when_parsing(self):
+        s, t = self.std()
+        meta = t.build(6000)
+        for fill in (0, 20, 21, 340, 1000):
+            p = self.write("k%d.mxf" % fill, meta, kag_fill=fill)
+            part = mh.find_partitions(p)[0]
+            self.assertEqual(part.pre_fill, fill)
+            self.assertEqual(part.meta_offset, part.pack_end + fill)
+            self.assertEqual(mh.read_header(p).to_bytes(), meta)
+
+    def test_adopt_with_kag_fill_keeps_bytes_outside_header_metadata(self):
+        s, t = self.std()
+        for src_fill, tgt_fill in ((0, 340), (340, 0), (340, 508), (0, 0)):
+            src = self.write("src.mxf", s.build(6000), kag_fill=src_fill)
+            tgt = self.write("tgt.mxf", t.build(6000), kag_fill=tgt_fill, footer_meta=t.build(6000))
+            before = tgt.read_bytes()
+            msgs = mh.adopt_from_source(tgt, src)
+            self.assertTrue(msgs)
+            after = tgt.read_bytes()
+            self.assertEqual(len(before), len(after))
+            diff = [i for i in range(len(before)) if before[i] != after[i]]
+            regions = [(p.meta_offset, p.meta_offset + p.header_byte_count)
+                       for p in mh.find_partitions(tgt) if p.header_byte_count]
+            self.assertEqual(len(regions), 2)
+            self.assertTrue(diff)
+            self.assertTrue(all(any(a <= i < b for a, b in regions) for i in diff))
+            # der Fill vor dem Primer ist byte-genau unveraendert
+            p0 = mh.find_partitions(tgt)[0]
+            self.assertEqual(before[p0.pack_end:p0.meta_offset], after[p0.pack_end:p0.meta_offset])
+            self.assertEqual(mh.compare_with_source(tgt, src), [])
+            self.assertIn("Partition 0", mh.describe(tgt))
+
+    def test_kag_fill_not_counted_in_header_byte_count(self):
+        # Ohne Beruecksichtigung des Fills waere der Bereich um pre_fill Bytes verschoben
+        s, t = self.std()
+        p = self.write("a.mxf", t.build(6000), kag_fill=340)
+        part = mh.find_partitions(p)[0]
+        raw = p.read_bytes()
+        self.assertEqual(raw[part.meta_offset:part.meta_offset + 16], bytes.fromhex("060e2b34020501010d01020101050100"))
+
+
+class SoundRuleTests(Base):
+    def conflict(self, src_fn, tgt_fn, *needles):
+        s, t = sound_pair(src_fn, tgt_fn)
+        src, tgt = self.pair(s, t)
+        before = tgt.read_bytes()
+        with self.assertRaises(HeaderPatchError) as cm:
+            mh.adopt_from_source(tgt, src)
+        for n in needles:
+            self.assertIn(n, str(cm.exception))
+        self.assertEqual(before, tgt.read_bytes())
+        d = mh.compare_with_source(tgt, src)
+        self.assertTrue(d and d[0].startswith("Abweichung"))
+        return str(cm.exception)
+
+    def test_essence_conflicts_raise_and_keep_file(self):
+        self.conflict(with_item("GenericSoundEssenceDescriptor.QuantizationBits", u32(16)), None,
+                      "Tonspur 1", "QuantizationBits", "16", "24")
+        self.conflict(with_item("WaveAudioDescriptor.BlockAlign", struct.pack(">H", 2)), None, "BlockAlign")
+        self.conflict(with_item("GenericSoundEssenceDescriptor.ChannelCount", u32(2)), None, "ChannelCount")
+        self.conflict(with_item("WaveAudioDescriptor.AvgBps", u32(96000)), None, "AvgBps", "96000", "144000")
+        self.conflict(with_item("GenericSoundEssenceDescriptor.AudioSamplingRate", struct.pack(">ii", 48000, 1)),
+                      with_item("GenericSoundEssenceDescriptor.AudioSamplingRate", struct.pack(">ii", 44100, 1)),
+                      "AudioSamplingRate", "48000/1", "44100/1")
+
+    def test_all_conflicts_listed_for_all_tracks(self):
+        msg = self.conflict(with_item("GenericSoundEssenceDescriptor.QuantizationBits", u32(16)), None)
+        self.assertIn("Tonspur 1", msg)
+        self.assertIn("Tonspur 2", msg)
+
+    def test_sampling_rate_other_representation_is_equal(self):
+        s, t = sound_pair(with_item("GenericSoundEssenceDescriptor.AudioSamplingRate", struct.pack(">ii", 96000, 2)),
+                          with_item("GenericSoundEssenceDescriptor.AudioSamplingRate", struct.pack(">ii", 48000, 1)))
+        src, tgt = self.pair(s, t)
+        mh.adopt_from_source(tgt, src)
+
+    def test_sequence_offset_rules(self):
+        so = "WaveAudioDescriptor.SequenceOffset"
+        # Quelle 0, Ziel fehlt -> gleich
+        s, t = sound_pair(with_item(so, b"\x00"), None)
+        src, tgt = self.pair(s, t)
+        mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        self.assertEqual({hm.get(d, so) for d in sound_descs(hm, st)}, {b"\x00"})
+        # Quelle 2, Ziel fehlt -> Fehler mit --seq-off-Hinweis
+        msg = self.conflict(with_item(so, b"\x02"), None, "SequenceOffset", "--seq-off 2")
+        self.assertIn("fehlt", msg)
+        # Quelle 2, Ziel 0 -> Fehler;  Quelle 0, Ziel 1 -> Fehler;  Quelle 1, Ziel 1 -> ok
+        self.conflict(with_item(so, b"\x02"), with_item(so, b"\x00"), "SequenceOffset")
+        self.conflict(with_item(so, b"\x00"), with_item(so, b"\x01"), "SequenceOffset")
+        s, t = sound_pair(with_item(so, b"\x01"), with_item(so, b"\x01"))
+        src, tgt = self.pair(s, t)
+        mh.adopt_from_source(tgt, src)
+        # nur das Ziel hat den Wert (Quelle ohne): Strukturregel "wie Quelle" -> entfernt
+        s, t = sound_pair(None, with_item(so, b"\x01"))
+        src, tgt = self.pair(s, t)
+        mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        self.assertEqual({hm.get(d, so) for d in sound_descs(hm, st)}, {None})
+
+    def test_one_sided_item_follows_source(self):
+        rate = struct.pack(">ii", 48000, 1)
+        s, t = sound_pair(with_item("GenericSoundEssenceDescriptor.AudioSamplingRate", rate), None)
+        src, tgt = self.pair(s, t)
+        mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        self.assertEqual({hm.get(d, "GenericSoundEssenceDescriptor.AudioSamplingRate") for d in sound_descs(hm, st)}, {rate})
+
+    def test_class_taken_from_source_only_with_same_essence_container(self):
+        # gleiches Label (Versionsbyte darf abweichen): Klasse der Quelle
+        s, t = sound_pair(with_item("FileDescriptor.EssenceContainer", EC_LABEL_V2), None, src_cls="WaveAudioDescriptor")
+        src, tgt = self.pair(s, t)
+        msgs = mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        self.assertEqual({hm.name(d) for d in sound_descs(hm, st)}, {"WaveAudioDescriptor"})
+        self.assertFalse(any(m.startswith("WARNUNG:") for m in msgs))
+        self.assertEqual({hm.get(d, "FileDescriptor.EssenceContainer") for d in sound_descs(hm, st)}, {EC_LABEL})
+        # anderes Label: Ziel-Klasse bleibt, Warnung
+        s, t = sound_pair(with_item("FileDescriptor.EssenceContainer", EC_LABEL_OTHER), None, src_cls="WaveAudioDescriptor")
+        src, tgt = self.pair(s, t)
+        msgs = mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        self.assertEqual({hm.name(d) for d in sound_descs(hm, st)}, {"AES3AudioDescriptor"})
+        self.assertTrue(any(m.startswith("WARNUNG:") and "Klasse" in m and "EssenceContainer" in m for m in msgs))
+        self.assertEqual(mh.compare_with_source(tgt, src), [])        # Warnung ist keine Abweichung
+
+    def test_class_specific_items_not_copied_into_other_class(self):
+        emph = "AES3AudioDescriptor.Emphasis"
+        s, t = sound_pair(lambda items, lt: items + [(emph, b"\x01")] and with_item("FileDescriptor.EssenceContainer", EC_LABEL_OTHER)(
+            items + [(emph, b"\x01")], lt), None, tgt_cls="WaveAudioDescriptor")
+        src, tgt = self.pair(s, t)
+        msgs = mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        for d in sound_descs(hm, st):
+            self.assertEqual(hm.name(d), "WaveAudioDescriptor")
+            self.assertIsNone(hm.get(d, emph))
+        self.assertTrue(any(m.startswith("HINWEIS:") and "Emphasis" in m for m in msgs))
+
+    def test_reference_like_items_are_not_copied(self):
+        s, t = sound_pair()
+        src_ident_uid = s.sets[0][2]
+        other_uid = bytes([0x99]) * 16
+        plain16 = bytes(range(16))              # sieht nur aus wie eine UID, ist keine Referenz
+        extra_ref = (FAKE_UL, src_ident_uid)
+        extra_batch = (FAKE_UL2, batch([src_ident_uid, s.sets[1][2]]))
+        extra_plain = (bytes.fromhex("060e2b34010101ff0f0f0f0f0f0f0d00"), plain16)
+        extra_other = (bytes.fromhex("060e2b34010101ff0f0f0f0f0f0f0c00"), other_uid)    # unbekannte UID -> kein Set
+        edit_sound(s, lambda items, lt: items + [extra_ref, extra_batch, extra_plain, extra_other])
+        src, tgt = self.pair(s, t)
+        msgs = mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        for d in sound_descs(hm, st):
+            self.assertIsNone(hm.get(d, FAKE_UL))
+            self.assertIsNone(hm.get(d, FAKE_UL2))
+            self.assertEqual(hm.get(d, extra_plain[0]), plain16)
+            self.assertEqual(hm.get(d, extra_other[0]), other_uid)
+        note = [m for m in msgs if m.startswith("HINWEIS:") and "nicht uebernommen" in m]
+        self.assertEqual(len(note), 2)
+        self.assertEqual(mh.compare_with_source(tgt, src), [])        # bewusst nicht uebernommen != Abweichung
+
+    def test_target_sub_descriptor_removed_when_source_has_none(self):
+        s, t = sound_pair()
+        sub = t.add("AVCSubDescriptor", [("AVCSubDescriptor.AVCProfile", b"\x7a")])
+        edit_sound(t, lambda items, lt: items + [("GenericDescriptor.SubDescriptors", batch([sub]))])
+        src, tgt = self.pair(s, t)
+        msgs = mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        self.assertFalse([x for x in hm.sets if hm.name(x) == "AVCSubDescriptor"])
+        self.assertTrue(any("im Ziel entfernt" in m for m in msgs))
+
+
+class PairingTests(Base):
+    SRC = [("timecode", 1, 0, None), ("picture", 2, 0x15010500, None),
+           ("sound", 4, 0x16080301, None), ("sound", 3, 0x16080300, None), ("data", 5, 0x17010201, None)]
+
+    def test_sound_paired_by_track_number_not_by_position(self):
+        s = make_card(self.SRC, ident=SONY_IDENT)
+        # Deskriptoren unterscheidbar machen: Marker = Quell-Track-ID
+        edit_sound(s, lambda items, lt: items + [(FAKE_UL, bytes([lt]))])
+        t = make_card(TGT_TRACKS, ident=BMX_IDENT)
+        src, tgt = self.pair(s, t)
+        msgs = mh.adopt_from_source(tgt, src)
+        self.assertFalse(any(m.startswith("WARNUNG:") for m in msgs))
+        hm, st = structure(tgt)
+        by_num = {x.track_number: x.track_id for x in st.file.kind_tracks("sound")}
+        self.assertEqual(by_num, {0x16080300: 3, 0x16080301: 4})
+        # Reihenfolge wie Quelle (4 vor 3), aber die IDs gehoeren zur TrackNumber
+        self.assertEqual([x.track_id for x in st.file.kind_tracks("sound")], [4, 3])
+        self.assertEqual(sorted((x.track_id for x in st.material.kind_tracks("sound"))), [3, 4])
+        for mt in st.material.kind_tracks("sound"):
+            self.assertEqual(hm.u32(mt.clips[0], "SourceClip.SourceTrackID"), mt.track_id)
+        # Deskriptor gehoert zum richtigen Track (Marker = ID des Quell-Tracks gleicher TrackNumber)
+        for d in sound_descs(hm, st):
+            self.assertEqual(hm.get(d, FAKE_UL), bytes([hm.u32(d, "FileDescriptor.LinkedTrackID")]))
+        self.assertEqual(mh.compare_with_source(tgt, src), [])
+
+    def test_material_tracks_paired_via_source_clips(self):
+        # Ziel: Material-Package-Tracks in anderer Reihenfolge als die File-Package-Tracks
+        s = make_card(self.SRC, ident=SONY_IDENT)
+        t = make_card(TGT_TRACKS, ident=BMX_IDENT)
+        rev = []
+        for n, items, u, k in t.sets:
+            if n == "MaterialPackage":
+                tracks = mh.uid_list(dict(items)["GenericPackage.Tracks"])
+                # 2001/2002 im MP vertauschen
+                mp = [x for x in tracks]
+                sound_idx = [i for i, x in enumerate(mp) if i in (2, 3)]
+                mp[2], mp[3] = mp[3], mp[2]
+                items = [(r, (batch(mp) if r == "GenericPackage.Tracks" else v)) for r, v in items]
+            rev.append((n, items, u, k))
+        t.sets = rev
+        src, tgt = self.pair(s, t)
+        mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        fp_ids = {x.track_id: x.track_number for x in st.file.tracks}
+        for mt in st.material.kind_tracks("sound"):
+            # Material-Track und der File-Package-Track, auf den er zeigt, tragen dieselbe ID
+            self.assertEqual(hm.u32(mt.clips[0], "SourceClip.SourceTrackID"), mt.track_id)
+            self.assertIn(mt.track_id, fp_ids)
+        self.assertEqual(mh.compare_with_source(tgt, src), [])
+
+    def test_number_sets_mismatch_falls_back_to_position_with_warning(self):
+        src_tracks = [(k, i, (0x16080311 if i == 4 else n), nm) for k, i, n, nm in self.SRC]
+        s = make_card(src_tracks, ident=SONY_IDENT)
+        t = make_card(TGT_TRACKS, ident=BMX_IDENT)
+        src, tgt = self.pair(s, t)
+        msgs = mh.adopt_from_source(tgt, src)
+        self.assertTrue(any(m.startswith("WARNUNG:") and "Position" in m and "sound" in m for m in msgs))
+        hm, st = structure(tgt)
+        self.assertEqual([x.track_id for x in st.file.kind_tracks("sound")], [4, 3])      # wie Quell-Position
+
+    def test_zero_track_numbers_pair_by_position_silently(self):
+        zero = [(k, i, 0, nm) for k, i, n, nm in SRC_TRACKS]
+        s = make_card(zero, ident=SONY_IDENT)
+        t = make_card([(k, i, 0, nm) for k, i, n, nm in TGT_TRACKS], ident=BMX_IDENT)
+        src, tgt = self.pair(s, t)
+        msgs = mh.adopt_from_source(tgt, src)
+        self.assertFalse(any(m.startswith("WARNUNG:") for m in msgs))
+
+
+class OpenHeaderTests(Base):
+    def test_target_without_rip_and_open_header_is_refused(self):
+        s, t = self.std()
+        src = self.write("src.mxf", s.build(6000))
+        tgt = self.write("tgt.mxf", t.build(6000), open_header=True)
+        before = tgt.read_bytes()
+        with self.assertRaises(HeaderPatchError) as cm:
+            mh.adopt_from_source(tgt, src)
+        self.assertIn("nicht vollstaendig auffindbar", str(cm.exception))
+        self.assertEqual(before, tgt.read_bytes())
+
+    def test_source_without_rip_and_open_header_can_be_read(self):
+        s, t = self.std()
+        src = self.write("src.mxf", s.build(6000), open_header=True)
+        tgt = self.write("tgt.mxf", t.build(6000))
+        self.assertEqual(mh.read_header(src).to_bytes(), s.build(6000))
+        mh.adopt_from_source(tgt, src)
+        self.assertEqual(mh.compare_with_source(tgt, src), [])
+
+    def test_closed_file_without_rip_but_with_footer_is_still_patchable(self):
+        s, t = self.std()
+        src = self.write("src.mxf", s.build(6000))
+        tgt = self.write("tgt.mxf", t.build(6000), rip=False)
+        mh.adopt_from_source(tgt, src)
+        self.assertEqual(mh.compare_with_source(tgt, src), [])
 
 
 if __name__ == "__main__":
