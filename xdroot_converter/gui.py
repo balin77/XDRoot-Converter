@@ -133,15 +133,49 @@ def _fatal_hint(fatal: str) -> str:
     return ""
 
 
+MAX_REASON_CHARS = 100
+
+
+def _fail_reason(r) -> str:
+    """Grund eines fehlgeschlagenen Clips (erste Notiz, gekürzt) als Anhang ' – Grund' oder ''."""
+    notes = getattr(r, "notes", None) or []
+    if not notes:
+        return ""
+    txt = " ".join(str(notes[0]).split())
+    if not txt:
+        return ""
+    if len(txt) > MAX_REASON_CHARS:
+        txt = txt[:MAX_REASON_CHARS].rstrip() + " …"
+    return f" – {txt}"
+
+
 def completion_message(summary) -> tuple[str, str, str]:
     """Meldungsfenster nach einem Lauf: (art, titel, text); art = info | warning | error."""
     log_path = getattr(summary, "log_path", None)
     log_part = f"Protokolldatei:\n{log_path}" if log_path else ""
     if summary.fatal:
-        parts = ["Die Umwandlung konnte nicht durchgeführt werden:\n" + str(summary.fatal)]
+        if summary.results:
+            parts = ["Die Umwandlung wurde mit einem fatalen Fehler abgebrochen:\n" + str(summary.fatal)]
+        else:
+            parts = ["Die Umwandlung konnte nicht durchgeführt werden:\n" + str(summary.fatal)]
         hint = _fatal_hint(str(summary.fatal))
         if hint:
             parts.append(hint)
+        if summary.results:
+            parts.append(
+                f"bis dahin - umgewandelt: {summary.count(converter.ST_CONVERTED)}, "
+                f"bereits fertig: {summary.count(converter.ST_SKIPPED_DONE)}, "
+                f"kopiert: {summary.count(converter.ST_COPIED)}, "
+                f"Fehler: {summary.failed}")
+            try:
+                inc = summary.incomplete_text()
+            except Exception:  # noqa: BLE001
+                inc = ""
+            if inc:
+                if len(inc) > MAX_INCOMPLETE_CHARS:
+                    inc = inc[:MAX_INCOMPLETE_CHARS].rstrip() + " … (siehe Protokoll)"
+                parts.append(inc)
+            parts.append("Die Zielkarte ist unvollständig. Ein erneuter Lauf mit demselben Zielordner setzt fort.")
         if log_part:
             parts.append(log_part)
         return "error", "Umwandlung fehlgeschlagen", "\n\n".join(parts)
@@ -174,7 +208,7 @@ def completion_message(summary) -> tuple[str, str, str]:
     if failed:
         lines = ["Fehlgeschlagene Clips:"]
         for r in failed[:MAX_LISTED_FAILED]:
-            lines.append(f"  • {r.name}")
+            lines.append(f"  • {r.name}{_fail_reason(r)}")
         if len(failed) > MAX_LISTED_FAILED:
             lines.append(f"  … und {len(failed) - MAX_LISTED_FAILED} weitere (siehe Protokoll)")
         parts.append("\n".join(lines))
@@ -478,37 +512,43 @@ class App(_Base):  # type: ignore[misc,valid-type]
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("XDROOT-Converter", str(e))
             return
-        # Ziel ist selbst ein XDROOT? Dann den Elternordner anbieten (ohne Seiteneffekte)
-        if target_is_xdroot(dst):
-            parent = str(Path(dst).parent)
+        # Ziel ist selbst ein XDROOT? Dann den Elternordner anbieten (ohne Seiteneffekte:
+        # das Zielfeld wird erst gesetzt, wenn alle Prüfungen und Rückfragen positiv waren)
+        use_parent = target_is_xdroot(dst)
+        if use_parent:
             if Path(dst).parent == Path(dst):
                 messagebox.showwarning("XDROOT-Converter", "Der gewählte Zielordner ist selbst ein XDROOT. "
                                        "Bitte einen anderen Ordner als Ziel wählen.")
                 return
-            if not messagebox.askyesno(
-                    "XDROOT-Converter",
-                    f"Der gewählte Zielordner ist selbst ein XDROOT. "
-                    f"Soll der übergeordnete Ordner „{parent}“ als Ziel verwendet werden?"):
-                return
-            dst = parent
-            self.var_dst.set(dst)
-        # Grundprüfungen (Quelle ≠ Ziel) vor jeder Rückfrage
+            eff_dst = str(Path(dst).parent)
+        else:
+            eff_dst = dst
+        # Grundprüfungen (Quelle ≠ Ziel) vor jeder Rückfrage, mit dem tatsächlich verwendeten Ziel
         try:
             src_root = card.find_xdroot(src)
         except Exception as e:  # noqa: BLE001
             messagebox.showwarning("XDROOT-Converter", f"Quelle nicht nutzbar: {e}")
             return
         try:
-            card.check_target(src_root, Path(dst), chosen_source=Path(src))
+            card.check_target(src_root, Path(eff_dst), chosen_source=Path(src))
         except Exception as e:  # noqa: BLE001
             messagebox.showwarning("XDROOT-Converter", str(e))
             return
-        if target_xdroot_has_files(dst):
+        if use_parent:
+            if not messagebox.askyesno(
+                    "XDROOT-Converter",
+                    f"Der gewählte Zielordner ist selbst ein XDROOT. "
+                    f"Soll der übergeordnete Ordner „{eff_dst}“ als Ziel verwendet werden?"):
+                return
+        if target_xdroot_has_files(eff_dst):
             if not messagebox.askyesno(
                     "XDROOT-Converter",
                     "Der Zielordner enthält bereits ein XDROOT (z. B. von einem früheren Lauf). "
                     "Fertige Clips werden übersprungen, fehlende ergänzt. Fortfahren?"):
                 return
+        dst = eff_dst
+        if use_parent:
+            self.var_dst.set(dst)
         opts = converter.Options(
             source=src, target=dst, bitrate_mbps=bitrate, preset=self.var_preset.get() or "medium",
             unlisted="skip" if self.var_skip_unlisted.get() else "convert",

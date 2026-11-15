@@ -147,6 +147,41 @@ class CompletionDetailTests(unittest.TestCase):
         self.assertIn("Sperrdatei", text)
 
 
+class FatalMitErgebnissenTests(unittest.TestCase):
+    def test_fatal_mitten_im_lauf(self):
+        s = _summary(fatal="Platte voll", results=[_res("A", converter.ST_CONVERTED),
+                                                    _res("B", converter.ST_FAILED)],
+                     log_path=Path("Z/log.txt"))
+        kind, _t, text = gui.completion_message(s)
+        self.assertEqual(kind, "error")
+        self.assertIn("Platte voll", text)
+        self.assertNotIn("konnte nicht durchgeführt werden", text)
+        self.assertIn("umgewandelt: 1", text)
+        self.assertIn("Fehler: 1", text)
+        self.assertIn(s.incomplete_text(), text)
+        self.assertIn("log.txt", text)
+
+
+class FehlergrundTests(unittest.TestCase):
+    def test_grund_hinter_namen(self):
+        r = converter.ClipResult(name="C0001", status=converter.ST_FAILED,
+                                 notes=["FFmpeg beendet mit Code 1", "zweite Notiz"])
+        _k, _t, text = gui.completion_message(_summary(results=[r]))
+        self.assertIn("• C0001 – FFmpeg beendet mit Code 1", text)
+        self.assertNotIn("zweite Notiz", text)
+
+    def test_grund_gekuerzt(self):
+        r = converter.ClipResult(name="C0002", status=converter.ST_FAILED, notes=["x" * 300])
+        _k, _t, text = gui.completion_message(_summary(results=[r]))
+        line = [l for l in text.splitlines() if "C0002" in l and "•" in l][0]
+        self.assertLess(len(line), 140)
+        self.assertTrue(line.endswith("…"))
+
+    def test_ohne_notiz(self):
+        _k, _t, text = gui.completion_message(_summary(results=[_res("C0003", converter.ST_FAILED)]))
+        self.assertIn("  • C0003\n", text + "\n")
+
+
 class TargetFilesTests(unittest.TestCase):
     def test_xdroot_has_files(self):
         with tempfile.TemporaryDirectory() as d:

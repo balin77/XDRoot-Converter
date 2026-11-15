@@ -1,7 +1,6 @@
 @echo off
 setlocal
-pushd "%~dp0"
-if errorlevel 1 (
+pushd "%~dp0" || (
     echo Der Programmordner konnte nicht geoeffnet werden: "%~dp0"
     pause
     exit /b 1
@@ -26,9 +25,11 @@ set "PYMODE=python"
 :found
 rem GUI ohne Konsolenfenster starten, dieses Fenster schliesst sich danach
 if "%PYMODE%"=="py" goto :startpy
-where pythonw >nul 2>nul
-if errorlevel 1 goto :startconsole
-start "" pythonw -m xdroot_converter
+set "PYW="
+for /f "delims=" %%i in ('python -c "import sys,os;print(os.path.join(os.path.dirname(sys.executable),'pythonw.exe'))"') do set "PYW=%%i"
+if not defined PYW goto :startconsole
+if not exist "%PYW%" goto :startconsole
+start "" "%PYW%" -m xdroot_converter
 exit /b 0
 
 :startpy
