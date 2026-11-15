@@ -1,0 +1,306 @@
+ (created='2026-11-15 17:28:05.000')
+Application
+  name            : mxf2raw
+  lib_name        : bmx
+  lib_version     : 1.6.0
+  build_timestamp : 2025-03-28 08:42:37.000
+  scm_version     : v1.6
+Files: (1)
+  File #0:
+    file_uri        : file:///E:/FX6_Karte/Untitled/XDROOT/Clip/FX6ENG10562.MXF
+    mxf_version     : 1.3
+    op_label        : OP1A (external_essence='false', non_stream='false', multi_track='true', label='urn:smpte:ul:060e2b34.04010101.0d010201.01010900')
+    frame_wrapped   : true
+    Identifications: (1)
+      Identification #0:
+        generation_uid  : urn:uuid:dfd78a94-0639-1238-980e-9c50d1ae4ac3
+        company_name    : Sony
+        product_name    : Mem 
+        version_string  : 2.00
+        product_uid     : urn:uuid:cede1104-8280-11de-8a39-08004678031c
+        modified_date   : 2025-11-13 10:23:05.000
+    MaterialPackages: (1)
+      MaterialPackage #0:
+        package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.fe36c56e.920906db.9c50d1ff.feae4ac3
+        creation_date   : 2025-11-13 10:23:05.000
+        modified_date   : 2025-11-13 10:23:05.000
+    FileSourcePackages: (1)
+      FileSourcePackage #0:
+        package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.ff36c56e.920906db.9c50d1ff.feae4ac3
+        creation_date   : 2025-11-13 10:23:05.000
+        modified_date   : 2025-11-13 10:23:05.000
+Clip
+  edit_rate       : 50/1
+  duration        : 00:00:19:12 (count='962')
+  StartTimecodes:
+    material        : 10:22:08:12
+    file_source     : 10:22:08:12
+  Tracks: (6)
+    Track #0:
+      essence_kind    : Picture
+      essence_type    : AVC_High_422
+      ec_label        : urn:smpte:ul:060e2b34.0401010a.0d010301.02106001
+      edit_rate       : 50/1
+      duration        : 00:00:19:12 (count='962')
+      Packages: (1)
+        Package #0:
+          Material:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.fe36c56e.920906db.9c50d1ff.feae4ac3
+            track_id        : 2
+            track_number    : 0
+          FileSource:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.ff36c56e.920906db.9c50d1ff.feae4ac3
+            track_id        : 2
+            track_number    : 0x15010500
+            file_uri        : file:///E:/FX6_Karte/Untitled/XDROOT/Clip/FX6ENG10562.MXF
+      PictureDescriptor:
+        coding_label    : urn:smpte:ul:060e2b34.0401010d.04010202.01316001
+        signal_standard : SMPTE_274 (value='4')
+        frame_layout    : Full_Frame (value='0')
+        stored_width    : 1920
+        stored_height   : 1088
+        display_width   : 1920
+        display_height  : 1080
+        display_x_offset : 0
+        display_y_offset : 0
+        aspect_ratio    : 16/9
+        CDCIDescriptor:
+          component_depth : 10
+          horiz_subsamp   : 2
+          vert_subsamp    : 1
+          color_siting    : Cositing (value='0')
+    Track #1:
+      essence_kind    : Sound
+      essence_type    : WAVE_PCM
+      ec_label        : urn:smpte:ul:060e2b34.04010101.0d010301.02060300
+      edit_rate       : 50/1
+      duration        : 00:00:19:12 (count='962')
+      Packages: (1)
+        Package #0:
+          Material:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.fe36c56e.920906db.9c50d1ff.feae4ac3
+            track_id        : 3
+            track_number    : 0
+          FileSource:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.ff36c56e.920906db.9c50d1ff.feae4ac3
+            track_id        : 3
+            track_number    : 0x16040300
+            file_uri        : file:///E:/FX6_Karte/Untitled/XDROOT/Clip/FX6ENG10562.MXF
+      SoundDescriptor:
+        sampling_rate        : 48000/1
+        bits_per_sample      : 24
+        block_align          : 3
+        channel_count        : 1
+        locked               : true
+        audio_ref_level      : 0
+    Track #2:
+      essence_kind    : Sound
+      essence_type    : WAVE_PCM
+      ec_label        : urn:smpte:ul:060e2b34.04010101.0d010301.02060300
+      edit_rate       : 50/1
+      duration        : 00:00:19:12 (count='962')
+      Packages: (1)
+        Package #0:
+          Material:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.fe36c56e.920906db.9c50d1ff.feae4ac3
+            track_id        : 4
+            track_number    : 0
+          FileSource:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.ff36c56e.920906db.9c50d1ff.feae4ac3
+            track_id        : 4
+            track_number    : 0x16040301
+            file_uri        : file:///E:/FX6_Karte/Untitled/XDROOT/Clip/FX6ENG10562.MXF
+      SoundDescriptor:
+        sampling_rate        : 48000/1
+        bits_per_sample      : 24
+        block_align          : 3
+        channel_count        : 1
+        locked               : true
+        audio_ref_level      : 0
+    Track #3:
+      essence_kind    : Sound
+      essence_type    : WAVE_PCM
+      ec_label        : urn:smpte:ul:060e2b34.04010101.0d010301.02060300
+      edit_rate       : 50/1
+      duration        : 00:00:19:12 (count='962')
+      Packages: (1)
+        Package #0:
+          Material:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.fe36c56e.920906db.9c50d1ff.feae4ac3
+            track_id        : 5
+            track_number    : 0
+          FileSource:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.ff36c56e.920906db.9c50d1ff.feae4ac3
+            track_id        : 5
+            track_number    : 0x16040302
+            file_uri        : file:///E:/FX6_Karte/Untitled/XDROOT/Clip/FX6ENG10562.MXF
+      SoundDescriptor:
+        sampling_rate        : 48000/1
+        bits_per_sample      : 24
+        block_align          : 3
+        channel_count        : 1
+        locked               : true
+        audio_ref_level      : 0
+    Track #4:
+      essence_kind    : Sound
+      essence_type    : WAVE_PCM
+      ec_label        : urn:smpte:ul:060e2b34.04010101.0d010301.02060300
+      edit_rate       : 50/1
+      duration        : 00:00:19:12 (count='962')
+      Packages: (1)
+        Package #0:
+          Material:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.fe36c56e.920906db.9c50d1ff.feae4ac3
+            track_id        : 6
+            track_number    : 0
+          FileSource:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.ff36c56e.920906db.9c50d1ff.feae4ac3
+            track_id        : 6
+            track_number    : 0x16040303
+            file_uri        : file:///E:/FX6_Karte/Untitled/XDROOT/Clip/FX6ENG10562.MXF
+      SoundDescriptor:
+        sampling_rate        : 48000/1
+        bits_per_sample      : 24
+        block_align          : 3
+        channel_count        : 1
+        locked               : true
+        audio_ref_level      : 0
+    Track #5:
+      essence_kind    : Data
+      essence_type    : ANC_Data
+      ec_label        : urn:smpte:ul:060e2b34.04010109.0d010301.020e0000
+      edit_rate       : 50/1
+      duration        : 00:00:19:12 (count='962')
+      Packages: (1)
+        Package #0:
+          Material:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.fe36c56e.920906db.9c50d1ff.feae4ac3
+            track_id        : 7
+            track_number    : 0
+          FileSource:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.ff36c56e.920906db.9c50d1ff.feae4ac3
+            track_id        : 7
+            track_number    : 0x17010201
+            file_uri        : file:///E:/FX6_Karte/Untitled/XDROOT/Clip/FX6ENG10562.MXF
+      DataDescriptor:
+        ANCDescriptor:
+          Manifest: (13)
+            Element #0:
+              line_number     : 11
+              wrapping_type   : VANC_Progressive_Frame (value='4')
+              sample_coding   : ANC_8_Bit_Luma (value='4')
+              DIDType2:
+                did             : 0x43
+                sdid            : 0x05
+                description     : [RDD18] Acquisition Metadata Sets for Video Camera Parameters
+            Element #1:
+              line_number     : 12
+              wrapping_type   : VANC_Progressive_Frame (value='4')
+              sample_coding   : ANC_8_Bit_Luma (value='4')
+              DIDType2:
+                did             : 0x43
+                sdid            : 0x05
+                description     : [RDD18] Acquisition Metadata Sets for Video Camera Parameters
+            Element #2:
+              line_number     : 13
+              wrapping_type   : VANC_Progressive_Frame (value='4')
+              sample_coding   : ANC_8_Bit_Luma (value='4')
+              DIDType2:
+                did             : 0x43
+                sdid            : 0x05
+                description     : [RDD18] Acquisition Metadata Sets for Video Camera Parameters
+            Element #3:
+              line_number     : 14
+              wrapping_type   : VANC_Progressive_Frame (value='4')
+              sample_coding   : ANC_8_Bit_Luma (value='4')
+              DIDType2:
+                did             : 0x43
+                sdid            : 0x05
+                description     : [RDD18] Acquisition Metadata Sets for Video Camera Parameters
+            Element #4:
+              line_number     : 15
+              wrapping_type   : VANC_Progressive_Frame (value='4')
+              sample_coding   : ANC_8_Bit_Luma (value='4')
+              DIDType2:
+                did             : 0x43
+                sdid            : 0x05
+                description     : [RDD18] Acquisition Metadata Sets for Video Camera Parameters
+            Element #5:
+              line_number     : 16
+              wrapping_type   : VANC_Progressive_Frame (value='4')
+              sample_coding   : ANC_8_Bit_Luma (value='4')
+              DIDType2:
+                did             : 0x43
+                sdid            : 0x05
+                description     : [RDD18] Acquisition Metadata Sets for Video Camera Parameters
+            Element #6:
+              line_number     : 17
+              wrapping_type   : VANC_Progressive_Frame (value='4')
+              sample_coding   : ANC_8_Bit_Luma (value='4')
+              DIDType2:
+                did             : 0x43
+                sdid            : 0x05
+                description     : [RDD18] Acquisition Metadata Sets for Video Camera Parameters
+            Element #7:
+              line_number     : 18
+              wrapping_type   : VANC_Progressive_Frame (value='4')
+              sample_coding   : ANC_8_Bit_Luma (value='4')
+              DIDType2:
+                did             : 0x43
+                sdid            : 0x05
+                description     : [RDD18] Acquisition Metadata Sets for Video Camera Parameters
+            Element #8:
+              line_number     : 19
+              wrapping_type   : VANC_Progressive_Frame (value='4')
+              sample_coding   : ANC_8_Bit_Luma (value='4')
+              DIDType2:
+                did             : 0x43
+                sdid            : 0x05
+                description     : [RDD18] Acquisition Metadata Sets for Video Camera Parameters
+            Element #9:
+              line_number     : 20
+              wrapping_type   : VANC_Progressive_Frame (value='4')
+              sample_coding   : ANC_8_Bit_Luma (value='4')
+              DIDType2:
+                did             : 0x43
+                sdid            : 0x05
+                description     : [RDD18] Acquisition Metadata Sets for Video Camera Parameters
+            Element #10:
+              line_number     : 21
+              wrapping_type   : VANC_Progressive_Frame (value='4')
+              sample_coding   : ANC_8_Bit_Luma (value='4')
+              DIDType2:
+                did             : 0x43
+                sdid            : 0x05
+                description     : [RDD18] Acquisition Metadata Sets for Video Camera Parameters
+            Element #11:
+              line_number     : 22
+              wrapping_type   : VANC_Progressive_Frame (value='4')
+              sample_coding   : ANC_8_Bit_Luma (value='4')
+              DIDType2:
+                did             : 0x43
+                sdid            : 0x05
+                description     : [RDD18] Acquisition Metadata Sets for Video Camera Parameters
+            Element #12:
+              line_number     : 14
+              wrapping_type   : VANC_Progressive_Frame (value='4')
+              sample_coding   : ANC_8_Bit_Luma (value='4')
+              DIDType2:
+                did             : 0x53
+                sdid            : 0x01
+  TextObjects: (1)
+    TextObject #0:
+      scheme_id       : urn:uuid:786d4d22-8280-11de-8a39-08004678031c
+      mime_type       : text/xml
+      lang_code       : und
+      description     : 
+      encoding        : UTF8
+      generic_stream  : false
+      package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.fe36c56e.920906db.9c50d1ff.feae4ac3
+      track_id        : 8
+      component_index : 0
+LogMessages: (4)
+  warning : Failed to de-reference strong reference array element (item key = 06 0e 2b 34 01 01 01 09 06 01 01 04 06 10 00 00) (source='libMXF')
+  warning : Failed to de-reference strong reference array element (item key = 06 0e 2b 34 01 01 01 09 06 01 01 04 06 10 00 00) (source='libMXF')
+  warning : Failed to de-reference strong reference array element (item key = 06 0e 2b 34 01 01 01 09 06 01 01 04 06 10 00 00) (source='libMXF')
+  warning : Failed to de-reference strong reference array element (item key = 06 0e 2b 34 01 01 01 09 06 01 01 04 06 10 00 00) (source='libMXF')

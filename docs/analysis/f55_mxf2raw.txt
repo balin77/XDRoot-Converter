@@ -1,0 +1,292 @@
+ (created='2026-11-15 17:28:05.000')
+Application
+  name            : mxf2raw
+  lib_name        : bmx
+  lib_version     : 1.6.0
+  build_timestamp : 2025-03-28 08:42:37.000
+  scm_version     : v1.6
+Files: (1)
+  File #0:
+    file_uri        : file:///F:/XDROOT/Clip/PDW-F55_6753.MXF
+    mxf_version     : 1.3
+    op_label        : OP1A (external_essence='false', non_stream='false', multi_track='true', label='urn:smpte:ul:060e2b34.04010101.0d010201.01010900')
+    frame_wrapped   : true
+    Identifications: (1)
+      Identification #0:
+        generation_uid  : urn:uuid:a5e8fe0a-e0df-11f1-9e13-0800466b88c4
+        company_name    : Sony
+        product_name    : Mem 
+        version_string  : 2.00
+        product_uid     : urn:uuid:cede1104-8280-11de-8a39-08004678031c
+        modified_date   : 2026-11-15 10:30:58.000
+    MaterialPackages: (1)
+      MaterialPackage #0:
+        package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.41a62c70.591306dd.08004602.026b88c4
+        creation_date   : 2026-11-15 10:30:58.000
+        modified_date   : 2026-11-15 10:30:58.000
+    FileSourcePackages: (1)
+      FileSourcePackage #0:
+        package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.42a62c70.591306dd.08004602.026b88c4
+        creation_date   : 2026-11-15 10:30:58.000
+        modified_date   : 2026-11-15 10:30:58.000
+Clip
+  edit_rate       : 50/1
+  duration        : 00:31:35:10 (count='94760')
+  StartTimecodes:
+    material        : 00:00:00:00
+    file_source     : 00:00:00:00
+  Tracks: (10)
+    Track #0:
+      essence_kind    : Picture
+      essence_type    : AVCI_100_1080p
+      ec_label        : urn:smpte:ul:060e2b34.0401010a.0d010301.02106001
+      edit_rate       : 50/1
+      duration        : 00:31:35:10 (count='94760')
+      Packages: (1)
+        Package #0:
+          Material:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.41a62c70.591306dd.08004602.026b88c4
+            track_id        : 2
+            track_number    : 0
+          FileSource:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.42a62c70.591306dd.08004602.026b88c4
+            track_id        : 2
+            track_number    : 0x15010500
+            file_uri        : file:///F:/XDROOT/Clip/PDW-F55_6753.MXF
+      PictureDescriptor:
+        coding_label    : urn:smpte:ul:060e2b34.0401010a.04010202.01323104
+        signal_standard : SMPTE_274 (value='4')
+        frame_layout    : Full_Frame (value='0')
+        stored_width    : 1920
+        stored_height   : 1088
+        display_width   : 1920
+        display_height  : 1080
+        display_x_offset : 0
+        display_y_offset : 0
+        aspect_ratio    : 16/9
+        avci_header     : true
+        CDCIDescriptor:
+          component_depth : 10
+          horiz_subsamp   : 2
+          vert_subsamp    : 1
+          color_siting    : Cositing (value='0')
+    Track #1:
+      essence_kind    : Sound
+      essence_type    : WAVE_PCM
+      ec_label        : urn:smpte:ul:060e2b34.04010101.0d010301.02060300
+      edit_rate       : 50/1
+      duration        : 00:31:35:10 (count='94760')
+      Packages: (1)
+        Package #0:
+          Material:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.41a62c70.591306dd.08004602.026b88c4
+            track_id        : 3
+            track_number    : 0
+          FileSource:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.42a62c70.591306dd.08004602.026b88c4
+            track_id        : 3
+            track_number    : 0x16080300
+            file_uri        : file:///F:/XDROOT/Clip/PDW-F55_6753.MXF
+      SoundDescriptor:
+        sampling_rate        : 48000/1
+        bits_per_sample      : 24
+        block_align          : 3
+        channel_count        : 1
+        locked               : true
+        audio_ref_level      : 0
+    Track #2:
+      essence_kind    : Sound
+      essence_type    : WAVE_PCM
+      ec_label        : urn:smpte:ul:060e2b34.04010101.0d010301.02060300
+      edit_rate       : 50/1
+      duration        : 00:31:35:10 (count='94760')
+      Packages: (1)
+        Package #0:
+          Material:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.41a62c70.591306dd.08004602.026b88c4
+            track_id        : 4
+            track_number    : 0
+          FileSource:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.42a62c70.591306dd.08004602.026b88c4
+            track_id        : 4
+            track_number    : 0x16080301
+            file_uri        : file:///F:/XDROOT/Clip/PDW-F55_6753.MXF
+      SoundDescriptor:
+        sampling_rate        : 48000/1
+        bits_per_sample      : 24
+        block_align          : 3
+        channel_count        : 1
+        locked               : true
+        audio_ref_level      : 0
+    Track #3:
+      essence_kind    : Sound
+      essence_type    : WAVE_PCM
+      ec_label        : urn:smpte:ul:060e2b34.04010101.0d010301.02060300
+      edit_rate       : 50/1
+      duration        : 00:31:35:10 (count='94760')
+      Packages: (1)
+        Package #0:
+          Material:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.41a62c70.591306dd.08004602.026b88c4
+            track_id        : 5
+            track_number    : 0
+          FileSource:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.42a62c70.591306dd.08004602.026b88c4
+            track_id        : 5
+            track_number    : 0x16080302
+            file_uri        : file:///F:/XDROOT/Clip/PDW-F55_6753.MXF
+      SoundDescriptor:
+        sampling_rate        : 48000/1
+        bits_per_sample      : 24
+        block_align          : 3
+        channel_count        : 1
+        locked               : true
+        audio_ref_level      : 0
+    Track #4:
+      essence_kind    : Sound
+      essence_type    : WAVE_PCM
+      ec_label        : urn:smpte:ul:060e2b34.04010101.0d010301.02060300
+      edit_rate       : 50/1
+      duration        : 00:31:35:10 (count='94760')
+      Packages: (1)
+        Package #0:
+          Material:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.41a62c70.591306dd.08004602.026b88c4
+            track_id        : 6
+            track_number    : 0
+          FileSource:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.42a62c70.591306dd.08004602.026b88c4
+            track_id        : 6
+            track_number    : 0x16080303
+            file_uri        : file:///F:/XDROOT/Clip/PDW-F55_6753.MXF
+      SoundDescriptor:
+        sampling_rate        : 48000/1
+        bits_per_sample      : 24
+        block_align          : 3
+        channel_count        : 1
+        locked               : true
+        audio_ref_level      : 0
+    Track #5:
+      essence_kind    : Sound
+      essence_type    : WAVE_PCM
+      ec_label        : urn:smpte:ul:060e2b34.04010101.0d010301.02060300
+      edit_rate       : 50/1
+      duration        : 00:31:35:10 (count='94760')
+      Packages: (1)
+        Package #0:
+          Material:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.41a62c70.591306dd.08004602.026b88c4
+            track_id        : 7
+            track_number    : 0
+          FileSource:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.42a62c70.591306dd.08004602.026b88c4
+            track_id        : 7
+            track_number    : 0x16080304
+            file_uri        : file:///F:/XDROOT/Clip/PDW-F55_6753.MXF
+      SoundDescriptor:
+        sampling_rate        : 48000/1
+        bits_per_sample      : 24
+        block_align          : 3
+        channel_count        : 1
+        locked               : true
+        audio_ref_level      : 0
+    Track #6:
+      essence_kind    : Sound
+      essence_type    : WAVE_PCM
+      ec_label        : urn:smpte:ul:060e2b34.04010101.0d010301.02060300
+      edit_rate       : 50/1
+      duration        : 00:31:35:10 (count='94760')
+      Packages: (1)
+        Package #0:
+          Material:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.41a62c70.591306dd.08004602.026b88c4
+            track_id        : 8
+            track_number    : 0
+          FileSource:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.42a62c70.591306dd.08004602.026b88c4
+            track_id        : 8
+            track_number    : 0x16080305
+            file_uri        : file:///F:/XDROOT/Clip/PDW-F55_6753.MXF
+      SoundDescriptor:
+        sampling_rate        : 48000/1
+        bits_per_sample      : 24
+        block_align          : 3
+        channel_count        : 1
+        locked               : true
+        audio_ref_level      : 0
+    Track #7:
+      essence_kind    : Sound
+      essence_type    : WAVE_PCM
+      ec_label        : urn:smpte:ul:060e2b34.04010101.0d010301.02060300
+      edit_rate       : 50/1
+      duration        : 00:31:35:10 (count='94760')
+      Packages: (1)
+        Package #0:
+          Material:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.41a62c70.591306dd.08004602.026b88c4
+            track_id        : 9
+            track_number    : 0
+          FileSource:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.42a62c70.591306dd.08004602.026b88c4
+            track_id        : 9
+            track_number    : 0x16080306
+            file_uri        : file:///F:/XDROOT/Clip/PDW-F55_6753.MXF
+      SoundDescriptor:
+        sampling_rate        : 48000/1
+        bits_per_sample      : 24
+        block_align          : 3
+        channel_count        : 1
+        locked               : true
+        audio_ref_level      : 0
+    Track #8:
+      essence_kind    : Sound
+      essence_type    : WAVE_PCM
+      ec_label        : urn:smpte:ul:060e2b34.04010101.0d010301.02060300
+      edit_rate       : 50/1
+      duration        : 00:31:35:10 (count='94760')
+      Packages: (1)
+        Package #0:
+          Material:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.41a62c70.591306dd.08004602.026b88c4
+            track_id        : 10
+            track_number    : 0
+          FileSource:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.42a62c70.591306dd.08004602.026b88c4
+            track_id        : 10
+            track_number    : 0x16080307
+            file_uri        : file:///F:/XDROOT/Clip/PDW-F55_6753.MXF
+      SoundDescriptor:
+        sampling_rate        : 48000/1
+        bits_per_sample      : 24
+        block_align          : 3
+        channel_count        : 1
+        locked               : true
+        audio_ref_level      : 0
+    Track #9:
+      essence_kind    : Data
+      essence_type    : ANC_Data
+      ec_label        : urn:smpte:ul:060e2b34.04010109.0d010301.020e0000
+      edit_rate       : 50/1
+      duration        : 00:31:35:10 (count='94760')
+      Packages: (1)
+        Package #0:
+          Material:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.41a62c70.591306dd.08004602.026b88c4
+            track_id        : 11
+            track_number    : 0
+          FileSource:
+            package_uid     : urn:smpte:umid:060a2b34.01010105.01010d43.13000000.42a62c70.591306dd.08004602.026b88c4
+            track_id        : 11
+            track_number    : 0x17010201
+            file_uri        : file:///F:/XDROOT/Clip/PDW-F55_6753.MXF
+      DataDescriptor:
+        ANCDescriptor:
+          Manifest: (1)
+            Element #0:
+              line_number     : 11
+              wrapping_type   : VANC_Progressive_Frame (value='4')
+              sample_coding   : ANC_8_Bit_Luma (value='4')
+              DIDType2:
+                did             : 0x43
+                sdid            : 0x05
+                description     : [RDD18] Acquisition Metadata Sets for Video Camera Parameters

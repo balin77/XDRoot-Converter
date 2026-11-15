@@ -1,0 +1,304 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MediaProfile xmlns="http://xmlns.sony.net/pro/metadata/mediaprofile" createdAt="2025-11-13T22:50:48+01:00" version="2.30">
+	<Properties>
+		<System systemId="9C50D1FFFEAE4AC3" systemKind="ILME-FX6V ver.5.020" masterVersion="XAVC-XD@2.00.00"/>
+		<Attached mediaId="1840BD53920906D54AC39C50D1FFFEAE" mediaKind="ProfessionalDisc"
+			mediaName=""/>
+	</Properties>
+	<Contents>
+		<Material uri="./Clip/FX6ENG10561.MXF" type="MXF" offset="0" dur="446" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000665BA56E920906D39C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10561M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10561T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10562.MXF" type="MXF" offset="0" dur="962" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000FE36C56E920906DB9C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10562M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10562T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10563.MXF" type="MXF" offset="0" dur="3068" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000AB94286F920906D29C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10563M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10563T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10564.MXF" type="MXF" offset="0" dur="634" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D431300000096FC626F920906CE9C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10564M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10564T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10565.MXF" type="MXF" offset="0" dur="10912" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000D053816F920906D39C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10565M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10565T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10566.MXF" type="MXF" offset="0" dur="7934" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000E259D17A920906D69C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10566M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10566T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10567.MXF" type="MXF" offset="0" dur="930" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D43130000001106507B920906DE9C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10567M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10567T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10568.MXF" type="MXF" offset="0" dur="1502" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D43130000007DC7667B920906CE9C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10568M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10568T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10569.MXF" type="MXF" offset="0" dur="3242" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D43130000007940B27E920906DC9C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10569M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10569T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10570.MXF" type="MXF" offset="0" dur="60044" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D43130000007CDDE87E920906DA9C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10570M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10570T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10571.MXF" type="MXF" offset="0" dur="37838" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D431300000044398382920906D79C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10571M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10571T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10572.MXF" type="MXF" offset="0" dur="7778" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D431300000072064586920906D89C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10572M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10572T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10573.MXF" type="MXF" offset="0" dur="906" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D43130000007048CB86920906DD9C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10573M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10573T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10574.MXF" type="MXF" offset="0" dur="1422" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000323EF486920906D59C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10574M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10574T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10575.MXF" type="MXF" offset="0" dur="4256" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D43130000003FD31187920906CC9C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10575M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10575T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10576.MXF" type="MXF" offset="0" dur="2514" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D43130000000BB66087920906C59C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10576M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10576T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10577.MXF" type="MXF" offset="0" dur="45178" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000D5CF74A0920906DA9C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10577M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10577T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10578.MXF" type="MXF" offset="0" dur="55516" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000A53978A3920906CE9C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10578M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10578T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10579.MXF" type="MXF" offset="0" dur="1338" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D43130000000D74DAA6920906CC9C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10579M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10579T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10580.MXF" type="MXF" offset="0" dur="8116" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000BD8FB7B4920906DB9C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10580M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10580T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10581.MXF" type="MXF" offset="0" dur="2496" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D43130000005E4D3CB5920906C49C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10581M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10581T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10582.MXF" type="MXF" offset="0" dur="28548" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D43130000005E427BB5920906C99C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10582M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10582T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10583.MXF" type="MXF" offset="0" dur="870" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000110650B7920906C59C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10583M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10583T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10584.MXF" type="MXF" offset="0" dur="8892" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000DA4B68B7920906D59C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10584M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10584T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10585.MXF" type="MXF" offset="0" dur="5390" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D43130000002B1A09B8920906CD9C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10585M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10585T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10586.MXF" type="MXF" offset="0" dur="1456" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000666666B8920906C49C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10586M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10586T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10587.MXF" type="MXF" offset="0" dur="2866" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000A702B3B8920906C99C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10587M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10587T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10588.MXF" type="MXF" offset="0" dur="15328" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000E5F607B9920906CF9C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10588M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10588T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10589.MXF" type="MXF" offset="0" dur="3016" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000499FF4B9920906C29C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10589M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10589T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10590.MXF" type="MXF" offset="0" dur="2148" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000667127BA920906DE9C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10590M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10590T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10591.MXF" type="MXF" offset="0" dur="322" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000E17A14CE920906DD9C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10591M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10591T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10592.MXF" type="MXF" offset="0" dur="2582" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000A3703DCE920906C09C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10592M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10592T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10593.MXF" type="MXF" offset="0" dur="4742" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000563412D0920906CC9C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10593M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10593T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10594.MXF" type="MXF" offset="0" dur="5066" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D43130000008ED877D0920906D79C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10594M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10594T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10595.MXF" type="MXF" offset="0" dur="3012" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000D5C4B3D8920906D49C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10595M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10595T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10596.MXF" type="MXF" offset="0" dur="26762" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000A8F7F1D8920906C69C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10596M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10596T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10597.MXF" type="MXF" offset="0" dur="25162" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000F1A1A7DA920906D29C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10597M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10597T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10598.MXF" type="MXF" offset="0" dur="3028" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000D8822DDC920906D89C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10598M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10598T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10599.MXF" type="MXF" offset="0" dur="54494" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000C92F96DC920906C99C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10599M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10599T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10600.MXF" type="MXF" offset="0" dur="6944" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000EC3B36E5920906C29C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10600M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10600T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10601.MXF" type="MXF" offset="0" dur="43170" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D4313000000222222E6920906C19C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10601M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10601T01.JPG" type="JPG"/>
+		</Material>
+		<Material uri="./Clip/FX6ENG10602.MXF" type="MXF" offset="0" dur="4770" fps="50p" aspectRatio="16:9" ch="4"
+			videoType="AVC50_1920_1080_H422P@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D43130000008B25BFE8920906CE9C50D1FFFEAE4AC3"
+			status="none" flip="none">
+			<RelevantInfo uri="./Clip/FX6ENG10602M01.XML" type="XML"/>
+			<RelevantInfo uri="./Thmbnl/FX6ENG10602T01.JPG" type="JPG"/>
+		</Material>
+	</Contents>
+</MediaProfile>

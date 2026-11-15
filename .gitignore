@@ -1,0 +1,7 @@
+tools/
+_poc/
+_test_out/
+__pycache__/
+*.pyc
+.pytest_cache/
+local_paths.md

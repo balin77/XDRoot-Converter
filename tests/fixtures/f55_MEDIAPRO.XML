@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MediaProfile xmlns="http://xmlns.sony.net/pro/metadata/mediaprofile" createdAt="2026-11-15T12:02:35+01:00" version="2.10">
+	<Properties>
+		<System systemId="08004602026B88C4" systemKind="PMW-F55 ver.9.000"/>
+		<Attached mediaId="D7305267591306DD88C408004602026B" mediaKind="ProfessionalDisc"
+			mediaName=""/>
+	</Properties>
+	<Contents>
+		<Material uri="./Clip/PDW-F55_6753.MXF" type="MXF" offset="0" dur="94760" fps="50p" aspectRatio="16:9" ch="8"
+			videoType="AVC100CBG_1920_1080_H422IP@L42" audioType="LPCM24"
+			umid="060A2B340101010501010D431300000041A62C70591306DD08004602026B88C4"
+			status="none">
+			<RelevantInfo uri="./Clip/PDW-F55_6753M01.XML" type="XML"/>
+			<RelevantInfo uri="./Clip/PDW-F55_6753R01.BIM" type="BiM"/>
+		</Material>
+		<Material uri="./Take/PDW-F55_6753U01.SMI" type="PD-EDL" offset="0" dur="94760" fps="50p" aspectRatio="16:9" ch="8"
+			umid="060A2B340101010501010D431300000041A62C70591306FF08004602026B88C4"
+			status="none">
+			<Component uri="./Clip/PDW-F55_6753.MXF" type="MXF"
+				umid="060A2B340101010501010D431300000041A62C70591306DD08004602026B88C4"/>
+			<Component mediaId="D93C5867591306DA88C408004602026B" mediaKind="ProfessionalDisc" mediaName=""
+				uri="file:///XDROOT/Take/PDW-F55_6753.SMI" type="PD-EDL"
+				offset="94760"
+				umid="060A2B340101010501010D43130000009317CA75591306FC08004602026B88C4"/>
+			<RelevantInfo uri="./Take/PDW-F55_6753U01M01.XML" type="XML"/>
+		</Material>
+	</Contents>
+</MediaProfile>

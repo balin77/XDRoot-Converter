@@ -1,0 +1,5 @@
+# Kamera-Referenzdateien byte-genau speichern (CRLF/BOM der Kamera erhalten)
+tests/fixtures/** -text
+docs/analysis/** -text
+*.bat text eol=crlf
+*.ps1 text eol=crlf
