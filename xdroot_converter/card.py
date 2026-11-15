@@ -364,13 +364,9 @@ def check_existing_target(src_root: Path, out_root: Path, src_mp: MediaPro) -> N
         return
     prefix = "Der Zielordner enthaelt bereits eine andere Karte oder fremde Daten: "
     if not out_root.is_dir():
-        raise ValueError(prefix + f"'{out_root}' ist keine Ordner.")
+        raise ValueError(prefix + f"'{out_root}' ist kein Ordner.")
     src_clip_names = {p.name.casefold() for p in list_clip_mxf(src_root)}
-    clip_dir = None
-    for c in out_root.iterdir():
-        if c.is_dir() and c.name.casefold() == "clip":
-            clip_dir = c
-    tgt_mxfs = list_clip_mxf(out_root) if clip_dir is not None else []
+    tgt_mxfs = list_clip_mxf(out_root) if (out_root / "Clip").is_dir() else []
     mp_file = out_root / "MEDIAPRO.XML"
     if not mp_file.is_file():
         if tgt_mxfs:

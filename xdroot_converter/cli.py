@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import time
@@ -16,10 +17,13 @@ from . import converter, tools, verify
 
 
 class CliReporter(converter.Reporter):
-    def __init__(self) -> None:
+    def __init__(self, verbose: bool = False) -> None:
         self._last = 0.0
+        self.verbose = verbose
 
     def log(self, level: str, msg: str) -> None:
+        if level == "detail" and not self.verbose:
+            return  # Einzelheiten stehen nur in konvertierung.log (oder mit --verbose hier)
         prefix = {"warn": "WARNUNG: ", "error": "FEHLER: "}.get(level, "")
         print(prefix + msg, flush=True)
 
@@ -48,6 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-anc", action="store_true", help="ANC-Datenspur nicht uebernehmen")
     ap.add_argument("--no-sony-header", action="store_true",
                     help="MXF-Kopfdaten NICHT an die Quelle angleichen (Ausgabe traegt dann bmx-Kennungen und bmx-Track-IDs)")
+    ap.add_argument("--verbose", action="store_true",
+                    help="auch Einzelheiten ausgeben (z. B. jede Aenderung der MXF-Kopfdaten); sie stehen immer in konvertierung.log")
     ap.add_argument("--mxf-info", metavar="DATEI", help="Header-Metadaten einer MXF-Datei ausgeben (Diagnose)")
     ap.add_argument("--verify", metavar="ZIEL", help="Ziel-XDROOT (oder Elternordner) pruefen")
     ap.add_argument("--source", dest="verify_source", metavar="QUELLE", help="mit --verify: zusaetzlich gegen Quelle vergleichen")
@@ -93,11 +99,28 @@ def main(argv=None) -> int:
         sony_header=not args.no_sony_header,
     )
     cancel = tools.CancelToken()
-    try:
-        signal.signal(signal.SIGINT, lambda *_: cancel.cancel())
-    except Exception:
-        pass
-    conv = converter.Converter(opts, CliReporter(), cancel)
+    hits = [0]
+
+    def on_signal(*_):
+        hits[0] += 1
+        if hits[0] == 1:
+            print("Abbruch angefordert - laufende Programme werden beendet (nochmal Strg+C: sofort hart beenden) ...",
+                  file=sys.stderr, flush=True)
+            cancel.cancel()
+        else:
+            # zweites Strg+C: Kindprozesse hart beenden und sofort aussteigen (Sperre/Temp-Dateien raeumt der naechste Lauf auf)
+            cancel.kill_all()
+            os._exit(130)
+
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, on_signal)
+        except (OSError, ValueError):
+            pass
+    conv = converter.Converter(opts, CliReporter(verbose=args.verbose), cancel)
     summary = conv.run()
     if summary.cancelled:
         return 130

@@ -164,5 +164,36 @@ class FfprobeParse(unittest.TestCase):
         self.assertFalse(mxfinfo.decide_source(i, p).convert)
 
 
+class DecideSourceAudio(unittest.TestCase):
+    """Tonformat: umgewandelt wird nur, wenn ALLE Spuren Mono / 24 Bit / 48 kHz sind."""
+
+    def _pair(self):
+        return (mxfinfo.parse_mxf2raw(fixture_text("f55_mxf2raw.txt")),
+                mxfinfo.parse_ffprobe(fixture_text("f55_ffprobe.txt")))
+
+    def test_fixture_is_mono_24_48(self):
+        i, p = self._pair()
+        self.assertTrue(mxfinfo.decide_source(i, p).convert)
+
+    def test_each_deviation_rejected(self):
+        for key, val, txt in (("bits_per_sample", "16", "16 Bit"),
+                              ("sampling_rate", "44100/1", "44100 Hz"),
+                              ("channel_count", "2", "2 Kanal")):
+            i, p = self._pair()
+            i.audio[3].descriptor = dict(i.audio[3].descriptor, **{key: val})  # nur eine (die 4.) Spur
+            d = mxfinfo.decide_source(i, p)
+            self.assertFalse(d.convert, key)
+            self.assertIn("Tonformat", d.reason)
+            self.assertIn("Audiospur 4", d.reason)
+            self.assertIn(txt, d.reason)
+
+    def test_missing_descriptor_rejected(self):
+        i, p = self._pair()
+        i.audio[0].descriptor = {}
+        d = mxfinfo.decide_source(i, p)
+        self.assertFalse(d.convert)
+        self.assertIn("Tonformat", d.reason)
+
+
 if __name__ == "__main__":
     unittest.main()

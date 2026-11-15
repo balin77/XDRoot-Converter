@@ -351,6 +351,16 @@ class SourceDecision:
     fps: Optional[Fraction] = None
 
 
+def _audio_desc(d: dict) -> str:
+    """Kurzbeschreibung des Tonformats aus dem mxf2raw-Deskriptor ('2 Kanaele, 16 Bit, 48000 Hz')."""
+    rate = d.get("sampling_rate") or "?"
+    try:
+        rate = str(int(parse_fraction(rate)))
+    except Exception:  # noqa: BLE001
+        pass
+    return f"{d.get('channel_count') or '?'} Kanal/Kanaele, {d.get('bits_per_sample') or '?'} Bit, {rate} Hz"
+
+
 def decide_source(mxf: MxfInfo, probe: ProbeResult) -> SourceDecision:
     """Soll dieser Clip umgewandelt werden? Nur XAVC-I (H.264 Intra) 1920x1080 progressiv."""
     v = probe.video
@@ -381,6 +391,14 @@ def decide_source(mxf: MxfInfo, probe: ProbeResult) -> SourceDecision:
         return SourceDecision(False, "keine Audiospuren")
     if len(probe.audio) != len(mxf.audio):
         return SourceDecision(False, f"Audiospuren uneinheitlich (MXF {len(mxf.audio)}, ffprobe {len(probe.audio)})")
+    for i, a in enumerate(mxf.audio, 1):
+        d = a.descriptor
+        if d.get("channel_count") != "1" or d.get("bits_per_sample") != "24" or d.get("sampling_rate") != "48000/1":
+            return SourceDecision(
+                False,
+                f"Tonformat von Audiospur {i} ({_audio_desc(d)}) wird nicht umgewandelt - "
+                "es werden nur Mono, 24 Bit, 48 kHz unterstuetzt",
+            )
     return SourceDecision(True, "XAVC-Intra 1080 progressiv", fps)
 
 
