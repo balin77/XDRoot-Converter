@@ -42,6 +42,8 @@ die Angleichung (die Dateien tragen dann bmx-Kennungen).
 - Windows (Hauptziel) oder Linux (mit synthetischem Material getestet, siehe unten)
 - Python 3.11 oder neuer (nur Standardbibliothek, keine pip-Pakete; tkinter gehört zur Standardinstallation).
   `XDROOT-Converter.bat` prüft beim Start, ob Python ≥ 3.11 **mit tkinter** vorhanden ist, und zeigt sonst eine Anleitung
+  (die GUI startet ohne Konsolenfenster über `pyw`, sonst über das per `where python` gefundene `pythonw.exe`; startet der
+  Doppelklick nicht, hilft `python -m xdroot_converter` in einer Konsole)
 - FFmpeg und bmx (werden vom Setup-Skript geladen, siehe unten)
 
 ## Installation
@@ -116,9 +118,11 @@ Neben `XDROOT\` entstehen im Zielordner:
 - `konvertierung.log` – Protokoll (wird bei Folgeläufen angehängt)
 - `konvertierung_einstellungen.json` – Einstellungen (Bitrate, Preset, Kopfdaten-Angleichung, XML einbetten, ANC, Programmversionen)
   je fertigem Clip; außerdem, wenn ANC-Spur oder eingebettetes XML bei einem Clip bewusst weggelassen werden mussten
-  (Rückfall), das je Clip, und `--unlisted skip`/`--only` des Laufs
+  (Rückfall), das je Clip, und `--unlisted skip`/`--only` des Laufs (`auswahl`). Eine unlesbare/kaputte Einstellungsdatei wird
+  nicht überschrieben, sondern als `konvertierung_einstellungen.json.defekt` gesichert (mit Warnung)
 - `_xdroot_converter.lock` – Sperrdatei (PID + Prozess-Startzeit), nur während des Laufs; ein zweiter Lauf mit demselben Ziel
-  bricht ab. Eine verwaiste Sperre (Prozess existiert nicht mehr bzw. andere Startzeit) wird übernommen
+  bricht ab. Eine verwaiste Sperre (Prozess existiert nicht mehr bzw. andere Startzeit; die Prozess-Startzeit hat Vorrang vor der
+  bloßen PID) wird übernommen
 - ein temporärer Arbeitsordner, der nach dem Lauf bzw. Abbruch entfernt wird
 
 **Fortsetzen** (erneuter Lauf mit demselben Ziel): Vorhandene Ziel-Clips werden geprüft (Dateistruktur: Footer, RIP, Größe –
@@ -139,8 +143,10 @@ Konsistenz von `MEDIAPRO.XML` und `M01.XML` mit der MXF, Toninhalt je Spur (Verg
 Clip-Ende und die Sony-Kopfdaten. Ohne `--source` werden die Kopfdaten gegen das Sony-Muster geprüft (auch eine mit
 `--no-sony-header` erzeugte Ausgabe wird dann als abweichend gemeldet). Mit `--source` zusätzlich: Vergleich mit der Quell-MXF
 (Dauer, UMIDs, Timecode, Kopfdaten, ANC, Toninhalt: erste Sekunde je Spur, bei Stille weitere Fenster), alle nicht geänderten
-Nicht-MXF-Dateien byte-gleich, **fehlende Dateien sind Abweichungen**; ebenso Quell-Clips, die im Ziel fehlen, ohne dass die
-Einstellungsdatei `--unlisted skip` bzw. `--only` belegt. Mit `--deep` wird jeder Clip komplett dekodiert (dauert).
+Nicht-MXF-Dateien byte-gleich, **fehlende Dateien sind Abweichungen**; ebenso nicht in `MEDIAPRO.XML` gelistete Quell-Clips, die im
+Ziel fehlen, es sei denn, `auswahl` in `konvertierung_einstellungen.json` belegt `--unlisted skip` bzw. `--only`. Ein nicht
+lesbarer Ziel-Clip ist ohne `--source` immer eine Abweichung; mit `--source` nur ein Hinweis, wenn er byte-gleich mit der Quelle
+ist (die Quelle war schon nicht analysierbar und wurde unverändert kopiert). Mit `--deep` wird jeder Clip komplett dekodiert (dauert).
 
 ## Was wird umgewandelt, kopiert, angepasst?
 
@@ -163,8 +169,10 @@ Einstellungsdatei `--unlisted skip` bzw. `--only` belegt. Mit `--deep` wird jede
 - **Nur kopiert (mit Hinweis im Protokoll):** 4K, Halbbilder (Interlaced), Clips, die bereits
   Long GOP oder ein anderer Codec sind, Clips mit **Ton, der nicht Mono / 24 Bit / 48 kHz ist** (nur dieses Format wird umgewandelt)
   und Clips mit unbekannter Dauer.
-- **Nicht analysierbare `.MXF`-Dateien** (Müll, 0 Byte, abgebrochene Aufnahmen): werden unverändert kopiert und mit Warnung gemeldet,
-  solange im Ziel kein umgewandelter Clip dieses Namens liegt (sonst Fehler, der Ziel-Clip bleibt erhalten). Dateien, deren Name mit `.`
+- **Nicht analysierbare `.MXF`-Dateien** (Müll, 0 Byte, abgebrochene Aufnahmen) **und Clips, deren Ton-Zuordnung nicht eindeutig
+  bestimmbar ist**: werden nie umgewandelt, sondern unverändert kopiert und mit Warnung („nicht analysierbar, unveraendert
+  kopiert: …“) gemeldet, kein Fehler. Liegt im Ziel schon ein XAVC-L-Clip oder eine andere Datei dieses Namens, ist das ein
+  **Fehler** und das Ziel bleibt unangetastet. Dateien, deren Name mit `.`
   beginnt (macOS `._*.MXF`), gelten nicht als Clips, sondern werden wie Begleitdateien kopiert.
 - **Clips ohne Eintrag in `MEDIAPRO.XML` und ohne `M01.XML`:** werden umgewandelt (Standard), wenn die MXF eindeutig XAVC-I ist; es
   gibt dann kein XML anzupassen, das H.264-Level folgt der Bildrate (bis 30 fps 4.1, darüber 4.2). Mit `--unlisted skip` werden
@@ -209,8 +217,8 @@ Details und Messwerte: [docs/SPEC.md](docs/SPEC.md).
 - Die **Wiedergabe in Schnittprogrammen** (Avid, Premiere, Resolve, ...) wurde nicht geprüft.
 - 4K, Interlaced und Ton, der nicht Mono/24 Bit/48 kHz ist, werden nur kopiert, nicht umgewandelt.
 - Clips, deren Tonspuren unterschiedlichen `SequenceOffset` haben, werden nicht umgewandelt (nur kopiert, Hinweis). Lässt sich die
-  Zuordnung ffmpeg-Audiostream ↔ MXF-Track nicht eindeutig bestimmen, ist das ein **Fehler** für diesen Clip (kein Raten, wegen
-  der Gefahr vertauschter Tonspuren).
+  Zuordnung ffmpeg-Audiostream ↔ MXF-Track nicht eindeutig bestimmen, wird der Clip **nicht umgewandelt**, sondern unverändert
+  kopiert (Warnung, kein Raten, wegen der Gefahr vertauschter Tonspuren); ein vorhandener Ziel-Clip führt zum Fehler.
 - Der Toninhalts-Vergleich wurde nur mit synthetischem Ton geprüft, nicht mit echtem Sony-AES3.
 - Andere Bildraten nur synthetisch getestet (siehe oben).
 - Zwei Läufe gleichzeitig in dasselbe Ziel sind gesperrt; die Sperre wurde nur unter Linux getestet.

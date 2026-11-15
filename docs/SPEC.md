@@ -86,8 +86,10 @@ Ergebnis laut mxf2raw: `AVC_High_422`, coding_label und ec_label identisch zur F
      usw.; GOP = ca. 0,5 s, bei 50p N=24). Clips, die schon Long GOP oder ein anderer Codec
      sind (z. B. `MPEG2HD50…`, 4K-XAVC), werden **unverändert kopiert** und im Log genannt.
      4K-Umwandlung ist nicht Teil von Version 1. Dasselbe gilt für Quellen mit unbekannter Dauer. **Nicht analysierbare**
-     `.MXF`-Dateien (Müll, 0 Byte, abgebrochene Aufnahme) werden unverändert kopiert und mit Warnung gemeldet, sofern im Ziel kein
-     umgewandelter Clip dieses Namens liegt (dann Fehler, Ziel bleibt erhalten). Dateien, deren Name mit `.` beginnt (macOS
+     `.MXF`-Dateien (Müll, 0 Byte, abgebrochene Aufnahme) und Clips mit nicht eindeutig bestimmbarer Ton-Zuordnung
+     (`plan.error`) werden nie umgewandelt: ohne Ziel-Clip unverändert kopiert, Warnung „nicht analysierbar, unveraendert kopiert:
+     …“, kein Fehler; liegt im Ziel ein XAVC-L-Clip oder eine andere Datei dieses Namens, ist es ein Fehler und das Ziel bleibt
+     unangetastet. Dateien, deren Name mit `.` beginnt (macOS
      `._*.MXF`), sind keine Clips und werden wie Begleitdateien kopiert.
    - Transcode + Wrap in einen temporären Ordner im Ziel (`_tmp_xdroot_converter`),
      dann atomar nach `Clip/` verschieben; temporäre Dateien löschen. Große Clips
@@ -129,7 +131,8 @@ Ergebnis laut mxf2raw: `AVC_High_422`, coding_label und ec_label identisch zur F
   x264-Preset (Standard `medium`).
 - Nach Quellwahl kurze Übersicht: Kamera (`systemKind`), Anzahl Clips, davon umzuwandeln,
   Gesamtgröße, geschätzte Zielgröße.
-- Start per Doppelklick: `XDROOT-Converter.bat` (startet `pythonw -m xdroot_converter`).
+- Start per Doppelklick: `XDROOT-Converter.bat` (startet die GUI ohne Konsole: `pyw -3`, sonst `pythonw.exe` neben dem per `where python` gefundenen Python; Ausweichweg
+  `python -m xdroot_converter`).
 
 ### Projektstruktur
 
@@ -294,14 +297,16 @@ steht bewusst nicht hier; maßgeblich ist die Ausgabe von `python -m unittest di
 - **Fremdes Ziel:** Gehört ein vorhandenes Ziel-XDROOT nicht zur Quelle (andere `systemId`/`mediaId`, fremde Clips/Dateien,
   MXF ohne `MEDIAPRO.XML`), Abbruch vor jeder Änderung. Quelle = Ziel (oder darin enthalten) wird abgelehnt.
 - **Sperre:** `_xdroot_converter.lock` im Zielordner (PID + Prozess-Startzeit, `O_EXCL`); ein zweiter Lauf bricht ab; eine verwaiste
-  Sperre (Prozess weg, andere Startzeit oder älter als der letzte Systemstart) wird übernommen.
+  Sperre (Prozess weg, andere Startzeit oder älter als der letzte Systemstart) wird übernommen; die Prozess-Startzeit hat Vorrang
+  vor der PID.
 - **Strukturprüfung** (`verify.check_structure`): Header-Partition geschlossen, FooterPartition-Offset zeigt auf ein
   Partition Pack, RIP am Dateiende konsistent, Dateigröße = Ende des RIP, Mindestgröße aus Frames × Tonbytes. Erkennt
   abgeschnittene Clips beim Fortsetzen und in `--verify`; dazu ein Decode-Test am Clip-Ende (auch beim Fortsetzen).
 - **Einstellungsdatei** `konvertierung_einstellungen.json` im Zielordner: Einstellungen je fertigem Clip; beim Fortsetzen
   Warnung bei Abweichung, kein Neuerzeugen. Ein Rückfall (ANC-Spur oder eingebettetes XML mussten für den Clip weggelassen werden,
   `anc_dropped`/`xml_dropped`) wird **je Clip** gemerkt, damit Fortsetzen und `--verify` ihn nicht als Fehler werten; ebenso
-  `--unlisted skip`/`--only` des Laufs.
+  `--unlisted skip`/`--only` des Laufs (`auswahl`). Eine kaputte Einstellungsdatei wird nicht überschrieben, sondern als
+  `konvertierung_einstellungen.json.defekt` gesichert (Warnung).
 - **Ersetzen von Ziel-Clips:** Ein fertiger XAVC-L-Ziel-Clip wird nie durch eine Kopie (z. B. einer als nicht umwandelbar eingestuften
   Quelle) ersetzt; ein vorhandener Clip wird erst nach erfolgreicher Neuerzeugung ersetzt. `--max-frames` ersetzt keine vollständigen
   Clips. Verschieben/Ersetzen wird bei gesperrten Dateien (Windows: Virenscanner, Indexdienst) mehrfach wiederholt (`card.replace_retry`).
@@ -334,10 +339,14 @@ synthetischen 2-s-Clips nie, bei einem von zwei 20-s-Clips dreimal. Bekannte, ha
 
 ### Nicht analysierbare Dateien, fehlende Clips in --verify
 
-- Nicht analysierbare `.MXF`-Dateien: siehe Ablauf Punkt 3. Beobachtet mit Müll- und 0-Byte-Datei: Kopie mit Warnung, Zählung „kopiert“;
-  `--verify` meldet solche Dateien als Struktur-Abweichung (sie sind keine gültige MXF).
+- Nicht analysierbare `.MXF`-Dateien (und Clips mit unklarer Ton-Zuordnung): siehe Ablauf Punkt 3. Beobachtet mit Müll- und
+  0-Byte-Datei: Kopie mit Warnung, Zählung „kopiert“. Dateien mit Namen `._*` sind Begleitdateien (1:1 kopiert, in `--verify --source`
+  byte-gleich verglichen).
+- `--verify`: Ein nicht lesbarer Ziel-Clip ist ohne `--source` eine Abweichung (MXF nicht lesbar + Struktur). Mit `--source` ist er nur ein
+  Hinweis („nicht analysierbar, unveraendert uebernommen“), wenn er byte-gleich mit dem Quell-Clip ist (`_same_content`); sonst Abweichung.
 - `--verify --source` meldet im Ziel fehlende Quell-Clips, die weder gelistet sind noch durch die Einstellungsdatei als bewusst
-  übersprungen (`--unlisted skip`/`--only`) belegt sind, als Abweichung. Geprüft: mit Einstellungsdatei nur Hinweis, ohne sie
+  übersprungen (`--unlisted skip`/`--only`, `auswahl` in der Einstellungsdatei) belegt sind, als Abweichung. Geprüft: mit
+  passender `auswahl` nur Hinweis, ohne sie oder bei `auswahl` ohne Belegung (`--unlisted convert`, kein passendes `--only`)
   Abweichung.
 
 ### GUI / Start
@@ -345,7 +354,7 @@ synthetischen 2-s-Clips nie, bei einem von zwei 20-s-Clips dreimal. Bekannte, ha
 Abschlussfenster nach jedem Lauf (Fertig / mit Fehlern / abgebrochen / fehlgeschlagen) mit Zählzeile, Fehlergrund je Clip und Hinweis
 auf eine unvollständige Zielkarte, Rückfragen beim Start (u. a. „Fortsetzen?“ bei vorhandenem Ziel), Hinweise in der Oberfläche,
 robustes Polling und Schließen während des Laufs. `XDROOT-Converter.bat` sucht Python ≥ 3.11 mit tkinter (`py -3`, dann
-`python`) und zeigt sonst eine Anleitung.
+`python`; Start per `pyw`, sonst `pythonw.exe` aus `where python`, sonst mit Konsole) und zeigt sonst eine Anleitung.
 
 ### Noch nicht belegt
 

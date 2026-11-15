@@ -17,16 +17,18 @@ Abweichung). Runde 2 und die Fix-Runden wurden in einer Cloud-Session (Linux, oh
   groben Fehler mehr. Ergebnis u. a.: XML aus dem Ist-Zustand, atomares Schreiben, Abbruch bei fremdem Ziel, Sperrdatei mit
   Prozess-Startzeit, Strukturprüfung und End-Decode-Test (auch beim Fortsetzen), Einstellungsdatei mit Rückfall je Clip (ANC/XML),
   fertige XAVC-L-Clips werden nie durch eine Kopie ersetzt, `--max-frames` ersetzt keine vollständigen Clips, Wiederholungen bei
-  gesperrten Dateien (Windows), Quellen mit unbekannter Dauer werden nur kopiert, nicht analysierbare `.MXF` und `._*.MXF` werden
-  kopiert, erweitertes `--verify` (mit/ohne `--source`, `--deep`), GUI-Abschlussfenster (Zählzeile, Fehlergrund je Clip, Hinweis auf
+  gesperrten Dateien (Windows), Quellen mit unbekannter Dauer werden nur kopiert, nicht analysierbare `.MXF` und Clips mit unklarer Ton-Zuordnung
+  werden nie umgewandelt, sondern unverändert kopiert (Warnung; mit vorhandenem Ziel-Clip Fehler), `._*.MXF` gelten als Begleitdateien, erweitertes `--verify` (mit/ohne `--source`, `--deep`), GUI-Abschlussfenster (Zählzeile, Fehlergrund je Clip, Hinweis auf
   unvollständige Zielkarte), Rückfragen beim Start, Startskript mit Python-Prüfung, Strg+C unter Windows.
 - Alle Tests laufen (`python -m unittest discover -s tests`).
 
 ## Was der Autor lokal tun muss
 
 1. `git pull`, danach `setup_tools.bat` (lädt FFmpeg und bmx; prüft auch `MXFDump.exe`).
-2. **Unter Windows `XDROOT-Converter.bat` starten.** Das Startskript wurde umgeschrieben und noch **nie unter Windows ausgeführt**
-   (Python-Suche `py -3`/`python`, tkinter-Prüfung, GUI-Start ohne Konsolenfenster).
+2. **Zuerst: Unter Windows `XDROOT-Converter.bat` per Doppelklick starten.** Das Startskript wurde umgeschrieben und noch **nie
+   unter Windows ausgeführt** (Python-Suche `py -3`/`python`, tkinter-Prüfung, `pythonw.exe` über `where python`, GUI-Start ohne
+   Konsolenfenster). Startet der Doppelklick nicht: Ausweichweg `python -m xdroot_converter` in einer Konsole (im Projektordner),
+   und die Meldung zurückgeben.
 3. **Zuerst nur lesend, auf einen echten F55-/F5-Clip:**
    `python -m xdroot_converter.cli --mxf-info <Clip.MXF>` – zeigt KAG, Track-IDs (auch Timecode-Track), Track-Namen und
    Sound-Deskriptor-Items echter Sony-Dateien. Versteht der Parser sie fehlerfrei?
@@ -58,8 +60,8 @@ Abweichung). Runde 2 und die Fix-Runden wurden in einer Cloud-Session (Linux, oh
 - Ob echte Sony-Dateien KAG 512 nutzen, ist nicht belegt; das Ziel übernimmt das KAG der Quelle (512 oder 1).
 - Der Toninhalts-Vergleich (erste Sekunde je Spur, bei Stille weitere Fenster) wurde nur mit synthetischem Ton geprüft; bei echtem
   Sony-AES3 ungeprüft.
-- Ungewöhnliche Spurzuordnung (Tonspuren nicht eindeutig den ffmpeg-Audiostreams zuzuordnen) führt zu einem sauberen Fehler für den
-  Clip, nicht zu geratener Zuordnung.
+- Ungewöhnliche Spurzuordnung (Tonspuren nicht eindeutig den ffmpeg-Audiostreams zuzuordnen) führt nicht zu geratener Zuordnung: der Clip
+  wird nicht umgewandelt, sondern unverändert kopiert (Warnung); liegt im Ziel schon ein Clip dieses Namens, ist es ein Fehler.
 - `MXFDump` meldet bei KAG 512 gelegentlich „Length is zero (following KLVFill key …)“: bekannte, harmlose Eigenheit von bmx/libMXF
   (siehe MXF-VERGLEICH.md, Abschnitt 2).
 - Wiedergabe in Schnittprogrammen und Sony-Werkzeugen ungeprüft; kein Sony-Prüfwerkzeug getestet.
