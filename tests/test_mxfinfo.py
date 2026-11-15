@@ -67,6 +67,70 @@ class Mxf2rawParse(unittest.TestCase):
         self.assertEqual(i.audio[0].duration, 94760)
 
 
+class Mxf2rawHeaderFields(unittest.TestCase):
+    """Kopfdaten-Felder (Runde 2): Identification, Track-IDs, TextObject."""
+
+    def test_fx6_identification_keeps_trailing_space(self):
+        i = mxfinfo.parse_mxf2raw(fixture_text("fx6_mxf2raw.txt"))
+        self.assertEqual(i.ident_company, "Sony")
+        self.assertEqual(i.ident_product, "Mem ")
+        self.assertEqual(i.ident_version_string, "2.00")
+        self.assertEqual(i.ident_product_uid, "urn:uuid:cede1104-8280-11de-8a39-08004678031c")
+        self.assertEqual(i.ident_generation_uid, "urn:uuid:dfd78a94-0639-1238-980e-9c50d1ae4ac3")
+        self.assertEqual(i.ident_toolkit_version, "")
+        self.assertEqual(i.ident_platform, "")
+        self.assertEqual(i.ident_product_version, "")
+
+    def test_fx6_track_ids(self):
+        i = mxfinfo.parse_mxf2raw(fixture_text("fx6_mxf2raw.txt"))
+        self.assertEqual(i.video.mp_track_id, 2)
+        self.assertEqual(i.video.fp_track_id, 2)
+        self.assertEqual([a.mp_track_id for a in i.audio], [3, 4, 5, 6])
+        self.assertEqual([a.fp_track_id for a in i.audio], [3, 4, 5, 6])
+        self.assertEqual(i.anc_tracks[0].mp_track_id, 7)
+        self.assertEqual(i.anc_tracks[0].fp_track_id, 7)
+        self.assertEqual(i.audio[0].fp_track_number, "0x16040300")
+        self.assertEqual(i.audio[1].fp_track_number, "0x16040301")
+        self.assertEqual(i.video.fp_track_number, "0x15010500")
+
+    def test_f55_track_ids(self):
+        i = mxfinfo.parse_mxf2raw(fixture_text("f55_mxf2raw.txt"))
+        self.assertEqual(i.video.mp_track_id, 2)
+        self.assertEqual(i.video.fp_track_id, 2)
+        self.assertEqual([a.mp_track_id for a in i.audio], list(range(3, 11)))
+        self.assertEqual([a.fp_track_id for a in i.audio], list(range(3, 11)))
+        self.assertEqual(i.anc_tracks[0].mp_track_id, 11)
+        self.assertEqual(i.anc_tracks[0].fp_track_id, 11)
+        self.assertEqual(i.ident_product, "Mem ")
+        self.assertEqual(i.ident_company, "Sony")
+
+    def test_text_object_fields(self):
+        i = mxfinfo.parse_mxf2raw(fixture_text("fx6_mxf2raw.txt"))
+        t = i.text_objects[0]
+        self.assertEqual(t["mime_type"], "text/xml")
+        self.assertEqual(t["lang_code"], "und")
+        self.assertEqual(t["description"], "")
+        self.assertEqual(t["track_id"], "8")
+        self.assertEqual(t["scheme_id"], "urn:uuid:786d4d22-8280-11de-8a39-08004678031c")
+
+    def test_bmx_toolkit_platform(self):
+        txt = (
+            "Files: (1)\n  File #0:\n    Identifications: (1)\n      Identification #0:\n"
+            "        generation_uid  : urn:uuid:00000000-0000-0000-0000-000000000001\n"
+            "        company_name    : BBC\n        product_name    : bmx\n"
+            "        product_version : 1.6.0.0.0\n        version_string  : 1.6\n"
+            "        product_uid     : urn:uuid:f3f4f4a6-9c6b-4dc5-9a35-fee1a2b3c4d5\n"
+            "        modified_date   : 2026-01-01 10:00:00.000\n"
+            "        toolkit_version : libMXF 1.0\n        platform        : Linux x86_64\n"
+        )
+        i = mxfinfo.parse_mxf2raw(txt)
+        self.assertEqual(i.ident_company, "BBC")
+        self.assertEqual(i.ident_product, "bmx")
+        self.assertEqual(i.ident_toolkit_version, "libMXF 1.0")
+        self.assertEqual(i.ident_platform, "Linux x86_64")
+        self.assertEqual(i.ident_product_version, "1.6.0.0.0")
+
+
 class FfprobeParse(unittest.TestCase):
     def test_parse(self):
         p = mxfinfo.parse_ffprobe(fixture_text("fx6_ffprobe.txt"))

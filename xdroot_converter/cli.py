@@ -2,6 +2,7 @@
 
   python -m xdroot_converter.cli <quelle> <ziel> [--bitrate 50] [--preset medium] [--max-frames N]
   python -m xdroot_converter.cli --verify <ziel-xdroot> [--source <quell-xdroot>] [--deep]
+  python -m xdroot_converter.cli --mxf-info <datei.MXF>
 """
 
 from __future__ import annotations
@@ -45,6 +46,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--embed-xml", choices=["auto", "always", "never"], default="auto",
                     help="M01.XML in die MXF einbetten (auto: nur wenn die Quelle es auch hat)")
     ap.add_argument("--no-anc", action="store_true", help="ANC-Datenspur nicht uebernehmen")
+    ap.add_argument("--no-sony-header", action="store_true",
+                    help="MXF-Kopfdaten NICHT an die Quelle angleichen (Ausgabe traegt dann bmx-Kennungen und bmx-Track-IDs)")
+    ap.add_argument("--mxf-info", metavar="DATEI", help="Header-Metadaten einer MXF-Datei ausgeben (Diagnose)")
     ap.add_argument("--verify", metavar="ZIEL", help="Ziel-XDROOT (oder Elternordner) pruefen")
     ap.add_argument("--source", dest="verify_source", metavar="QUELLE", help="mit --verify: zusaetzlich gegen Quelle vergleichen")
     ap.add_argument("--deep", action="store_true", help="mit --verify: jeden Clip komplett dekodieren")
@@ -58,6 +62,15 @@ def main(argv=None) -> int:
         except Exception:
             pass
     args = build_parser().parse_args(argv)
+
+    if args.mxf_info:
+        from . import mxfheader
+        try:
+            print(mxfheader.describe(args.mxf_info))
+        except (mxfheader.MxfParseError, OSError) as e:
+            print(f"FEHLER: {e}", file=sys.stderr)
+            return 1
+        return 0
 
     if args.verify:
         cancel = tools.CancelToken()
@@ -77,6 +90,7 @@ def main(argv=None) -> int:
         only=args.only,
         embed_xml=args.embed_xml,
         keep_anc=not args.no_anc,
+        sony_header=not args.no_sony_header,
     )
     cancel = tools.CancelToken()
     try:

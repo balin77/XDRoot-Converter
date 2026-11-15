@@ -1,4 +1,4 @@
-"""Externe Programme finden und Subprozesse sicher starten (ffmpeg, ffprobe, raw2bmx, mxf2raw)."""
+"""Externe Programme finden und Subprozesse sicher starten (ffmpeg, ffprobe, raw2bmx, mxf2raw; optional MXFDump)."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 _PROGRAMS = ("ffmpeg", "ffprobe", "raw2bmx", "mxf2raw")
+# Optionale Programme (keine Pflicht fuer die Umwandlung; nur fuer scripts/mxf_vergleich.py)
+OPTIONAL_PROGRAMS = ("MXFDump",)
 _cache: dict[str, str] = {}
 
 
@@ -46,6 +48,14 @@ def find_tool(name: str) -> str:
         )
     _cache[name] = found
     return found
+
+
+def find_optional_tool(name: str) -> Optional[str]:
+    """Wie find_tool, liefert aber None statt eines Fehlers, wenn das Programm fehlt."""
+    try:
+        return find_tool(name)
+    except ToolNotFound:
+        return None
 
 
 def check_tools() -> dict[str, str]:

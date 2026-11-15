@@ -129,14 +129,21 @@ Ergebnis laut mxf2raw: `AVC_High_422`, coding_label und ec_label identisch zur F
 ```
 xdroot_converter/   __init__.py, __main__.py (GUI-Start), gui.py, cli.py,
                     converter.py (Ablauf), card.py (XDROOT/XML lesen+patchen),
-                    mxfinfo.py (ffprobe/mxf2raw-Parsing), tools.py (Programme finden)
-tests/              unittest für card.py/mxfinfo.py-Parsing/Codec-String-Ableitung
-                    (Fixtures: Kopien aus docs/analysis)
+                    mxfinfo.py (ffprobe/mxf2raw-Parsing), tools.py (Programme finden),
+                    mxfheader.py (MXF-Header-Metadaten lesen/ändern, Runde 2),
+                    verify.py (Prüfung Einzelclip + Karte)
+scripts/            make_test_card.py (synthetische XAVC-I-Testkarte),
+                    mxf_vergleich.py (Satz-für-Satz-Vergleich der Header-Metadaten)
+tests/              unittest für card.py/mxfinfo.py/mxfheader.py/verify.py/converter.py (ohne Medien;
+                    Fixtures: Kopien aus docs/analysis)
+docs/               SPEC.md, MXF-VERGLEICH.md, NAECHSTE-SCHRITTE.md, analysis/
 XDROOT-Converter.bat, README.md (Deutsch, kurz), .gitignore
 ```
 
 CLI: `python -m xdroot_converter.cli <quelle> <ziel> [--bitrate 50] [--preset medium]
-[--max-frames N]` und `--verify <ziel-xdroot> [--source <quell-xdroot>]`.
+[--max-frames N] [--unlisted convert|skip] [--only TEXT] [--embed-xml auto|always|never] [--no-anc]
+[--no-sony-header]`, `--verify <ziel-xdroot> [--source <quell-xdroot>] [--deep]` und
+`--mxf-info <datei.MXF>` (Header-Metadaten ausgeben).
 `--max-frames` (nur Test) wandelt nur die ersten N Frames und passt dann
 `dur`/`Duration` **nicht** an – Ausgabe als Testausgabe kennzeichnen.
 
@@ -156,7 +163,7 @@ Nur Python-Standardbibliothek (Python 3.11), keine pip-Abhängigkeiten (Tests mi
 - ANC-Spur: per `mxf2raw --ess-out … --wrap-klv d --disable-audio --disable-video` + `raw2bmx --klv s --anc` byte-identisch übernommen (auch 13-Elemente-Manifest der FX6 bleibt erhalten).
 - Eingebettetes XML (`--embed-xml`, `--xml-scheme-id`, `--xml-lang und`) funktioniert, wird aber nur eingebettet, wenn die Quelle auch ein TextObject hat (`--embed-xml auto`, Standard). F5/F55-Quellen haben keins.
 - `--create-date` (Format `YYYY-MM-DDThh:mm:ss:qm`) übernimmt das Datum der Quell-Identification; `--signal-std st274`, `--color-siting cositing` werden aus der Quelle abgeleitet.
-- Nicht änderbar mit raw2bmx: Identification (bmx statt Sony „Mem“), Track-IDs (1001/2001/3001 statt 2,3,…), mime_type des TextObject (`application/xml` statt `text/xml`), TextObject-description.
+- Mit raw2bmx allein (Version 1) nicht erreichbar, seit Runde 2 per Nachbearbeitung gelöst (siehe „Umsetzungsstand Runde 2"): Identification (bmx statt Sony „Mem "), Track-IDs (1001/2001/3001 statt 2,3,…), mime_type des TextObject (`application/xml` statt `text/xml`), TextObject-description.
 - ffmpeg braucht `-color_range tv` (sonst markiert x264 den Strom als Full Range).
 - Auf der Testkarte liegen 147 MXF, `MEDIAPRO.XML` listet nur 19. Option `--unlisted skip` bzw. GUI-Haken.
 
@@ -194,3 +201,54 @@ eine bmx-Datei. Maßstab ist `docs/analysis/fx6_mxf2raw.txt` (Ziel) bzw. die Que
    `verify` prüft die neuen Felder mit.
 5. README: offen dokumentieren, dass die Dateien Sony-Kennungen der Quellkamera
    tragen, aber von diesem Tool erzeugt wurden.
+
+## Umsetzungsstand Runde 2
+
+Gewählter Weg (Reihenfolge a → b → c aus Punkt 3):
+
+- **a) vorhandene raw2bmx-Optionen – reicht nicht.** `--prod-info` setzt Company, Product, Version-String und
+  Product-UID (und lässt mit `0.0.0.0.0` die Product-Version weg) und wird genutzt. Aber: `ToolkitVersion` und
+  `Platform` der Identification lassen sich nicht abschalten (bmx schreibt sie immer), und die Track-IDs sind in bmx fest
+  verdrahtet (`OP1AFile.cpp`: 901 Timecode, 1001 Video, 2001.. Audio, 3001 ANC).
+- **b) Python-Patcher – gewählt.** `xdroot_converter/mxfheader.py` parst die Header-Metadaten (Primer + Local Sets) der
+  fertigen MXF, ändert sie und schreibt sie in place zurück. Die Länge der Header-Region bleibt gleich (der letzte KLV-Fill
+  wird gekürzt/verlängert), daher bleiben `HeaderByteCount`, alle Offsets und der Index gültig; alle Partitionen mit Header-Metadaten
+  werden behandelt; vor dem Schreiben wird erneut geparst und validiert (bei Fehler bleibt die Datei unverändert).
+  `adopt_from_source(ziel, quelle)` gleicht an die Quell-MXF an (Quelle wird nur gelesen): Identification (inkl. Entfernen von
+  Toolkit/Platform), Track-IDs mit allen Verweisen (SourceTrackID, LinkedTrackID), Track-Reihenfolge und -Namen, Sound-Deskriptor-Items,
+  MIME-Typ/Description des TextObjects. `compare_with_source` ist der zugehörige Trockenlauf für `verify`.
+- **c) bmx-Fork – nicht nötig.** Es bleibt beim offiziellen bbc/bmx-Windows-Paket (`setup_tools.ps1` unverändert bis auf die
+  optionale Prüfung von `MXFDump.exe`); es ist **kein eigener Windows-Build** nötig.
+
+Ablauf pro Clip (`converter.py`):
+
+1. `raw2bmx` mit `--prod-info` aus der Quell-MXF (Rückfall Sony / `Mem ` / 2.00 / `cede1104-8280-11de-8a39-08004678031c`; das
+   Leerzeichen im Produktnamen bleibt erhalten).
+2. `mxfheader.adopt_from_source(out.mxf, quelle)`; Änderungen werden als Info geloggt, Einträge mit „WARNUNG:" als Warnung.
+   Schlägt es fehl (`HeaderPatchError`, `MxfParseError`, `OSError`), gilt der Clip als **FEHLER** („MXF-Kopfdaten konnten nicht
+   an die Quelle angeglichen werden: …"), er wird nicht stillschweigend übernommen.
+3. Prüfung `verify.check_clip(..., source=quelle)`: bisherige Prüfungen plus `check_header` (`compare_with_source` und
+   mxf2raw-Felder: Identification, Track-IDs Material/File Package, Track-Nummern der Tonspuren, Audio-Deskriptor-Felder).
+4. `Options.sony_header = False` / `--no-sony-header` schaltet 1.–3. ab (Warnung im Log: Datei trägt bmx-Kennungen).
+
+Fortsetzen: Besteht ein vorhandener Ziel-Clip alle bisherigen Prüfungen und weichen nur die Kopfdaten ab (z. B. Ausgabe von
+Version 1), wird er **nicht** neu transkodiert, sondern `adopt_from_source` direkt auf den Ziel-Clip angewendet, erneut
+geprüft, als „Kopfdaten nachgezogen" geloggt und übersprungen. Schlägt das fehl, wird neu erzeugt.
+
+`verify`:
+
+- mit `--source`: dieselben Kopfdaten-Vergleiche je umgewandeltem Clip.
+- ohne `--source`: Plausibilität gegen das Sony-Muster (Company nicht `BBC`, Product nicht `bmx`, kein Toolkit/Platform,
+  Video-Track-ID 2, Audio 3..N+2, ANC N+3 wie `fx6_mxf2raw.txt`); Abweichung = ABWEICHUNG. Eine bewusst mit `--no-sony-header`
+  erzeugte Ausgabe hat keine Markierung und wird daher ohne `--source` ebenfalls als abweichend gemeldet.
+- Fehlalarm behoben: Ein umgewandelter Clip, der nicht in `MEDIAPRO.XML` steht, wird für den XML-Vergleich anhand seiner
+  Ziel-`M01.XML` (videoCodec XAVC-L) als umgewandelt erkannt und gegen `patch_clip_xml(quelle, codec)` verglichen. Fehlt die
+  `M01.XML` auch in der Quelle, ist das nur ein Hinweis.
+
+Messwerte (synthetische Karte, 3 Clips, Details und Vergleichsbericht in [MXF-VERGLEICH.md](MXF-VERGLEICH.md)):
+Ausgabe von Version 1: 117 Abweichungen zur Quelle in 45 Sätzen; Runde 2: 30 Abweichungen in 3 Sätzen, alle im Video-Deskriptor
+(gewollt). `mxf2raw` des Ziels: Identification Sony/`Mem `/2.00/UID, kein Toolkit/Platform, Track-IDs 2, 3..10, 11.
+
+Grenzen: Belegt nur gegen eine **synthetische** Quelle (mit bmx erzeugt, auf Sony-Track-IDs gesetzt) und gegen die
+`mxf2raw`-Ausgaben echter Dateien; `MXFDump`-Ausgaben echter Kameradateien liegen nicht im Repository. Siehe Hinweis oben in
+`docs/MXF-VERGLEICH.md`. Fehlt noch: lokaler Lauf von `scripts/mxf_vergleich.py` mit F55-Quelle, FX6-Referenz und Ziel.

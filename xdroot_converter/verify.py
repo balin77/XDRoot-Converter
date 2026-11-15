@@ -8,7 +8,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import card, mxfinfo, tools
+from . import card, mxfheader, mxfinfo, tools
 
 # Referenzwerte (Sony FX6, XAVC-L), siehe docs/analysis/fx6_mxf2raw.txt
 XAVCL_ESSENCE_TYPE = "AVC_High_422"
@@ -31,8 +31,17 @@ class ClipExpect:
     expect_xml: bool = False
 
 
-def check_clip(path: Path, exp: ClipExpect, cancel: Optional[tools.CancelToken] = None) -> list[str]:
-    """Prueft einen Ziel-Clip gegen die Erwartung. Leere Liste = in Ordnung."""
+def check_clip(
+    path: Path,
+    exp: ClipExpect,
+    cancel: Optional[tools.CancelToken] = None,
+    source: Optional[Path] = None,
+    source_info: Optional[mxfinfo.MxfInfo] = None,
+) -> list[str]:
+    """Prueft einen Ziel-Clip gegen die Erwartung. Leere Liste = in Ordnung.
+
+    Mit ``source`` (Quell-MXF) werden zusaetzlich die Sony-Kopfdaten gegen die Quelle geprueft
+    (``check_header``); ohne ``source`` nur die uebrigen Eigenschaften."""
     problems: list[str] = []
     try:
         info = mxfinfo.read_mxf_info(str(path), cancel=cancel)
@@ -75,7 +84,114 @@ def check_clip(path: Path, exp: ClipExpect, cancel: Optional[tools.CancelToken] 
         problems.append("ANC-Spur fehlt")
     if exp.expect_xml and not any(t.get("scheme_id") == NRT_SCHEME_ID for t in info.text_objects):
         problems.append("eingebettetes XML fehlt")
+    if source is not None:
+        problems += check_header(path, source, cancel=cancel, info=info, src_info=source_info)
     return problems
+
+
+# --------------------------------------------------------------------------- Kopfdaten (Runde 2)
+
+_AUDIO_DESC_KEYS = ("sampling_rate", "bits_per_sample", "block_align", "channel_count", "locked", "audio_ref_level")
+_IDENT_FIELDS = (
+    ("company_name", "ident_company"),
+    ("product_name", "ident_product"),
+    ("version_string", "ident_version_string"),
+    ("product_uid", "ident_product_uid"),
+    ("product_version", "ident_product_version"),
+    ("toolkit_version", "ident_toolkit_version"),
+    ("platform", "ident_platform"),
+)
+
+
+def _by_kind(info: mxfinfo.MxfInfo) -> dict:
+    return {"Picture": [t for t in info.tracks if t.kind == "Picture"],
+            "Sound": [t for t in info.tracks if t.kind == "Sound"],
+            "Data": [t for t in info.tracks if t.kind == "Data"]}
+
+
+def compare_info_header(info: mxfinfo.MxfInfo, src: mxfinfo.MxfInfo) -> list[str]:
+    """Kopfdaten-Vergleich auf Basis der mxf2raw-Felder (reine Logik): Identification, Track-IDs
+    (Material und File Package), Track-Nummern der Tonspuren, Audio-Deskriptor-Felder."""
+    out: list[str] = []
+    for label, attr in _IDENT_FIELDS:
+        a, b = getattr(info, attr), getattr(src, attr)
+        if a != b:
+            out.append(f"Identification {label}: {a!r} statt {b!r} (Quelle)")
+    ti, si = _by_kind(info), _by_kind(src)
+    for kind, name in (("Picture", "Video"), ("Sound", "Audio"), ("Data", "Daten")):
+        for i, (t, s) in enumerate(zip(ti[kind], si[kind]), 1):
+            tag = f"{name}spur" + (f" {i}" if kind != "Picture" else "")
+            if t.mp_track_id != s.mp_track_id:
+                out.append(f"{tag}: Track-ID im Material Package {t.mp_track_id} statt {s.mp_track_id} (Quelle)")
+            if t.fp_track_id != s.fp_track_id:
+                out.append(f"{tag}: Track-ID im File Package {t.fp_track_id} statt {s.fp_track_id} (Quelle)")
+            if kind == "Sound":
+                if t.fp_track_number != s.fp_track_number:
+                    out.append(f"{tag}: Track-Nummer {t.fp_track_number or '?'} statt {s.fp_track_number or '?'} (Quelle)")
+                for k in _AUDIO_DESC_KEYS:
+                    if t.descriptor.get(k) != s.descriptor.get(k):
+                        out.append(f"{tag}: Deskriptor {k} {t.descriptor.get(k)!r} statt {s.descriptor.get(k)!r} (Quelle)")
+    return out
+
+
+def check_sony_pattern(info: mxfinfo.MxfInfo) -> list[str]:
+    """Plausibilitaet ohne Quelle: sieht die Datei in den Kopfdaten wie eine Sony-Kameradatei aus
+    (Muster der FX6-Referenz: Video-Track-ID 2, Audio 3..N+2, ANC N+3, kein bmx/BBC/Toolkit)?"""
+    out: list[str] = []
+    if info.ident_company.strip().upper() == "BBC":
+        out.append(f"Identification company_name {info.ident_company!r} (bmx-Kennung)")
+    if info.ident_product.strip().lower() == "bmx":
+        out.append(f"Identification product_name {info.ident_product!r} (bmx-Kennung)")
+    if info.ident_toolkit_version:
+        out.append(f"Identification toolkit_version {info.ident_toolkit_version!r} vorhanden (Sony schreibt keins)")
+    if info.ident_platform:
+        out.append(f"Identification platform {info.ident_platform!r} vorhanden (Sony schreibt keins)")
+    k = _by_kind(info)
+    expected: list = []  # (Spur, erwartete ID, Name)
+    for t in k["Picture"][:1]:
+        expected.append((t, 2, "Videospur"))
+    n_audio = len(k["Sound"])
+    for i, t in enumerate(k["Sound"]):
+        expected.append((t, 3 + i, f"Audiospur {i + 1}"))
+    for i, t in enumerate(k["Data"]):
+        if t.essence_type == "ANC_Data":
+            expected.append((t, n_audio + 3, "ANC-Spur"))
+    for t, want, name in expected:
+        if t.mp_track_id != want:
+            out.append(f"{name}: Track-ID im Material Package {t.mp_track_id} statt {want}")
+        if t.fp_track_id != want:
+            out.append(f"{name}: Track-ID im File Package {t.fp_track_id} statt {want}")
+    return out
+
+
+def check_header(
+    path: Path,
+    source: Path,
+    cancel: Optional[tools.CancelToken] = None,
+    info: Optional[mxfinfo.MxfInfo] = None,
+    src_info: Optional[mxfinfo.MxfInfo] = None,
+) -> list[str]:
+    """Pruefung der Sony-Kopfdaten eines Ziel-Clips gegen die Quell-MXF.  Liefert nur Probleme
+    der Kopfdaten (getrennt von den uebrigen Pruefungen, damit "nur Kopfdaten nachziehen" moeglich ist)."""
+    out: list[str] = []
+    try:
+        out += [m for m in mxfheader.compare_with_source(path, source)]
+    except tools.Cancelled:
+        raise
+    except (mxfheader.HeaderPatchError, mxfheader.MxfParseError, OSError) as e:
+        out.append(f"Kopfdaten nicht pruefbar: {e}")
+    try:
+        if info is None:
+            info = mxfinfo.read_mxf_info(str(path), cancel=cancel)
+        if src_info is None:
+            src_info = mxfinfo.read_mxf_info(str(source), cancel=cancel)
+    except tools.Cancelled:
+        raise
+    except Exception as e:  # noqa: BLE001
+        out.append(f"Kopfdaten (mxf2raw) nicht lesbar: {e}")
+        return out
+    out += compare_info_header(info, src_info)
+    return out
 
 
 # --------------------------------------------------------------------------- Tiefenpruefung
@@ -211,7 +327,12 @@ def verify_card(
         xml_files = [p for p in (tgt / "Clip").iterdir() if re.match(re.escape(stem) + r"M\d\d\.XML$", p.name, re.I)]
         cx = card.parse_clip_xml(xml_files[0].read_bytes()) if xml_files else None
         if cx is None:
-            prob("keine M01.XML vorhanden")
+            src_xml = [p for p in (src_root / "Clip").iterdir()
+                       if re.match(re.escape(stem) + r"M\d\d\.XML$", p.name, re.I)] if src_root is not None else None
+            if src_xml == []:
+                rep.notes.append(f"{rel}: keine M01.XML (auch in der Quelle nicht vorhanden)")
+            else:
+                prob("keine M01.XML vorhanden")
         if mat is not None:
             if mat.umid != info.mp_uid:
                 prob(f"MEDIAPRO umid {mat.umid} != MXF Material-Package {info.mp_uid}")
@@ -276,6 +397,10 @@ def verify_card(
                 raise
             except Exception as e:  # noqa: BLE001
                 prob(f"ffprobe-Pruefung: {e}")
+            if src_root is None:
+                # ohne Quelle: Plausibilitaet gegen das Sony-Muster
+                for m in check_sony_pattern(info):
+                    prob(f"Kopfdaten: {m}")
             if deep:
                 log(f"  Tiefenpruefung (kompletter Decode): {rel}")
                 n, errs = deep_decode_check(str(mxf_path), cancel=cancel)
@@ -323,6 +448,9 @@ def verify_card(
                         )
                     if info.ident_modified != si.ident_modified:
                         rep.notes.append(f"{rel}: Erzeugungsdatum Ziel {info.ident_modified} / Quelle {si.ident_modified}")
+                    if is_l:
+                        for m in check_header(mxf_path, src_mxf, cancel=cancel, info=info, src_info=si):
+                            prob(f"Kopfdaten: {m}")
         if len(rep.problems) == before:
             rep.clips_ok += 1
 
@@ -332,6 +460,16 @@ def verify_card(
     if src_root is not None:
         _compare_files(src_root, tgt, mp, src_mp, rep)
     return rep
+
+
+def _xavcl_codec_of_xml(data: bytes) -> str:
+    """videoCodec einer Ziel-M01.XML, wenn sie XAVC-L nennt (Clip wurde umgewandelt, steht aber
+    evtl. nicht in MEDIAPRO.XML); sonst ''."""
+    try:
+        c = card.parse_clip_xml(data).video_codec
+    except Exception:  # noqa: BLE001
+        return ""
+    return c if card.is_xavcl_codec(c) else ""
 
 
 def _compare_files(src: Path, tgt: Path, tgt_mp: "card.MediaPro", src_mp: "card.MediaPro", rep: VerifyReport) -> None:
@@ -361,8 +499,9 @@ def _compare_files(src: Path, tgt: Path, tgt_mp: "card.MediaPro", src_mp: "card.
             elif re.search(r"M\d\d\.XML$", fn, re.I) and rel_root.as_posix().casefold() == "clip":
                 stem_m = re.match(r"(.*?)M\d\d\.XML$", fn, re.I)
                 key = f"clip/{stem_m.group(1)}.mxf".casefold() if stem_m else ""
-                if key in converted_xavcl:
-                    exp, _ = card.patch_clip_xml(sb, converted_xavcl[key])
+                new_codec = converted_xavcl.get(key) or _xavcl_codec_of_xml(tb)
+                if new_codec:
+                    exp, _ = card.patch_clip_xml(sb, new_codec)
                     if exp != tb:
                         rep.problems.append(f"{rel}: weicht ausser bei videoCodec von der Quelle ab")
                 else:

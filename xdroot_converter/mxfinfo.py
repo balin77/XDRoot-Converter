@@ -52,7 +52,10 @@ class MxfTrack:
     essence_type: str = ""
     ec_label: str = ""
     duration: Optional[int] = None
-    track_number: str = ""
+    track_number: str = ""  # TrackNumber im File Source Package ('0x16040300')
+    mp_track_id: Optional[int] = None  # Track-ID im Material Package
+    fp_track_id: Optional[int] = None  # Track-ID im File Source Package
+    fp_track_number: str = ""  # == track_number (explizit benannt)
     descriptor: dict = field(default_factory=dict)
     anc_elements: list = field(default_factory=list)  # [(line, did, sdid)]
 
@@ -66,7 +69,13 @@ class MxfInfo:
     fp_created: str = ""
     ident_modified: str = ""
     ident_company: str = ""
-    ident_product: str = ""
+    ident_product: str = ""  # Leerzeichen am Ende bleiben erhalten ("Mem ")
+    ident_version_string: str = ""
+    ident_product_uid: str = ""
+    ident_product_version: str = ""
+    ident_toolkit_version: str = ""
+    ident_platform: str = ""
+    ident_generation_uid: str = ""
     edit_rate: Optional[Fraction] = None
     duration: Optional[int] = None  # Frames
     start_tc: str = ""  # StartTimecodes material
@@ -117,9 +126,11 @@ def parse_mxf2raw(text: str, path: str = "") -> MxfInfo:
     ctx = ""  # ident / mp / fp / clip / tc / track / textobj / logs
     track: Optional[MxfTrack] = None
     desc_active = False
+    pkg_part = ""  # 'mat' / 'fs' innerhalb eines Tracks (Material:/FileSource:)
     cur_text: Optional[dict] = None
 
     for raw in text.splitlines():
+        raw_line = raw.rstrip("\r\n")  # Leerzeichen am Ende gehoeren zum Wert ("Mem ")
         line = raw.rstrip()
         if not line.strip():
             continue
@@ -129,6 +140,10 @@ def parse_mxf2raw(text: str, path: str = "") -> MxfInfo:
         # Abschnittsmarker
         if stripped.startswith("Identification #"):
             ctx = "ident"
+            # Es zaehlt die letzte Identification (Sony/bmx schreiben meist nur eine)
+            info.ident_modified = info.ident_company = info.ident_product = ""
+            info.ident_version_string = info.ident_product_uid = info.ident_product_version = ""
+            info.ident_toolkit_version = info.ident_platform = info.ident_generation_uid = ""
             continue
         if stripped.startswith("MaterialPackage #"):
             ctx = "mp"
@@ -153,6 +168,7 @@ def parse_mxf2raw(text: str, path: str = "") -> MxfInfo:
             info.tracks.append(track)
             ctx = "track"
             desc_active = False
+            pkg_part = ""
             continue
         if stripped.startswith("TextObjects:") and indent == 2:
             ctx, track = "textobj", None
@@ -166,26 +182,46 @@ def parse_mxf2raw(text: str, path: str = "") -> MxfInfo:
             continue
 
         if ctx == "track" and track is not None:
+            if stripped == "Material:":
+                pkg_part = "mat"
+                continue
+            if stripped == "FileSource:":
+                pkg_part = "fs"
+                continue
             if stripped.endswith("Descriptor:"):
                 desc_active = True
+                pkg_part = ""
                 continue
             m2 = re.match(r"Element #(\d+):", stripped)
             if m2:
                 track.anc_elements.append({})
                 continue
 
-        km = _KV.match(line)
+        km = _KV.match(raw_line)
         if not km:
             continue
         key, val = km.group(2).strip(), km.group(3).strip()
+        rawval = km.group(3)  # unveraendert (Leerzeichen am Ende erhalten)
 
         if ctx == "ident":
             if key == "modified_date":
                 info.ident_modified = val
             elif key == "company_name":
-                info.ident_company = val
+                info.ident_company = rawval
             elif key == "product_name":
-                info.ident_product = val
+                info.ident_product = rawval
+            elif key == "version_string":
+                info.ident_version_string = rawval
+            elif key == "product_uid":
+                info.ident_product_uid = val
+            elif key == "product_version":
+                info.ident_product_version = val
+            elif key == "toolkit_version":
+                info.ident_toolkit_version = val
+            elif key == "platform":
+                info.ident_platform = rawval
+            elif key == "generation_uid":
+                info.ident_generation_uid = val
         elif ctx == "mp":
             if key == "package_uid" and not info.mp_uid:
                 info.mp_uid = normalize_umid(val)
@@ -222,12 +258,22 @@ def parse_mxf2raw(text: str, path: str = "") -> MxfInfo:
                         track.duration = int(cm.group(1))
                 elif key == "track_number" and val.startswith("0x") and not track.track_number:
                     track.track_number = val
+                    track.fp_track_number = val
+                elif key == "track_id" and pkg_part in ("mat", "fs"):
+                    try:
+                        tid = int(val)
+                    except ValueError:
+                        tid = None
+                    if pkg_part == "mat" and track.mp_track_id is None:
+                        track.mp_track_id = tid
+                    elif pkg_part == "fs" and track.fp_track_id is None:
+                        track.fp_track_id = tid
             elif key in ("line_number", "wrapping_type", "sample_coding", "did", "sdid", "description") and track.anc_elements:
                 track.anc_elements[-1][key] = val
             else:
                 track.descriptor.setdefault(key, val)
         elif ctx == "textobj" and cur_text is not None:
-            cur_text[key] = val
+            cur_text[key] = rawval if key in ("description", "mime_type", "lang_code") else val
         if indent == 4 and key == "frame_wrapped":
             info.frame_wrapped = val.lower() == "true"
         if key == "op_label" and not info.op_label:

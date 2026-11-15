@@ -86,6 +86,13 @@ foreach ($pair in @(@($ffmpegDir, $ffProgs), @($bmxDir, $bmxProgs))) {
         }
     }
 }
+# Optional (kein Pflichtprogramm): MXFDump aus dem bmx-Paket, nur fuer scripts/mxf_vergleich.py
+$dump = if (Test-Path -LiteralPath $bmxDir) { Get-ChildItem -LiteralPath $bmxDir -Recurse -Filter 'MXFDump.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1 } else { $null }
+if ($dump) {
+    Write-Host "  OK       MXFDump.exe (optional)  ->  $($dump.FullName)"
+} else {
+    Write-Host "  MXFDump.exe fehlt (optional, nur fuer scripts/mxf_vergleich.py)"
+}
 if (-not $ok) { exit 1 }
 Write-Host ""
 Write-Host "Fertig. XDROOT-Converter.bat kann jetzt benutzt werden."

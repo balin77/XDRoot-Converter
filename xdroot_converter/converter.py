@@ -12,7 +12,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Optional
 
-from . import card, mxfinfo, tools, verify
+from . import card, mxfheader, mxfinfo, tools, verify
 
 TMP_NAME = "_tmp_xdroot_converter"
 LOG_NAME = "konvertierung.log"
@@ -24,6 +24,13 @@ ST_SKIPPED_DONE = "uebersprungen (bereits fertig)"
 ST_NOT_SELECTED = "nicht ausgewaehlt"
 ST_FAILED = "FEHLER"
 ST_CANCELLED = "abgebrochen"
+
+# Rueckfallwerte der Sony-Identification (siehe docs/analysis/fx6_mxf2raw.txt), falls die Quelle sie nicht liefert
+SONY_COMPANY = "Sony"
+SONY_PRODUCT = "Mem "  # mit Leerzeichen am Ende
+SONY_VERSION_STRING = "2.00"
+SONY_PRODUCT_UID = "urn:uuid:cede1104-8280-11de-8a39-08004678031c"
+_HEADER_ERRORS = (mxfheader.HeaderPatchError, mxfheader.MxfParseError, OSError)
 
 _SIGNAL_STD = {
     "SMPTE_274": "st274",
@@ -55,6 +62,7 @@ class Options:
     embed_xml: str = "auto"  # 'auto' (wenn Quelle eins hat) | 'always' | 'never'
     keep_anc: bool = True
     set_create_date: bool = True
+    sony_header: bool = True  # MXF-Kopfdaten (Identification, Track-IDs ...) aus der Quell-MXF uebernehmen
 
 
 class Reporter:
@@ -160,6 +168,19 @@ def mxf_date_to_arg(d: str) -> Optional[str]:
         return None
     ms = int((m.group(3) or "0")[:3].ljust(3, "0"))
     return f"{m.group(1)}T{m.group(2)}:{min(249, ms // 4):02d}"
+
+
+def prod_info_args(info: "mxfinfo.MxfInfo") -> list[str]:
+    """Argumente fuer ``raw2bmx --prod-info`` (Company, Product, Version, Version-String, UID) aus der
+    Quell-MXF; Rueckfall auf die Sony-Werte der FX6-Referenz.  ProductVersion '0.0.0.0.0' = weglassen."""
+    return [
+        "--prod-info",
+        info.ident_company or SONY_COMPANY,
+        info.ident_product or SONY_PRODUCT,
+        "0.0.0.0.0",
+        info.ident_version_string or SONY_VERSION_STRING,
+        info.ident_product_uid or SONY_PRODUCT_UID,
+    ]
 
 
 @dataclass
@@ -291,6 +312,9 @@ class Converter:
             if self.o.max_frames:
                 self.warn(f"TESTLAUF: nur die ersten {self.o.max_frames} Frames je Clip; dur/Duration werden NICHT angepasst")
             self.info(f"Einstellungen: Bitrate {self.o.bitrate_mbps} Mbit/s, Preset {self.o.preset}")
+            if not self.o.sony_header:
+                self.warn("Kopfdaten-Angleichung ABGESCHALTET (--no-sony-header): Die Dateien tragen bmx-Kennungen "
+                          "(BBC/bmx, Toolkit/Platform) und bmx-Track-IDs (1001/2001/...) statt der Sony-Kennungen der Quelle.")
             if self.o.bitrate_mbps != 50:
                 self.warn("Bitrate ungleich 50 Mbit/s: Die Kennung 'AVC50' in den XML-Dateien entspricht dann nicht der Bitrate.")
 
@@ -465,6 +489,20 @@ class Converter:
         # Fortsetzen: fertiger, verifizierter Ziel-Clip vorhanden?
         if dst.exists():
             probs = verify.check_clip(dst, exp, cancel=self.cancel)
+            if not probs and self.o.sony_header:
+                hprobs = verify.check_header(dst, plan.mxf, cancel=self.cancel, src_info=info)
+                if hprobs:
+                    # Nur die Kopfdaten weichen ab (z. B. Ausgabe einer aelteren Version): nachziehen statt neu transkodieren
+                    try:
+                        self._adopt_header(plan, dst)
+                        hprobs = verify.check_header(dst, plan.mxf, cancel=self.cancel, src_info=info)
+                    except _HEADER_ERRORS as e:
+                        hprobs = [f"Angleichen nicht moeglich: {e}"]
+                    if hprobs:
+                        probs = ["Kopfdaten: " + hprobs[0]]
+                    else:
+                        self.info(f"{plan.name}: Kopfdaten nachgezogen (Datei nicht neu transkodiert)")
+                        res.notes.append("Kopfdaten nachgezogen")
             if not probs:
                 self.info(f"{plan.name}: bereits fertig und verifiziert - uebersprungen")
                 self._patch_clip_xml(plan, dst_dir)
@@ -520,7 +558,15 @@ class Converter:
                 continue
             exp.expect_anc = anc_f is not None
             exp.expect_xml = xml_f is not None
-            probs = verify.check_clip(out_mxf, exp, cancel=self.cancel)
+            if self.o.sony_header:
+                try:
+                    self._adopt_header(plan, out_mxf)
+                except _HEADER_ERRORS as e:
+                    raise RuntimeError(f"MXF-Kopfdaten konnten nicht an die Quelle angeglichen werden: {e}") from e
+            probs = verify.check_clip(
+                out_mxf, exp, cancel=self.cancel,
+                source=plan.mxf if self.o.sony_header else None, source_info=info,
+            )
             if probs:
                 last_err = "; ".join(probs)
                 self.warn(f"{plan.name}: Pruefung des Ergebnisses fehlgeschlagen: {last_err} - Versuch {idx + 1}/{len(attempts)}")
@@ -548,6 +594,18 @@ class Converter:
         self._emit_progress(plan, 1.0, "fertig")
         self._frames_done += frames
         self.info(f"{plan.name}: fertig ({fmt_size(plan.mxf.stat().st_size)} -> {fmt_size(dst.stat().st_size)})")
+
+    def _adopt_header(self, plan: ClipPlan, mxf: Path) -> None:
+        """Kopfdaten der (Ziel-)MXF an die Quell-MXF angleichen (Python-Patcher, Quelle nur lesend).
+        Wirft HeaderPatchError / MxfParseError / OSError."""
+        msgs = mxfheader.adopt_from_source(mxf, plan.mxf)
+        changes = [m for m in msgs if not m.startswith("WARNUNG:")]
+        self.info(f"{plan.name}: Kopfdaten an Quelle angeglichen ({len(changes)} Aenderungen)")
+        for m in changes:
+            self.info(f"{plan.name}:   {m}")
+        for m in msgs:
+            if m.startswith("WARNUNG:"):
+                self.warn(f"{plan.name}: {m[len('WARNUNG:'):].strip()}")
 
     def _want_embed(self, info: mxfinfo.MxfInfo, plan: ClipPlan) -> bool:
         if plan.xml_path is None or self.o.embed_xml == "never":
@@ -681,6 +739,8 @@ class Converter:
             "--dur", str(frames),
             "--aes-3",  # Audio-Mapping wie Sony (ec_label ...02060300, Track-Nummern 0x16NN03xx)
         ]
+        if self.o.sony_header:
+            args += prod_info_args(info)
         if self.o.set_create_date:
             cd = mxf_date_to_arg(info.ident_modified)
             if cd:
