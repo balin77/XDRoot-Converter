@@ -69,3 +69,19 @@ Abweichung). Runde 2 und die Fix-Runden wurden in einer Cloud-Session (Linux, oh
 - Fortsetzen übernimmt abweichende Einstellungen nicht (nur Warnung); Sperrdatei, Strg+C und Wiederholungen bei gesperrten Dateien
   nur unter Linux bzw. mit Attrappen getestet.
 - GUI-Klicks sind nicht automatisiert getestet.
+
+### Kleine Notizen aus dem letzten Review (nicht behoben, keine groben Fehler)
+
+- Speicherschätzung: Ein nicht analysierbarer Quell-Clip, dessen umgewandelter Ziel-Clip schon existiert, wird mitgezählt, obwohl
+  nichts geschrieben wird. Bei einer sehr großen defekten Quelle kann ein Fortsetzungslauf deshalb unnötig mit „Zu wenig freier
+  Speicher“ abbrechen (kein Datenverlust).
+- `--verify --source`: Für einen nicht lesbaren, mit der Quelle byte-gleichen Ziel-Clip entfällt die Prüfung, ob `M01.XML` und
+  `MEDIAPRO.XML` ihn fälschlich als XAVC-L führen. Der Byte-Vergleich liest beide Dateien komplett und ist nicht abbrechbar.
+- Hat sich eine nicht lesbare Quelldatei zwischen zwei Läufen geändert, meldet die Zusammenfassung die ältere eigene Kopie im Ziel
+  als „fremde Datei“; der Clip bleibt Fehler, bis die Zieldatei gelöscht wird.
+- Ein vorübergehender Lesefehler der Einstellungsdatei führt ebenfalls zum Umbenennen nach `.defekt`; eine vorhandene
+  `.defekt`-Datei wird überschrieben.
+- Die Übersicht meldet für nicht umwandelbare Clips immer „wird unverändert kopiert“, auch wenn im Ziel schon ein umgewandelter
+  Clip liegt (dann ist es tatsächlich ein Fehler mit erhaltenem Ziel).
+- Meldungen aus dem Ablauf (Protokoll, Teile der Abschlussfenster) sind in ASCII-Umschrift („ae/oe/ue“), die übrige Oberfläche
+  hat echte Umlaute.
