@@ -6,6 +6,8 @@ import html
 import os
 import re
 import shutil
+import stat
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -290,9 +292,45 @@ def clip_xml_stem(name: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def make_writable(path) -> None:
+    """Schreibbit (Besitzer) setzen, damit eine schreibgeschuetzte Quelle (Windows: Nur-Lesen-Attribut) das Ziel
+    nicht schreibgeschuetzt macht.  Bei Ordnern bleibt das Betreten (x) erhalten.  Fehler werden ignoriert."""
+    try:
+        mode = os.stat(path).st_mode
+        add = stat.S_IWUSR | (stat.S_IXUSR if stat.S_ISDIR(mode) else 0)
+        if mode & add != add:
+            os.chmod(path, mode | add)
+    except OSError:
+        pass
+
+
+def copystat_writable(src, dst) -> None:
+    """Zeitstempel/Rechte von ``src`` auf ``dst`` uebertragen (best effort), danach ist ``dst`` beschreibbar."""
+    try:
+        shutil.copystat(src, dst)
+    except OSError:
+        pass
+    make_writable(dst)
+
+
+def replace_retry(src, dst, tries: int = 10, delay: float = 0.3) -> None:
+    """``os.replace`` mit Wiederholungen bei PermissionError (Windows: Virenscanner, Explorer-Vorschau oder
+    Nur-Lesen-Attribut der alten Zieldatei halten die Datei kurz fest)."""
+    for i in range(max(1, tries)):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i >= tries - 1:
+                raise
+            if i == 0 and os.path.exists(dst) and not os.access(dst, os.W_OK):
+                make_writable(dst)
+            time.sleep(delay)
+
+
 def write_bytes_atomic(dst: Path, data: bytes, stat_from: Optional[Path] = None) -> None:
-    """Datei atomar schreiben: Temp-Datei im selben Ordner, fsync, dann os.replace.
-    Zeitstempel/Rechte von ``stat_from`` werden uebernommen (soweit moeglich)."""
+    """Datei atomar schreiben: Temp-Datei im selben Ordner, fsync, dann os.replace (mit Wiederholungen).
+    Zeitstempel/Rechte von ``stat_from`` werden uebernommen (soweit moeglich), das Ziel bleibt beschreibbar."""
     dst = Path(dst)
     tmp = dst.with_name(dst.name + TMP_SUFFIX)
     try:
@@ -304,11 +342,8 @@ def write_bytes_atomic(dst: Path, data: bytes, stat_from: Optional[Path] = None)
             except OSError:
                 pass
         if stat_from is not None:
-            try:
-                shutil.copystat(stat_from, tmp)
-            except OSError:
-                pass
-        os.replace(tmp, dst)
+            copystat_writable(stat_from, tmp)
+        replace_retry(tmp, dst)
     except BaseException:
         try:
             tmp.unlink()
@@ -318,12 +353,13 @@ def write_bytes_atomic(dst: Path, data: bytes, stat_from: Optional[Path] = None)
 
 
 def copy_file_atomic(src: Path, dst: Path) -> None:
-    """Datei mit Zeitstempeln atomar kopieren (Temp-Datei im Zielordner + os.replace)."""
+    """Datei mit Zeitstempeln atomar kopieren (Temp-Datei im Zielordner + os.replace mit Wiederholungen)."""
     dst = Path(dst)
     tmp = dst.with_name(dst.name + TMP_SUFFIX)
     try:
         shutil.copy2(src, tmp)
-        os.replace(tmp, dst)
+        make_writable(tmp)
+        replace_retry(tmp, dst)
     except BaseException:
         try:
             tmp.unlink()
@@ -363,6 +399,8 @@ def check_existing_target(src_root: Path, out_root: Path, src_mp: MediaPro) -> N
     if not out_root.exists():
         return
     prefix = "Der Zielordner enthaelt bereits eine andere Karte oder fremde Daten: "
+    hint = (" Das tritt auch auf, wenn auf der Quellkarte seit dem letzten Lauf Clips geloescht wurden. "
+            "Dann bitte einen neuen, leeren Zielordner waehlen.")
     if not out_root.is_dir():
         raise ValueError(prefix + f"'{out_root}' ist kein Ordner.")
     src_clip_names = {p.name.casefold() for p in list_clip_mxf(src_root)}
@@ -395,10 +433,10 @@ def check_existing_target(src_root: Path, out_root: Path, src_mp: MediaPro) -> N
     foreign = [m for m in tmp.materials if m.umid and m.umid not in src_umids]
     if foreign:
         raise ValueError(prefix + f"{len(foreign)} Clip(s) der MEDIAPRO.XML im Ziel stehen nicht in der Quelle "
-                         f"(z. B. {foreign[0].rel_path}).")
+                         f"(z. B. {foreign[0].rel_path})." + hint)
     for p in tgt_mxfs:
         if p.name.casefold() not in src_clip_names:
-            raise ValueError(prefix + f"Clip/{p.name} gehoert nicht zur Quelle.")
+            raise ValueError(prefix + f"Clip/{p.name} gehoert nicht zur Quelle." + hint)
 
 
 def copy_structure(
@@ -461,8 +499,5 @@ def copy_structure(
             except OSError as e:
                 fail((rel / fn).as_posix(), e)
     for s_dir, d_dir in reversed(dirs):  # Ordner-Zeitstempel zuletzt
-        try:
-            shutil.copystat(s_dir, d_dir)
-        except OSError:
-            pass
+        copystat_writable(s_dir, d_dir)
     return count

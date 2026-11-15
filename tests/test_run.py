@@ -86,8 +86,14 @@ def _mxf_info(path, cancel=None):
     if parts[0] == "DST" and len(parts) > 2 and parts[2] == "TRUNC":
         raise RuntimeError("abgeschnitten")
     et = {"SRC": "AVCI_100_1080p", "DST": "AVC_High_422", "OTHER": "MPEG2_Long"}[parts[0]]
+    if parts[0] == "DST" and len(parts) > 4 and parts[4].isdigit():
+        info.duration = int(parts[4])  # DST|NAME|L||FRAMES: gekuerzter Clip (--max-frames)
+    if parts[0] == "SRC" and len(parts) > 2 and parts[2].startswith("NODUR"):
+        info.duration = None  # Quelle mit unbekannter Dauer
     info.tracks = [mxfinfo.MxfTrack(index=0, kind="Picture", essence_type=et)] + [
-        mxfinfo.MxfTrack(index=i, kind="Sound", essence_type="PCM") for i in (1, 2)]
+        mxfinfo.MxfTrack(index=i, kind="Sound", essence_type="PCM", mp_track_id=100 + i) for i in (1, 2)]
+    if parts[0] == "DST" and len(parts) > 3 and parts[3].startswith("ANC"):
+        info.tracks.append(mxfinfo.MxfTrack(index=9, kind="Data", essence_type="ANC_Data"))
     return info
 
 
@@ -105,6 +111,13 @@ class Fakes:
         self.adopts: list = []
         self.after_adopt_problems: list = []
         self.seq_offs = [0, 0]
+        self.audio_order = [101, 102]  # Sound-Track-IDs im Tracks-Array des Material Packages (ffmpeg-Reihenfolge)
+        self.kag = 1
+        self.tail_problems: list = []
+        self.wrap_frames: dict = {}
+        self.tails: list = []
+        self.fail_wrap_anc: set = set()  # Clip-Namen: raw2bmx scheitert, solange eine ANC-Datei uebergeben wird
+        self.always_probs: list = []  # Befunde, die check_clip fuer jede Datei zusaetzlich meldet
         self.probe_level = "42"
         self.crash_in_finish: set = set()  # Clip-Namen: os._exit direkt nach dem Ersetzen der MXF (harter Abbruch)
         self.patches: list = []
@@ -135,7 +148,11 @@ class Fakes:
             fx.wraps.append(plan.name)
             if plan.stem in fx.fail_wrap:
                 return "raw2bmx kaputt"
-            out.write_bytes(f"DST|{plan.stem}|L".encode())
+            if anc is not None and plan.stem in fx.fail_wrap_anc:
+                return "raw2bmx ANC kaputt"
+            out.write_bytes(f"DST|{plan.stem}|L".encode() + (b"||%d" % frames if frames != FRAMES else b"")
+                            + (b"|ANC" if anc is not None else b""))
+            fx.wrap_frames[plan.stem] = frames
             return ""
 
         def check_clip(path, exp, cancel=None, source=None, source_info=None):
@@ -149,10 +166,19 @@ class Fakes:
                 probs.append("essence_type falsch")
             if info.mp_uid != exp.mp_uid:
                 probs.append("Material-Package-UMID falsch")
-            if source is not None and fx.after_adopt_problems:
+            if exp.expect_anc and not info.anc_tracks:
+                probs.append("ANC-Spur fehlt")
+            probs += fx.always_probs
+            if source is not None:
+                probs += fx.header_problems  # wie das echte check_clip: mit Quelle auch die Kopfdaten
+            if source is not None and not fx.header_problems and fx.after_adopt_problems:
                 probs += fx.after_adopt_problems
                 fx.after_adopt_problems = []  # einmalig
             return probs
+
+        def tail_check(path, frames, fps, cancel=None, tail_frames=25):
+            fx.tails.append(Path(path).name)
+            return list(fx.tail_problems)
 
         def check_header(path, source, cancel=None, info=None, src_info=None):
             return list(fx.header_problems)
@@ -174,12 +200,15 @@ class Fakes:
             mock.patch.object(mxfinfo, "run_ffprobe", probe),
             mock.patch.object(mxfinfo, "decide_source", decide),
             mock.patch.object(converter, "read_seq_offsets", lambda p: list(fx.seq_offs)),
+            mock.patch.object(converter, "read_audio_order", lambda p: list(fx.audio_order)),
+            mock.patch.object(converter, "read_kag_size", lambda p: fx.kag),
             mock.patch.object(converter.Converter, "_transcode", transcode),
             mock.patch.object(converter.Converter, "_wrap", wrap),
             mock.patch.object(converter.Converter, "_extract_anc", lambda *a, **k: None),
             mock.patch.object(converter.Converter, "_finish_clip_files", finish),
             mock.patch.object(verify, "check_clip", check_clip),
             mock.patch.object(verify, "check_header", check_header),
+            mock.patch.object(verify, "tail_decode_check", tail_check),
             mock.patch.object(mxfheader, "adopt_from_source", adopt),
             mock.patch.object(converter.shutil, "disk_usage",
                               lambda p: shutil._ntuple_diskusage(10 ** 13, 10 ** 13 - fx.free, fx.free)),
@@ -441,7 +470,7 @@ class G3_ResumeHeaderRecheck(RunTestBase):
         s, rep, _ = self.run_conv(only=["A"])
         self.assertEqual(self.fx.adopts[0], "A.MXF")
         # nach dem Angleichen wurde check_clip ERNEUT (mit Quelle = volle Pruefung) aufgerufen
-        self.assertEqual([c for c in self.fx.checks if c[0] == "A.MXF"], [("A.MXF", False), ("A.MXF", True)])
+        self.assertEqual([c for c in self.fx.checks if c[0] == "A.MXF"], [("A.MXF", True), ("A.MXF", False), ("A.MXF", True)])
         # Ergebnis der vollen Pruefung fiel durch -> Clip wurde neu erzeugt
         self.assertEqual({r.name: r.status for r in s.results}["A.MXF"], converter.ST_CONVERTED)
         self.assertEqual(self.fx.transcodes.count("A.MXF"), 2)

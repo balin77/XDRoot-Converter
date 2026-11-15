@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import re
 import struct
+import tempfile
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
@@ -301,6 +304,8 @@ def check_clip(
         problems.append(f"ffprobe-Pruefung: {e}")
     if source is not None:
         problems += check_header(path, source, cancel=cancel, info=info, src_info=source_info)
+        problems += check_audio_content(path, source, cancel=cancel, fps=info.edit_rate,
+                                        duration=(source_info.duration if source_info is not None else info.duration))
     return problems
 
 
@@ -385,9 +390,11 @@ def check_header(
     cancel: Optional[tools.CancelToken] = None,
     info: Optional[mxfinfo.MxfInfo] = None,
     src_info: Optional[mxfinfo.MxfInfo] = None,
+    notes: Optional[list] = None,
 ) -> list[str]:
     """Pruefung der Sony-Kopfdaten eines Ziel-Clips gegen die Quell-MXF.  Liefert nur Probleme
-    der Kopfdaten (getrennt von den uebrigen Pruefungen, damit "nur Kopfdaten nachziehen" moeglich ist)."""
+    der Kopfdaten (getrennt von den uebrigen Pruefungen, damit "nur Kopfdaten nachziehen" moeglich ist).
+    Hinweise (keine Abweichungen) werden, falls ``notes`` angegeben ist, dort angehaengt."""
     out: list[str] = []
     try:
         # compare_with_source beginnt seine Saetze mit "Abweichung: " - nicht doppelt praefixen
@@ -397,7 +404,7 @@ def check_header(
         raise
     except (mxfheader.HeaderPatchError, mxfheader.MxfParseError, OSError) as e:
         out.append(f"Kopfdaten nicht pruefbar: {e}")
-    out += check_header_direct(path, source)
+    out += check_header_direct(path, source, notes=notes)
     try:
         if info is None:
             info = mxfinfo.read_mxf_info(str(path), cancel=cancel)
@@ -425,11 +432,14 @@ def _track_ids(pkg) -> dict:
     return {k: sorted(x for x in v if x is not None) for k, v in out.items()}
 
 
-def check_header_direct(path: Path, source: Path) -> list[str]:
+def check_header_direct(path: Path, source: Path, notes: Optional[list] = None) -> list[str]:
     """Direkte, vom Patcher (``compare_with_source``) unabhaengige Pruefung der Kopfdaten ueber
-    ``mxfheader.read_header`` (nur Lesen): je Package gleiche Track-IDs von Timecode-/Bild-/Ton-/
-    Daten-Tracks wie die Quelle; jeder SourceClip im Material Package zeigt auf einen existierenden
-    Track des File Packages; jede LinkedTrackID eines Deskriptors existiert; Identification-Felder
+    ``mxfheader.read_header`` (nur Lesen): je Package gleiche Track-IDs von Bild-/Ton-/Daten-Tracks
+    wie die Quelle; jeder Timecode-Track des Ziels traegt eine ID, die auch ein Timecode-Track der
+    Quelle im selben Package hat (zusaetzliche Timecode-Tracks der Quelle sind nur ein Hinweis, er
+    wird an ``notes`` angehaengt, falls angegeben); jeder SourceClip im Material Package zeigt auf
+    einen existierenden Track des File Packages; jede LinkedTrackID eines Deskriptors existiert;
+    Identification-Felder (die ERSTE Identification, maßgeblich ist die urspruengliche Erzeugung)
     byte-gleich zur Quelle."""
     out: list[str] = []
     try:
@@ -448,6 +458,15 @@ def check_header_direct(path: Path, source: Path) -> list[str]:
                 x, y = a.get(kind, []), b.get(kind, [])
                 if kind == "data" and not x:
                     continue  # ANC fehlt im Ziel: wird getrennt gemeldet (ggf. gewollt bei --no-anc)
+                if kind == "timecode":
+                    # jeder Ziel-Timecode-Track muss eine ID eines Timecode-Tracks der Quelle haben;
+                    # weitere Timecode-Tracks der Quelle fehlen im Ziel bewusst (nur Hinweis)
+                    if any(i not in y for i in x):
+                        out.append(f"{label}: Track-IDs {kind} {x} statt {y} (Quelle)")
+                    elif len(y) > len(x) and notes is not None:
+                        notes.append(f"{label}: Quelle hat zusaetzliche Timecode-Tracks "
+                                     f"(IDs {[i for i in y if i not in x]}), im Ziel nicht vorhanden")
+                    continue
                 if x != y:
                     out.append(f"{label}: Track-IDs {kind} {x} statt {y} (Quelle)")
         if st.file is not None:
@@ -468,8 +487,8 @@ def check_header_direct(path: Path, source: Path) -> list[str]:
                     v = ht.u32(d, ref)
                     if v is not None and v not in fids:
                         out.append(f"Deskriptor {ref.split('.')[1]} {v} zeigt auf keinen Track des File Packages")
-        it = st.identifications[-1] if st.identifications else None
-        isr = ss.identifications[-1] if ss.identifications else None
+        it = st.identifications[0] if st.identifications else None
+        isr = ss.identifications[0] if ss.identifications else None
         if it is None or isr is None:
             if (it is None) != (isr is None):
                 out.append("Identification: nur in " + ("der Quelle" if it is None else "im Ziel") + " vorhanden")
@@ -484,6 +503,104 @@ def check_header_direct(path: Path, source: Path) -> list[str]:
     except Exception as e:  # noqa: BLE001
         out.append(f"Kopfdaten (direkt) Pruefung fehlgeschlagen: {e}")
     return out
+
+
+# --------------------------------------------------------------------------- Tonspuren-Inhalt
+
+
+def _extract_audio(path, start: int, dur: int, directory: str, tag: str,
+                   cancel: Optional[tools.CancelToken]) -> list[bytes]:
+    """Rohe PCM-Daten (24 Bit) aller Tonspuren von ``dur`` Edit-Units ab ``start`` per mxf2raw --ess-out.
+    mxf2raw liest dabei nur die Tonspuren des gewaehlten Bereichs (Video/Daten abgeschaltet); die Dateien
+    heissen ``<prefix>_a<N>.raw`` mit N = Tonspur in der Reihenfolge von ``mxf2raw -i``.  Gibt die Inhalte
+    in dieser Reihenfolge zurueck; wirft RuntimeError."""
+    prefix = os.path.join(directory, tag)
+    res = tools.run_capture(
+        [tools.find_tool("mxf2raw"), "--ess-out", prefix, "--start", str(start), "--dur", str(dur),
+         "--disable-video", "--disable-data", str(path)],
+        cancel=cancel, keep_lines=30,
+    )
+    found = []
+    for name in os.listdir(directory):
+        m = re.fullmatch(re.escape(tag) + r"_a(\d+)\.raw", name)
+        if m:
+            found.append((int(m.group(1)), name))
+    if res.returncode != 0 or not found:
+        tail = (res.stderr or res.stdout).strip()[-200:]
+        raise RuntimeError(f"mxf2raw --ess-out fuer {os.path.basename(str(path))} fehlgeschlagen: {tail or 'keine Tondaten'}")
+    out = []
+    for _n, name in sorted(found):
+        fp = os.path.join(directory, name)
+        with open(fp, "rb") as f:
+            out.append(f.read())
+        os.remove(fp)  # gleich wieder freigeben (nur wenige MB, aber Verzeichnis wird wiederverwendet)
+    return out
+
+
+def _compare_audio(target: list[bytes], source: list[bytes], where: str = "") -> list[str]:
+    out: list[str] = []
+    if len(target) != len(source):
+        return [f"Tonspuren{where}: {len(target)} extrahiert statt {len(source)} (Quelle)"]
+    for i, (t, s) in enumerate(zip(target, source), 1):
+        n = min(len(t), len(s))  # Testausgaben (--max-frames) sind kuerzer: gemeinsame Laenge
+        if n == 0:
+            if len(t) != len(s):
+                out.append(f"Tonspur {i}{where}: keine Audiodaten lesbar (Ziel {len(t)} Bytes, Quelle {len(s)} Bytes)")
+            continue
+        if t[:n] == s[:n]:
+            continue
+        msg = f"Tonspur {i}{where}: Inhalt weicht von der Quelle ab (Spuren vertauscht?)"
+        others = [k for k, o in enumerate(source, 1) if k != i and o[:n] == t[:n]]
+        if others:
+            msg += f" - entspricht dem Inhalt von Quell-Tonspur {', '.join(str(k) for k in others)}"
+        out.append(msg)
+    return out
+
+
+def check_audio_content(
+    target,
+    source,
+    cancel: Optional[tools.CancelToken] = None,
+    seconds: float = 1.0,
+    fps: Optional[Fraction] = None,
+    duration: Optional[int] = None,
+) -> list[str]:
+    """Vergleicht den Ton-INHALT: je Tonspur die ersten ``seconds`` Sekunden von Ziel und Quelle
+    (mxf2raw --ess-out mit --start/--dur, Video/Daten abgeschaltet, in einem temporaeren Verzeichnis,
+    das danach geloescht wird) byte-genau, Spur fuer Spur in der Reihenfolge von mxf2raw.  Faengt vertauschte
+    oder falsch zugeordnete Tonspuren, die in den Kopfdaten nicht sichtbar sind.  Bei ``--max-frames``-
+    Testausgaben ist das Ziel kuerzer: es zaehlt die gemeinsame Laenge.  Sind in diesem Fenster nicht alle
+    Quellspuren verschieden (z. B. Stille), werden zusaetzlich Fenster bei 1/3 und 2/3 der Dauer geprueft.
+    ``fps``/``duration`` (Bildrate, Frames der Quelle) sparen einen mxf2raw-Aufruf, wenn bekannt.
+    Leere Liste = in Ordnung."""
+    try:
+        if fps is None or not duration:
+            si = mxfinfo.read_mxf_info(str(source), cancel=cancel)
+            fps = fps or si.edit_rate
+            duration = duration or si.duration
+        n = max(1, math.ceil(seconds * float(fps or 25)))
+        with tempfile.TemporaryDirectory(prefix="xdroot_audiochk_") as td:
+            src = _extract_audio(source, 0, n, td, "s", cancel)
+            tgt = _extract_audio(target, 0, n, td, "t", cancel)
+            out = _compare_audio(tgt, src)
+            if not out and len(src) > 1 and len(set(src)) < len(src) and duration:
+                for frac, label in ((1 / 3, " (Fenster bei 1/3)"), (2 / 3, " (Fenster bei 2/3)")):
+                    start = int(duration * frac)
+                    if start < 1 or start >= duration:
+                        continue
+                    try:
+                        s2 = _extract_audio(source, start, n, td, "s", cancel)
+                        t2 = _extract_audio(target, start, n, td, "t", cancel)
+                    except RuntimeError:
+                        continue  # z. B. kuerzere Testausgabe: Fenster liegt hinter dem Ende des Ziels
+                    out += _compare_audio(t2, s2, label)
+                    if out or len(set(s2)) == len(s2):
+                        break
+            return out
+    except tools.Cancelled:
+        raise
+    except Exception as e:  # noqa: BLE001
+        return [f"Tonspuren-Inhalt nicht pruefbar: {e}"]
 
 
 def tail_decode_check(path: str, frames: int, fps: Optional[Fraction], cancel: Optional[tools.CancelToken] = None,
@@ -603,6 +720,34 @@ def _read_test_marker(target_dir: Path) -> Optional[int]:
     return None
 
 
+SETTINGS_NAME = "konvertierung_einstellungen.json"  # wie converter.SETTINGS_NAME (hier nicht importiert)
+# Felder je Clip, die "ANC wurde bewusst/zwangsweise nicht uebernommen" anzeigen (defensiv gelesen,
+# unbekannte Felder werden ignoriert)
+_ANC_DROPPED_FLAGS = ("anc_failed", "anc_dropped", "anc_skipped", "anc_omitted", "anc_missing", "anc_uebernahme_gescheitert")
+
+
+def _anc_dropped_clips(target_dir: Path) -> dict:
+    """{Clip-Pfad klein geschrieben ('clip/name.mxf'): Grund} der Clips, bei denen laut
+    ``konvertierung_einstellungen.json`` im Zielordner ANC nicht uebernommen wurde (``keep_anc`` false oder
+    ein Fehlerfeld wie ``anc_failed``).  Fehlende/unlesbare Datei = leer."""
+    try:
+        data = json.loads((target_dir / SETTINGS_NAME).read_text(encoding="utf-8"))
+        clips = data.get("clips") if isinstance(data, dict) else None
+        if not isinstance(clips, dict):
+            return {}
+    except (OSError, ValueError):
+        return {}
+    out: dict = {}
+    for rel, entry in clips.items():
+        if not isinstance(entry, dict) or not isinstance(rel, str):
+            continue
+        if entry.get("keep_anc") is False:
+            out[rel.replace("\\", "/").casefold()] = "ANC-Uebernahme war abgeschaltet (--no-anc)"
+        elif any(entry.get(k) is True or (isinstance(entry.get(k), str) and entry.get(k)) for k in _ANC_DROPPED_FLAGS):
+            out[rel.replace("\\", "/").casefold()] = "ANC-Uebernahme ist beim Umwandeln gescheitert (laut Einstellungsdatei)"
+    return out
+
+
 def verify_card(
     target: str,
     source: Optional[str] = None,
@@ -621,6 +766,7 @@ def verify_card(
     src_mp = card.parse_mediapro((src_root / "MEDIAPRO.XML").read_bytes()) if src_root else None
 
     mxfs = card.list_clip_mxf(tgt)
+    anc_dropped = _anc_dropped_clips(tgt.parent)
     gop_ok: list[int] = []
     listed = {m.rel_path.casefold() for m in mp.materials}
     for m in mp.materials:
@@ -764,8 +910,14 @@ def verify_card(
                     if len(info.audio) != len(si.audio):
                         prob(f"Audiospuren {len(info.audio)} != Quelle {len(si.audio)}")
                     if bool(info.anc_tracks) != bool(si.anc_tracks):
-                        extra = " (gewollt bei --no-anc)" if si.anc_tracks and not info.anc_tracks else ""
-                        prob(f"ANC-Spur: Ziel {'ja' if info.anc_tracks else 'nein'}, Quelle {'ja' if si.anc_tracks else 'nein'}{extra}")
+                        why = anc_dropped.get(rel.casefold()) if si.anc_tracks and not info.anc_tracks else None
+                        if why:
+                            rep.notes.append(f"{rel}: ANC-Spur fehlt im Ziel, Quelle hat eine - {why}")
+                        else:
+                            extra = " (gewollt bei --no-anc)" if si.anc_tracks and not info.anc_tracks else ""
+                            prob(f"ANC-Spur: Ziel {'ja' if info.anc_tracks else 'nein'}, Quelle {'ja' if si.anc_tracks else 'nein'}{extra}"
+                                 + (" - in der Einstellungsdatei steht nicht, dass ANC bewusst weggelassen wurde"
+                                    if extra else ""))
                     elif si.anc_tracks and len(info.anc_tracks[0].anc_elements) != len(si.anc_tracks[0].anc_elements):
                         prob(f"ANC-Manifest {len(info.anc_tracks[0].anc_elements)} Elemente statt {len(si.anc_tracks[0].anc_elements)} (Quelle)")
                     if bool(info.text_objects) != bool(si.text_objects):
@@ -775,8 +927,14 @@ def verify_card(
                     if info.ident_modified != si.ident_modified:
                         rep.notes.append(f"{rel}: Erzeugungsdatum Ziel {info.ident_modified} / Quelle {si.ident_modified}")
                     if is_l:
-                        for m in check_header(mxf_path, src_mxf, cancel=cancel, info=info, src_info=si):
+                        hint_notes: list = []
+                        for m in check_header(mxf_path, src_mxf, cancel=cancel, info=info, src_info=si,
+                                              notes=hint_notes):
                             prob(f"Kopfdaten: {m}")
+                        rep.notes += [f"{rel}: {h}" for h in hint_notes]
+                        for m in check_audio_content(mxf_path, src_mxf, cancel=cancel, fps=info.edit_rate,
+                                                     duration=si.duration):
+                            prob(m)
         if len(rep.problems) == before:
             rep.clips_ok += 1
 

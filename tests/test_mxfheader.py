@@ -298,7 +298,7 @@ class AdoptTests(Base):
         msgs = mh.adopt_from_source(tgt, src)
         self.assertTrue(any(m.startswith("Identification.CompanyName") for m in msgs))
         hm, st = structure(tgt)
-        ident = st.identifications[-1]
+        ident = st.identifications[0]
         g = lambda f: hm.get(ident, "Identification." + f)
         self.assertEqual(g("CompanyName"), u16s("Sony"))
         self.assertEqual(g("ProductName"), u16s("Mem "))
@@ -472,7 +472,7 @@ class AdoptTests(Base):
         src, tgt = self.pair(s, t)
         mh.adopt_from_source(tgt, src)
         hm, st = structure(tgt)
-        i = st.identifications[-1]
+        i = st.identifications[0]
         self.assertEqual(hm.get(i, "Identification.CompanyName"), u16s("Sony"))
         self.assertEqual(hm.get(i, "Identification.ProductName"), u16s("Mem "))
         self.assertIsNone(hm.get(i, "Identification.Platform"))
@@ -495,6 +495,89 @@ class AdoptTests(Base):
         mh.adopt_from_source(tgt, src)
         mh.compare_with_source(tgt, src)
         self.assertEqual(sb, src.read_bytes())
+
+    # ---- Identification: die ERSTE der Quelle ist maßgeblich
+    def _two_idents(self, card):
+        """Zweite Identification (Bearbeitungsprogramm) hinter die erste setzen; Preface listet beide."""
+        ident2 = card.add("Identification", [
+            ("Identification.ThisGenerationUID", b"\x55" * 16),
+            ("Identification.ModificationDate", bytes.fromhex("07ea0b0f110000" + "00")),
+            ("Identification.CompanyName", u16s("Adobe")),
+            ("Identification.ProductName", u16s("Premiere")),
+            ("Identification.VersionString", u16s("9.9")),
+            ("Identification.ProductUID", bytes.fromhex("11" * 16)),
+            ("Identification.ToolkitVersion", bytes.fromhex("00010006000000000000")),
+        ])
+        out = []
+        for n, items, u, k in card.sets:
+            if n == "Preface":
+                first = dict(items)["Preface.Identifications"][8:24]
+                items = [(r, batch([first, ident2]) if r == "Preface.Identifications" else v) for r, v in items]
+            out.append((n, items, u, k))
+        card.sets = out
+        return ident2
+
+    def test_first_identification_of_source_is_authoritative(self):
+        s, t = self.std()
+        self._two_idents(s)
+        src, tgt = self.pair(s, t)
+        msgs = mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        i = st.identifications[0]
+        self.assertEqual(hm.get(i, "Identification.CompanyName"), u16s("Sony"))
+        self.assertEqual(hm.get(i, "Identification.ProductName"), u16s("Mem "))
+        self.assertIsNone(hm.get(i, "Identification.ToolkitVersion"))      # steht nur in der zweiten der Quelle
+        self.assertTrue(any(m.startswith("Identification.CompanyName") for m in msgs))
+        self.assertEqual(mh.compare_with_source(tgt, src), [])
+        # Gegenprobe: dieselbe Quelle ohne zweite Identification ergibt dasselbe Ziel
+        s2, t2 = self.std()
+        src2, tgt2 = self.pair(s2, t2)
+        mh.adopt_from_source(tgt2, src2)
+        self.assertEqual(tgt.read_bytes(), tgt2.read_bytes())
+
+    # ---- GenerationUID der Sound-Deskriptoren bleibt die des Ziels
+    def test_descriptor_generation_uid_not_copied_from_source(self):
+        gen = "InterchangeObject.GenerationUID"
+        src_gen, tgt_gen = b"\x55" * 16, b"\x66" * 16
+        # Quelle hat GenerationUID (Verweis auf ihre Generation), Ziel keine -> Item entfaellt
+        s, t = sound_pair(with_item(gen, src_gen), None)
+        src, tgt = self.pair(s, t)
+        mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        self.assertEqual(len(sound_descs(hm, st)), 2)
+        for d in sound_descs(hm, st):
+            self.assertIsNone(hm.get(d, gen))
+        self.assertEqual(mh.compare_with_source(tgt, src), [])
+        # Ziel hat eine eigene -> sie bleibt
+        s, t = sound_pair(with_item(gen, src_gen), with_item(gen, tgt_gen))
+        src, tgt = self.pair(s, t)
+        mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        for d in sound_descs(hm, st):
+            self.assertEqual(hm.get(d, gen), tgt_gen)
+        self.assertEqual(mh.compare_with_source(tgt, src), [])
+        # Quelle ohne, Ziel mit -> bleibt ebenfalls (wie bei den anderen Keep-Items)
+        s, t = sound_pair(None, with_item(gen, tgt_gen))
+        src, tgt = self.pair(s, t)
+        mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        for d in sound_descs(hm, st):
+            self.assertEqual(hm.get(d, gen), tgt_gen)
+
+    # ---- zusaetzlicher Timecode-Track der Quelle: keine ID-Kollision
+    def test_extra_source_timecode_track_id_is_not_reused(self):
+        src_tracks = SRC_TRACKS + [("timecode", 6, 0, None)]
+        s = make_card(src_tracks, ident=SONY_IDENT)
+        t = make_card(TGT_TRACKS + [("dm", 9001, 0, "X1")], ident=BMX_IDENT, text=("application/xml", "urn:x"))
+        src, tgt = self.pair(s, t)
+        mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        for pkg in (st.material, st.file):
+            ids = [x.track_id for x in pkg.tracks]
+            self.assertEqual(len(set(ids)), len(ids), ids)
+            self.assertEqual([x.track_id for x in pkg.kind_tracks("timecode")], [1])
+            self.assertEqual(pkg.kind_tracks("dm")[0].track_id, 7)      # 6 gehoert in der Quelle dem zweiten TC-Track
+        self.assertEqual(mh.compare_with_source(tgt, src), [])
 
 
 class CompareTests(Base):
@@ -821,6 +904,25 @@ class SoundRuleTests(Base):
         note = [m for m in msgs if m.startswith("HINWEIS:") and "nicht uebernommen" in m]
         self.assertEqual(len(note), 2)
         self.assertEqual(mh.compare_with_source(tgt, src), [])        # bewusst nicht uebernommen != Abweichung
+
+    def test_unknown_uid_batch_is_not_copied_but_single_value_is(self):
+        s, t = sound_pair()
+        dangling = batch([bytes([0x98]) * 16, bytes([0x97]) * 16])         # zeigt auf keine Set der Quelle
+        plain16 = bytes(range(16))
+        ul_batch = bytes.fromhex("060e2b34010101ff0f0f0f0f0f0f0b00")
+        ul_single = bytes.fromhex("060e2b34010101ff0f0f0f0f0f0f0d00")
+        ul_empty = bytes.fromhex("060e2b34010101ff0f0f0f0f0f0f0a00")
+        edit_sound(s, lambda items, lt: items + [(ul_batch, dangling), (ul_single, plain16), (ul_empty, batch([]))])
+        src, tgt = self.pair(s, t)
+        msgs = mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        for d in sound_descs(hm, st):
+            self.assertIsNone(hm.get(d, ul_batch))
+            self.assertEqual(hm.get(d, ul_single), plain16)
+            self.assertEqual(hm.get(d, ul_empty), batch([]))
+        hints = [m for m in msgs if m.startswith("HINWEIS:") and "16-Byte-Elementen" in m]
+        self.assertEqual(len(hints), 2)                                     # je Tonspur
+        self.assertEqual(mh.compare_with_source(tgt, src), [])
 
     def test_target_sub_descriptor_removed_when_source_has_none(self):
         s, t = sound_pair()

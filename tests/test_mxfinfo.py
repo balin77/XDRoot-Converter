@@ -130,6 +130,24 @@ class Mxf2rawHeaderFields(unittest.TestCase):
         self.assertEqual(i.ident_platform, "Linux x86_64")
         self.assertEqual(i.ident_product_version, "1.6.0.0.0")
 
+    def test_first_identification_wins(self):
+        def ident(n, company, product):
+            return (f"      Identification #{n}:\n"
+                    f"        generation_uid  : urn:uuid:00000000-0000-0000-0000-00000000000{n + 1}\n"
+                    f"        company_name    : {company}\n        product_name    : {product}\n"
+                    "        version_string  : 2.00\n"
+                    "        product_uid     : urn:uuid:cede1104-8280-11de-8a39-08004678031c\n"
+                    f"        modified_date   : 2026-01-0{n + 1} 10:00:00.000\n"
+                    + ("        toolkit_version : libMXF 1.0\n" if n == 1 else ""))
+        txt = ("Files: (1)\n  File #0:\n    Identifications: (2)\n" + ident(0, "Sony", "Mem ")
+               + ident(1, "Adobe", "Premiere") + "    MaterialPackages: (1)\n")
+        i = mxfinfo.parse_mxf2raw(txt)
+        self.assertEqual(i.ident_company, "Sony")
+        self.assertEqual(i.ident_product, "Mem ")
+        self.assertEqual(i.ident_modified, "2026-01-01 10:00:00.000")
+        self.assertEqual(i.ident_toolkit_version, "")  # stammt nur aus der zweiten Identification
+        self.assertTrue(i.ident_generation_uid.endswith("000000000001"))
+
 
 class FfprobeParse(unittest.TestCase):
     def test_parse(self):

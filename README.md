@@ -8,8 +8,8 @@ offer XAVC-I at 50p, while delivery often requires XAVC-L. The tool re-encodes t
 re-wraps it with bmx (`raw2bmx`), keeps UMIDs, duration, timecode, audio (bit-exact), ANC camera
 metadata, thumbnails and all other files, and patches only the codec fields in `MEDIAPRO.XML` and
 `Clip/*M01.XML`. Python 3.11+, no pip packages; GUI (tkinter) and CLI. The user interface and
-documentation are in German. Status: tested on Windows with F5/F55 XAVC-I HD 50p sources and an FX6
-XAVC-L reference. Version 1 was tested locally by the author with real F5 material. Everything added afterwards (header
+documentation are in German. Status: Version 1 was tested locally by the author with real F5 XAVC-I HD 50p
+material; for the F55 and the FX6 XAVC-L reference only analysis outputs (`mxf2raw` etc.) exist, no conversion run. Everything added afterwards (header
 patcher, new checks, GUI changes, start script) was tested **only on Linux with synthetic material** (an AVC-Intra source
 generated with bmx); it has **not** been run on Windows or with real camera files yet. **Please note:** the MXF
 headers of the output carry the **Sony identifiers of the source camera** (company/product/version

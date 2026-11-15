@@ -136,13 +136,93 @@ class ProcResult:
         self.timed_out = timed_out
 
 
+_job_handle = None  # Windows: Job-Object (KILL_ON_JOB_CLOSE); None = nicht verfuegbar/noch nicht angelegt
+_job_failed = False
+
+
+def _get_kill_on_close_job():
+    """Windows: Job-Object anlegen, das alle zugewiesenen Prozesse beendet, wenn dieser Prozess endet (auch bei
+    hartem Kill).  Sehr defensiv: bei JEDEM Fehler None (dann bleibt es beim bisherigen Verhalten).  Der Handle wird
+    absichtlich nie geschlossen; Windows schliesst ihn beim Prozessende und beendet damit die Kindprozesse."""
+    global _job_handle, _job_failed
+    if _job_handle is not None or _job_failed or sys.platform != "win32":
+        return _job_handle
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _BASIC(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD), ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _IO(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_uint64) for n in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+        class _EXT(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BASIC), ("IoInfo", _IO), ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        k32.SetInformationJobObject.restype = wintypes.BOOL
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            raise OSError("CreateJobObject")
+        ext = _EXT()
+        ext.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(job, 9, ctypes.byref(ext), ctypes.sizeof(ext)):  # ...ExtendedLimitInformation
+            k32.CloseHandle(wintypes.HANDLE(job))
+            raise OSError("SetInformationJobObject")
+        _job_handle = job
+    except Exception:  # noqa: BLE001
+        _job_failed = True
+        _job_handle = None
+    return _job_handle
+
+
+def _assign_to_job(proc: subprocess.Popen) -> bool:
+    """Kindprozess dem Kill-on-close-Job zuordnen (nur Windows, best effort; jeder Fehler wird verschluckt)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        job = _get_kill_on_close_job()
+        h = getattr(proc, "_handle", None)
+        if not job or h is None:
+            return False
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.AssignProcessToJobObject.restype = wintypes.BOOL
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        return bool(k32.AssignProcessToJobObject(job, int(h)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _popen(args: list[str], **kw) -> subprocess.Popen:
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         [str(a) for a in args],
         stdin=subprocess.DEVNULL,
         creationflags=CREATE_NO_WINDOW,
         **kw,
     )
+    # Windows: bei hartem Kill dieses Programms sollen ffmpeg/raw2bmx nicht als Waisen weiterlaufen.
+    # (Linux: bewusst kein prctl(PR_SET_PDEATHSIG) per preexec_fn - preexec_fn ist mit Threads (tkinter, Lese-Threads)
+    # nicht sicher, und PDEATHSIG haengt am erzeugenden Thread, nicht am Prozess.)
+    _assign_to_job(proc)
+    return proc
 
 
 def _drain(stream, sink: list[str], on_line: Optional[Callable[[str], None]] = None, keep: int = 400) -> None:

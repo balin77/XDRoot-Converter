@@ -935,7 +935,10 @@ _SONY_FALLBACK = {
     "ToolkitVersion": None,
     "Platform": None,
 }
-_SOUND_KEEP = ("InterchangeObject.InstanceUID", "FileDescriptor.ContainerDuration",
+# Items, die im Ziel-Deskriptor bleiben (nicht aus der Quelle kopiert).  GenerationUID verweist auf die
+# ThisGenerationUID einer Identification und waere mit dem Wert der Quelle im Ziel ein haengender Verweis;
+# hat das Ziel keine, entfaellt das Item.
+_SOUND_KEEP = ("InterchangeObject.InstanceUID", "InterchangeObject.GenerationUID", "FileDescriptor.ContainerDuration",
                "FileDescriptor.SampleRate", "FileDescriptor.EssenceContainer")
 _SOUND_REFS = ("GenericDescriptor.SubDescriptors", "GenericDescriptor.Locators")
 _XML_MIME = utf16("text/xml")
@@ -950,19 +953,21 @@ def _show(hm_name: str, v: Optional[bytes]) -> str:
     return v.hex()
 
 
-def _last_ident(st: Structure) -> Optional[MxfSet]:
-    return st.identifications[-1] if st.identifications else None
+def _first_ident(st: Structure) -> Optional[MxfSet]:
+    """Maßgebliche Identification = die ERSTE (urspruengliche Erzeugung, bei Sony die Kamera);
+    spaetere Eintraege stammen von Bearbeitungsprogrammen."""
+    return st.identifications[0] if st.identifications else None
 
 
 def _expected_ident(src: HeaderMetadata) -> dict:
-    s = _last_ident(resolve(src))
+    s = _first_ident(resolve(src))
     if s is None:
         return dict(_SONY_FALLBACK)
     return {f: src.get(s, "Identification." + f) for f in _IDENT_FIELDS}
 
 
 def _adopt_identification(tgt: HeaderMetadata, src: HeaderMetadata, log: list) -> None:
-    ts = _last_ident(resolve(tgt))
+    ts = _first_ident(resolve(tgt))
     if ts is None:
         raise HeaderPatchError("Ziel hat keine Identification")
     exp = _expected_ident(src)
@@ -1087,6 +1092,10 @@ def _adopt_tracks(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: S
                 store[id(t.set)] = s.track_id
         mapped = set(store.values())
         top = max(mapped, default=0)
+        # IDs unzugeordneter QUELL-Tracks (z. B. ein zweiter Timecode-Track) sind belegt: ein Ziel-Track
+        # ohne Gegenstueck bekommt eine freie ID und keine, die in der Quelle einem anderen Track gehoert.
+        src_pkg_all = ss.file if pkg_name == "File Package" else ss.material
+        mapped |= {x.track_id for x in src_pkg_all.tracks if x.track_id is not None}
         for t, s in pairs:
             if s is not None:
                 continue
@@ -1216,6 +1225,15 @@ def _is_ref_value(hm: HeaderMetadata, v: bytes) -> bool:
     return bool(uids) and len(v) == 8 + 16 * len(uids) and all(u in idx for u in uids)
 
 
+def _is_uid_batch_shape(v: bytes) -> bool:
+    """Wert hat den Kopf eines Arrays/Batches (u32 Anzahl, u32 Elementgroesse = 16) mit passender
+    Gesamtlaenge und mindestens einem Element."""
+    if len(v) < 8 + 16:
+        return False
+    n, sz = struct.unpack(">II", v[:8])
+    return sz == 16 and n >= 1 and len(v) == 8 + 16 * n
+
+
 def _ec_equal(a: Optional[bytes], b: Optional[bytes]) -> bool:
     if a is None or b is None:
         return a is None and b is None
@@ -1261,6 +1279,7 @@ def _adopt_sound(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: St
         allowed = _SOUND_ANCESTORS.get(set_name(new_key))
         new_items: list = []
         dropped_refs: list = []
+        dropped_unknown: list = []
         dropped_cls: list = []
         used_keep = set()
         for tag, val in sd.items:
@@ -1280,6 +1299,11 @@ def _adopt_sound(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: St
                 continue
             if ul in ref_uls or _is_ref_value(src, val):
                 dropped_refs.append(src.item_name(tag))
+                continue
+            if ul not in _ITEM_INFO and _is_uid_batch_shape(val):
+                # unbekanntes Item mit Array/Batch-Kopf und 16-Byte-Elementen: koennte eine Verweisliste auf
+                # Sets der Quelle sein, die es im Ziel nicht gibt -> nicht uebernehmen
+                dropped_unknown.append(src.item_name(tag))
                 continue
             if not same_ec and allowed is not None and ul in _ITEM_INFO \
                     and _ITEM_INFO[ul][0].split(".")[0] not in allowed:
@@ -1310,6 +1334,9 @@ def _adopt_sound(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: St
         if dropped_refs:
             log.append("HINWEIS: Tonspur %d: Verweise der Quelle (%s) nicht uebernommen" % (
                 n, ", ".join(sorted(set(dropped_refs)))))
+        if dropped_unknown:
+            log.append("HINWEIS: Tonspur %d: unbekannte Items mit Array/Batch aus 16-Byte-Elementen (moegliche Verweise: %s) "
+                       "nicht uebernommen" % (n, ", ".join(sorted(set(dropped_unknown)))))
         if dropped_cls:
             log.append("HINWEIS: Tonspur %d: Items der Quell-Klasse (%s) passen nicht zur Ziel-Klasse und wurden "
                        "nicht uebernommen" % (n, ", ".join(sorted(set(dropped_cls)))))

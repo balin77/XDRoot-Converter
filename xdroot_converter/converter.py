@@ -96,6 +96,7 @@ class ClipResult:
     frames: int = 0
     seconds: float = 0.0
     notes: list = field(default_factory=list)
+    target_ok: bool = False  # FEHLER, aber ein vorhandener umgewandelter Ziel-Clip blieb unangetastet erhalten
 
 
 @dataclass
@@ -119,15 +120,22 @@ class RunSummary:
     def incomplete_text(self) -> str:
         """Deutliche Warnung, wenn fehlgeschlagene Clips im Ziel fehlen bzw. unbrauchbar sind ('' wenn alles da)."""
         bad = [r for r in self.results if r.status == ST_FAILED]
+        kept = [r.name for r in bad if r.target_ok]
+        bad = [r for r in bad if not r.target_ok]
         missing = [r.name for r in bad if not r.dst_size]
         broken = [r.name for r in bad if r.dst_size]
         parts = []
+        if kept:
+            parts.append(f"{len(kept)} Clip(s) wurden diesmal NICHT verarbeitet, der vorhandene umgewandelte "
+                         f"Ziel-Clip blieb unveraendert erhalten: {', '.join(kept)}")
         if missing:
             parts.append(f"{len(missing)} Clip(s) fehlen: {', '.join(missing)}")
         if broken:
             parts.append(f"{len(broken)} Clip(s) im Ziel sind unbrauchbar/veraltet: {', '.join(broken)}")
         if not parts:
             return ""
+        if not missing and not broken:
+            return "ACHTUNG: " + "; ".join(parts)
         return ("ACHTUNG: Zielkarte unvollstaendig - " + "; ".join(parts)
                 + " (die Clips stehen aber in MEDIAPRO.XML)")
 
@@ -152,12 +160,13 @@ class RunSummary:
                 f"Umgewandelte Clips gesamt: {fmt_size(tot_src)} -> {fmt_size(tot_dst)} "
                 f"(Ersparnis {fmt_size(saved)}, {100.0 * saved / tot_src:.0f} %)"
             )
-        lines.append(
-            f"umgewandelt: {self.count(ST_CONVERTED)}, bereits fertig: {self.count(ST_SKIPPED_DONE)}, "
-            f"kopiert: {self.count(ST_COPIED)}, Fehler: {self.failed}"
-            + (", ABGEBROCHEN" if self.cancelled else "")
-            + f" - Dauer {fmt_duration(self.seconds)}"
-        )
+        if self.results or not self.fatal:  # bei fatalem Fehler ohne Clips keine irrefuehrende "Fehler: 0"-Zeile
+            lines.append(
+                f"umgewandelt: {self.count(ST_CONVERTED)}, bereits fertig: {self.count(ST_SKIPPED_DONE)}, "
+                f"kopiert: {self.count(ST_COPIED)}, Fehler: {self.failed}"
+                + (", ABGEBROCHEN" if self.cancelled else "")
+                + f" - Dauer {fmt_duration(self.seconds)}"
+            )
         for rel, msg in self.copy_errors:
             lines.append(f"FEHLER beim Kopieren von {rel}: {msg}")
         inc = self.incomplete_text()
@@ -269,6 +278,37 @@ def _boot_time() -> Optional[float]:
     return None
 
 
+def _proc_start_time(pid: int) -> Optional[int]:
+    """Startzeit eines Prozesses als opake Zahl (Linux: /proc/<pid>/stat Feld 22, Windows: GetProcessTimes);
+    None = nicht ermittelbar.  Dient dazu, Wiederverwendung einer PID zu erkennen."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return None
+            try:
+                c, e, k, u = (wintypes.FILETIME() for _ in range(4))
+                if not k32.GetProcessTimes(h, ctypes.byref(c), ctypes.byref(e), ctypes.byref(k), ctypes.byref(u)):
+                    return None
+                return (c.dwHighDateTime << 32) | c.dwLowDateTime
+            finally:
+                k32.CloseHandle(h)
+        with open(f"/proc/{int(pid)}/stat", "rb") as f:
+            data = f.read().decode("ascii", errors="replace")
+        rest = data[data.rindex(")") + 2:].split()  # ab Feld 3
+        return int(rest[19])  # Feld 22 = starttime
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _read_lock(path: Path) -> Optional[dict]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -299,14 +339,22 @@ def _lock_is_stale(path: Path, info: Optional[dict]) -> bool:
     boot = _boot_time()
     if boot is not None and started and started < boot - 5:
         return True  # Sperre stammt aus der Zeit vor dem letzten Systemstart
-    return not _pid_alive(pid)
+    if not _pid_alive(pid):
+        return True
+    saved = info.get("pstart")
+    if saved is not None:  # PID gibt es noch - ist es derselbe Prozess wie damals (oder eine Wiederverwendung)?
+        cur = _proc_start_time(pid)
+        if cur is not None and cur != saved:
+            return True
+    return False
 
 
 def acquire_lock(target_dir: Path) -> Path:
     """Sperrdatei im Zielordner anlegen (O_EXCL, PID + Startzeit).  Wirft TargetBusy, wenn ein anderer
     Lauf aktiv ist; eine verwaiste Sperre (Prozess existiert nicht mehr) wird uebernommen."""
     path = Path(target_dir) / LOCK_NAME
-    payload = json.dumps({"pid": os.getpid(), "start": time.time(), "host": socket.gethostname()})
+    payload = json.dumps({"pid": os.getpid(), "start": time.time(), "host": socket.gethostname(),
+                          "pstart": _proc_start_time(os.getpid())})
     for _ in range(4):
         try:
             fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
@@ -326,8 +374,15 @@ def acquire_lock(target_dir: Path) -> Path:
             except OSError as e:
                 raise TargetBusy(f"Verwaiste Sperre '{path}' konnte nicht entfernt werden: {e}") from e
             continue
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(payload)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+        except BaseException:  # z. B. Platte voll: keine leere Sperrdatei zuruecklassen
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            raise
         return path
     raise TargetBusy("Der Zielordner wird bereits von einem anderen Lauf benutzt (Sperre konnte nicht uebernommen werden).")
 
@@ -400,6 +455,49 @@ def read_seq_offsets(path: Path) -> list[int]:
     return out
 
 
+def read_kag_size(path: Path) -> int:
+    """KAG-Size der Quell-MXF (aus dem ersten Partition Pack; nur lesend).  Wirft bei Fehlern."""
+    parts = mxfheader.find_partitions(path)
+    if not parts:
+        raise mxfheader.MxfParseError("keine Partition gefunden")
+    return int(parts[0].kag_size)
+
+
+def read_audio_order(path: Path) -> list[int]:
+    """Track-IDs der Sound-Tracks des Material Packages der Quell-MXF in der Reihenfolge des Tracks-Arrays
+    (so nummeriert ffmpeg die Audiostreams ``0:a:i``).  Nur lesend.  Wirft, wenn nicht ermittelbar."""
+    hm = mxfheader.read_header(path)
+    st = mxfheader.resolve(hm)
+    if st.material is None:
+        raise mxfheader.HeaderPatchError("kein Material Package")
+    return [t.track_id for t in st.material.kind_tracks("sound")]
+
+
+def audio_stream_map(info: "mxfinfo.MxfInfo", order: list, n_probe_audio: Optional[int]) -> list[int]:
+    """Zuordnung Tonspur j (Reihenfolge von mxf2raw/bmx = ``info.audio``) -> ffmpeg-Audioindex ``0:a:i``.
+
+    ffmpeg nummeriert die Audiostreams in der Reihenfolge des Tracks-Arrays des Material Packages (``order``),
+    mxf2raw/bmx sortiert nach Track-Nummer/-ID.  Die Zuordnung laeuft ueber die Material-Package-Track-ID.
+    Wirft ValueError, wenn sie nicht eindeutig bestimmbar ist (nie raten)."""
+    audio = info.audio
+    n = len(audio)
+    if n_probe_audio is not None and n_probe_audio != n:
+        raise ValueError(f"ffprobe findet {n_probe_audio} Audiostreams, mxf2raw {n} Tonspuren")
+    if len(order) != n:
+        raise ValueError(f"{len(order)} Sound-Tracks im Header, mxf2raw meldet {n} Tonspuren")
+    if len(set(order)) != len(order) or any(t is None for t in order):
+        raise ValueError("Track-IDs der Tonspuren im Header sind nicht eindeutig")
+    out: list[int] = []
+    for j, a in enumerate(audio):
+        tid = a.mp_track_id
+        if tid is None or tid not in order:
+            raise ValueError(f"Track-ID von Tonspur {j + 1} ({tid}) steht nicht im Material Package")
+        out.append(order.index(tid))
+    if len(set(out)) != len(out):
+        raise ValueError("Tonspuren sind nicht eindeutig zuordenbar (doppelte Track-IDs)")
+    return out
+
+
 def level_from_probe(level) -> Optional[str]:
     """ffprobe-Level (``42``, ``'41'``) -> '4.2' / '4.1'."""
     try:
@@ -440,10 +538,14 @@ class ClipPlan:
     codec_free: bool = False  # kein Codec-String (kein XML, kein MEDIAPRO-Eintrag); MXF ist eindeutig XAVC-I
     fallback_level: str = ""  # nur ohne Codec-String: Level aus der Bildrate ('4.1' bis 30 fps, sonst '4.2')
     seq_off: Optional[int] = None  # SequenceOffset der Quell-Tonspuren (None = unbekannt/0)
+    kag: int = 0  # KAG-Size der Quell-MXF (0 = unbekannt)
+    audio_map: list = field(default_factory=list)  # Tonspur j (mxf2raw-Reihenfolge) -> ffmpeg-Index 0:a:i
+    error: str = ""  # Clip kann nicht verarbeitet werden (Quelle nicht lesbar, Zuordnung unklar): FEHLER, nichts kopieren
 
     @property
     def convert(self) -> bool:
-        return bool(self.selected and self.decision and self.decision.convert and (self.new_codec or self.codec_free))
+        return bool(self.selected and not self.error and self.decision and self.decision.convert
+                    and (self.new_codec or self.codec_free))
 
     @property
     def level(self) -> str:
@@ -546,11 +648,14 @@ class Converter:
                 plan.info = mxfinfo.read_mxf_info(str(mxf), cancel=self.cancel)
                 probe = mxfinfo.run_ffprobe(str(mxf), cancel=self.cancel)
                 plan.decision = mxfinfo.decide_source(plan.info, probe)
+                n_probe_audio: Optional[int] = len(probe.audio)
             except tools.Cancelled:
                 raise
             except Exception as e:  # noqa: BLE001
+                # Quelle nicht lesbar: nie kopieren (ein defektes Original darf kein Ziel ersetzen), Clip = FEHLER
                 plan.decision = mxfinfo.SourceDecision(False, f"Analyse fehlgeschlagen: {e}")
-                plan.notes.append(plan.decision.reason)
+                first = (str(e).strip().splitlines() or ["?"])[0][:220]
+                plan.error = f"Quelle nicht lesbar/analysierbar ({first}) - Clip wird weder umgewandelt noch kopiert."
                 continue
             if plan.decision.convert:
                 if not plan.src_codec:
@@ -567,11 +672,32 @@ class Converter:
                     plan.decision = mxfinfo.SourceDecision(
                         False, f"unbekanntes Codec-Muster {plan.src_codec!r} - wird nicht geraten, Clip bleibt unveraendert"
                     )
+                if plan.convert and (plan.info.duration is None or plan.info.duration <= 0):
+                    # K8: ohne bekannte Dauer laesst sich weder --dur setzen noch das Ergebnis pruefen
+                    plan.decision = mxfinfo.SourceDecision(
+                        False, f"Dauer der Quelle unbekannt ({plan.info.duration}) - kann nicht umgewandelt werden")
+                    plan.notes.append("ACHTUNG: " + plan.decision.reason + "; der Clip bleibt XAVC-I (wird nur kopiert)")
                 if plan.convert:
                     if plan.material and plan.material.dur is not None and plan.material.dur != plan.info.duration:
                         plan.notes.append(f"MEDIAPRO dur {plan.material.dur} != MXF-Dauer {plan.info.duration}")
-                    frames = plan.info.duration or 0
+                    frames = plan.info.duration
                     plan.frames = min(frames, self.o.max_frames) if self.o.max_frames else frames
+                    # K10: KAG-Size wie die Quelle (512 -> --kag-size-512)
+                    try:
+                        plan.kag = read_kag_size(mxf)
+                    except Exception as e:  # noqa: BLE001
+                        plan.notes.append(f"KAG-Size der Quelle nicht lesbar ({e}) - Standard (KAG 1)")
+                    else:
+                        if plan.kag not in (0, 1, 512):
+                            plan.notes.append(f"KAG-Size {plan.kag} der Quelle ist nicht nachbildbar - Ziel erhaelt KAG 1")
+                    # G1: Zuordnung Tonspur (mxf2raw-Reihenfolge) -> ffmpeg-Audiostream explizit herstellen
+                    try:
+                        plan.audio_map = audio_stream_map(plan.info, read_audio_order(mxf), n_probe_audio)
+                    except Exception as e:  # noqa: BLE001
+                        plan.error = (f"Zuordnung der Tonspuren zu den ffmpeg-Audiostreams nicht eindeutig bestimmbar ({e}) - "
+                                      "Clip wird nicht umgewandelt (Gefahr vertauschter Tonspuren).")
+                        plan.frames = 0
+                        continue
                     # A2: SequenceOffset der Tonspuren (5-Bild-Folge bei 29.97/59.94) wie in der Quelle
                     try:
                         offs = read_seq_offsets(mxf)
@@ -606,6 +732,18 @@ class Converter:
     def _tgt_is_l(self, plan: ClipPlan) -> bool:
         return _is_xavcl_info(self._tgt_info.get(plan.name.casefold()))
 
+    def _tgt_done(self, plan: ClipPlan) -> bool:
+        """Vorhandenes Ziel ist XAVC-L und passt in Dauer/Bildrate (wird beim Fortsetzen voraussichtlich nur geprueft,
+        nicht neu erzeugt).  Sonst wird der Clip neu erzeugt (Speicher: neu + alte Datei)."""
+        ti = self._tgt_info.get(plan.name.casefold())
+        if not _is_xavcl_info(ti):
+            return False
+        if plan.info is not None and ti.duration != plan.frames:
+            return False
+        if plan.info is not None and plan.info.edit_rate and ti.edit_rate != plan.info.edit_rate:
+            return False
+        return True
+
     def _heal_target(self, plans: list[ClipPlan], out_root: Path) -> None:
         """Ist-Zustand herstellen: fuer jeden Clip, dessen Ziel-MXF existiert und XAVC-L ist, den neuen Codec in
         M01.XML und (spaeter) MEDIAPRO.XML eintragen - unabhaengig davon, in welchem Lauf er entstand."""
@@ -614,7 +752,8 @@ class Converter:
             ti = self._tgt_info.get(plan.name.casefold())
             if not _is_xavcl_info(ti) or not plan.new_codec:
                 continue
-            if plan.material and plan.material.umid and ti.mp_uid != plan.material.umid:
+            want = self._expected_umid(plan)
+            if want and ti.mp_uid and ti.mp_uid.upper() != want:
                 continue  # gehoert nicht zu dieser Karte - nicht anfassen
             self.l_codecs[plan.rel] = plan.new_codec
             try:
@@ -668,9 +807,20 @@ class Converter:
         except OSError as e:
             self.warn(f"Einstellungsdatei konnte nicht geschrieben werden: {e}")
 
-    def _record_clip_settings(self, plan: ClipPlan) -> None:
-        self._settings_store["clips"][plan.rel] = self._current_settings()
+    def _record_clip_settings(self, plan: ClipPlan, **extra) -> None:
+        """Einstellungen dieses Clips merken; ``extra`` (z. B. ``anc_dropped=True``) = bewusst Weggelassenes."""
+        entry = self._current_settings()
+        entry.update(extra)
+        self._settings_store["clips"][plan.rel] = entry
         self._save_settings()
+
+    def _update_clip_setting(self, plan: ClipPlan, key: str, value) -> None:
+        """Einen einzelnen Wert im Einstellungseintrag eines schon fertigen Clips nachtragen (z. B. nach dem
+        Nachziehen der Kopfdaten); legt keinen neuen Eintrag an."""
+        entry = self._settings_store["clips"].get(plan.rel)
+        if isinstance(entry, dict) and entry.get(key) != value:
+            entry[key] = value
+            self._save_settings()
 
     def _check_resume_settings(self, plan: ClipPlan) -> None:
         old = self._settings_store["clips"].get(plan.rel)
@@ -736,8 +886,11 @@ class Converter:
             todo = [p for p in plans if p.convert]
             self._frames_total = sum(p.frames for p in todo) or 1
             for p in plans:
-                if p.selected and not p.convert and p.decision is not None:
-                    self.warn(f"{p.name}: wird nicht umgewandelt ({p.decision.reason}) - Datei wird unveraendert kopiert")
+                if p.selected and p.error:
+                    self.error(f"{p.name}: {p.error}")
+                elif p.selected and not p.convert and p.decision is not None:
+                    self.warn(f"{p.name}: wird nicht umgewandelt ({p.decision.reason}) - Datei wird unveraendert kopiert "
+                              "(sofern kein umgewandelter Ziel-Clip existiert)")
                 for n in p.notes:
                     self.warn(f"{p.name}: {n}")
             self.info(f"Umzuwandeln: {len(todo)} Clips, {self._frames_total} Frames")
@@ -754,7 +907,7 @@ class Converter:
                         f"Testlauf. Ein --max-frames-Lauf wuerde sie mit gekuerzten Clips ueberschreiben. "
                         f"Bitte einen anderen Zielordner waehlen."
                     )
-            self._frames_pending = sum(p.frames for p in todo if not self._tgt_is_l(p)) or 0
+            self._frames_pending = sum(p.frames for p in todo if not self._tgt_done(p)) or 0
 
             self._check_disk_space(target_dir, plans)
 
@@ -835,29 +988,31 @@ class Converter:
             summary.fatal = str(e)
             self.error(f"Abbruch wegen Fehler: {e}")
         finally:
-            # MEDIAPRO.XML immer passend zum tatsaechlichen Zustand (Ist-Zustand des Ziels) schreiben
-            if touched:
-                try:
-                    self._write_mediapro(final=True)
-                except Exception as e:  # noqa: BLE001
-                    self.error(f"MEDIAPRO.XML konnte nicht geschrieben werden: {e}")
-            if tmp_root is not None:
-                self._shutil_clean(tmp_root)
-                try:
-                    tmp_root.rmdir()
-                except OSError:
-                    pass
-            if touched and out_root is not None:
-                card.remove_stray_temp_files(out_root)
-            summary.seconds = time.time() - t0
-            self.info(summary.text())
-            if self._logf is not None:
-                try:
-                    self._logf.close()
-                except Exception:
-                    pass
-                self._logf = None
-            release_lock(lock_path)
+            try:
+                # MEDIAPRO.XML immer passend zum tatsaechlichen Zustand (Ist-Zustand des Ziels) schreiben
+                if touched:
+                    try:
+                        self._write_mediapro(final=True)
+                    except Exception as e:  # noqa: BLE001
+                        self.error(f"MEDIAPRO.XML konnte nicht geschrieben werden: {e}")
+                if tmp_root is not None:
+                    self._shutil_clean(tmp_root)
+                    try:
+                        tmp_root.rmdir()
+                    except OSError:
+                        pass
+                if touched and out_root is not None:
+                    card.remove_stray_temp_files(out_root)
+                summary.seconds = time.time() - t0
+                self.info(summary.text())
+                if self._logf is not None:
+                    try:
+                        self._logf.close()
+                    except Exception:
+                        pass
+                    self._logf = None
+            finally:
+                release_lock(lock_path)  # auch bei KeyboardInterrupt/anderen BaseExceptions freigeben
         return summary
 
     # ------------------------------------------------------------------ Hilfen
@@ -928,12 +1083,18 @@ class Converter:
         need = 0
         biggest = 0
         for p in plans:
-            if not p.selected:
+            if not p.selected or p.error:
                 continue
             if p.convert:
-                if self._tgt_is_l(p):
+                if self._tgt_done(p):
                     continue  # schon im Ziel (wird nur geprueft)
                 est = estimate_clip_bytes(p.frames, p.info.edit_rate, len(p.info.audio), self.o.bitrate_mbps)
+                old = (self._out_root or target_dir) / "Clip" / p.mxf.name
+                try:
+                    if old.is_file():
+                        est += old.stat().st_size  # die alte Datei bleibt bis zum Ersetzen liegen
+                except OSError:
+                    pass
             else:
                 dst = (self._out_root or target_dir) / "Clip" / p.mxf.name
                 if dst.exists() and card.same_file_stat(p.mxf, dst):
@@ -965,24 +1126,75 @@ class Converter:
         self.rep.progress(plan.name, clip_frac, min(1.0, total), eta, text)
 
     # ------------------------------------------------------------------ Ein Clip
+    def _expected_umid(self, plan: ClipPlan) -> str:
+        """Erwartete Material-Package-UMID des Clips (Quell-MXF, sonst MEDIAPRO.XML, sonst M01.XML); '' = unbekannt."""
+        if plan.info is not None and plan.info.mp_uid:
+            return plan.info.mp_uid.upper()
+        if plan.material is not None and plan.material.umid:
+            return plan.material.umid.upper()
+        if plan.xml_path is not None:
+            try:
+                return card.parse_clip_xml(plan.xml_path.read_bytes()).umid_ref.upper()
+            except Exception:  # noqa: BLE001
+                pass
+        return ""
+
+    def _target_belongs(self, plan: ClipPlan) -> bool:
+        """Gehoert die vorhandene (lesbare) Ziel-MXF zu diesem Clip?  Unbekannte UMID zaehlt als 'gehoert dazu'
+        (im Zweifel nichts ueberschreiben)."""
+        ti = self._tgt_info.get(plan.name.casefold())
+        if ti is None:
+            return False
+        want = self._expected_umid(plan)
+        return not (want and ti.mp_uid and ti.mp_uid.upper() != want)
+
     def _check_existing_umid(self, plan: ClipPlan, dst: Path) -> None:
         """G2b: Eine vorhandene Ziel-MXF, die nicht zu diesem Clip gehoert (UMID), wird nie ueberschrieben."""
         ti = self._tgt_info.get(plan.name.casefold())
         if ti is None:
             return  # nicht lesbar: gilt als beschaedigte eigene Ausgabe, wird erst nach erfolgreicher Neuerzeugung ersetzt
-        want = plan.info.mp_uid if plan.info is not None else (plan.material.umid if plan.material else "")
-        if want and ti.mp_uid and ti.mp_uid != want:
+        want = self._expected_umid(plan)
+        if want and ti.mp_uid and ti.mp_uid.upper() != want:
             raise RuntimeError(
                 f"Im Ziel liegt bereits eine andere Datei mit diesem Namen (Material-Package-UMID {ti.mp_uid} statt {want}) - "
                 "wird nicht ueberschrieben. Bitte einen anderen Zielordner waehlen."
             )
 
+    @staticmethod
+    def _fsync_file(path: Path) -> None:
+        """Datei auf den Datentraeger zwingen (best effort), bevor sie die fertige Zieldatei ersetzt."""
+        try:
+            with open(path, "r+b") as f:
+                os.fsync(f.fileno())
+        except OSError:
+            pass
+
+    @staticmethod
+    def _anc_xml_related(probs: list) -> bool:
+        """Stammt mindestens ein Pruefbefund von ANC bzw. eingebettetem XML (nur dann hilft der Rueckfall ohne sie)?"""
+        return any(re.search(r"\bANC\b|\bXML\b", str(p), re.I) for p in probs)
+
     def _process_clip(self, plan: ClipPlan, src_root: Path, out_root: Path, tmp_root: Path, res: ClipResult) -> None:
         dst_dir = out_root / "Clip"
         dst = dst_dir / plan.mxf.name
         res.notes.extend(plan.notes)
+        tgt_l = self._tgt_is_l(plan)
+
+        if plan.error:
+            # G1: Quelle nicht lesbar / Tonzuordnung unklar -> FEHLER; nichts kopieren, ein vorhandenes Ziel bleibt unberuehrt
+            res.target_ok = bool(tgt_l and self._target_belongs(plan))
+            raise RuntimeError(plan.error + (
+                " Der vorhandene umgewandelte Ziel-Clip bleibt unveraendert erhalten." if res.target_ok else ""))
 
         if not plan.convert:
+            if tgt_l and not _is_xavcl_info(plan.info):
+                # G1: ein fertiger XAVC-L-Ziel-Clip wird nie durch die (XAVC-I-)Quelle ueberschrieben
+                self._check_existing_umid(plan, dst)
+                res.target_ok = True
+                raise RuntimeError(
+                    "Quelle wird jetzt nicht (mehr) umgewandelt "
+                    f"({plan.decision.reason if plan.decision else 'nicht analysierbar'}); der vorhandene umgewandelte "
+                    "XAVC-L-Ziel-Clip bleibt erhalten und wird NICHT durch die Quelle ueberschrieben.")
             if dst.exists() and card.same_file_stat(plan.mxf, dst):
                 self.info(f"{plan.name}: unveraendert kopierter Clip ist schon im Ziel - uebersprungen")
                 res.status = ST_COPIED
@@ -996,8 +1208,9 @@ class Converter:
             tmpd.mkdir(parents=True, exist_ok=True)
             part = tmpd / "copy.mxf"
             self._copy_cancelable(plan.mxf, part, plan)
-            shutil.copystat(plan.mxf, part)
-            os.replace(part, dst)
+            card.copystat_writable(plan.mxf, part)
+            card.replace_retry(part, dst)
+            self.l_codecs.pop(plan.rel, None)  # das Ziel ist jetzt die unveraenderte Quelle, kein XAVC-L
             self._write_clip_xml(plan, dst_dir, None)
             res.status = ST_COPIED
             res.frames = 0
@@ -1010,23 +1223,45 @@ class Converter:
         fps = plan.decision.fps
         frames = plan.frames
         res.frames = frames
-        expect_anc = bool(self.o.keep_anc and info.anc_tracks)
-        embed = self._want_embed(info, plan)
-        exp = make_expect(
-            level=plan.level,
-            frames=frames, mp_uid=info.mp_uid, fp_uid=info.fp_uid, start_tc=info.start_tc,
-            n_audio=len(info.audio), fps=fps, expect_anc=expect_anc, expect_xml=embed,
-        )
+
+        # Einstellungen/Befunde des fruehren Laufs fuer diesen Clip (Best-Effort-Verluste von ANC/XML)
+        stored = self._settings_store["clips"].get(plan.rel)
+        stored = stored if isinstance(stored, dict) else {}
+        want_anc = bool(self.o.keep_anc and info.anc_tracks)
+        want_xml = self._want_embed(info, plan)
+        anc_dropped = bool(stored.get("anc_dropped")) and want_anc
+        xml_dropped = bool(stored.get("xml_dropped")) and want_xml
+
+        def mk_exp(anc: bool, xml: bool) -> "verify.ClipExpect":
+            return make_expect(
+                level=plan.level,
+                frames=frames, mp_uid=info.mp_uid, fp_uid=info.fp_uid, start_tc=info.start_tc,
+                n_audio=len(info.audio), fps=fps, expect_anc=anc, expect_xml=xml,
+            )
+
+        # Fortsetzen: was beim fruehen Lauf bewusst weggelassen wurde (ANC/XML), gilt nicht als Abweichung
+        exp = mk_exp(want_anc and not anc_dropped, want_xml and not xml_dropped)
+        src_arg = plan.mxf if self.o.sony_header else None
+
+        # K1: --max-frames ersetzt nie einen vorhandenen Clip mit laengerer (voller) Dauer - unabhaengig vom Marker
+        if self.o.max_frames and tgt_l and self._target_belongs(plan):
+            tdur = self._tgt_info[plan.name.casefold()].duration
+            if tdur is not None and tdur > frames:
+                self.warn(f"{plan.name}: --max-frames-Lauf: vorhandener Ziel-Clip ({tdur} Frames) ist laenger als der "
+                          f"Testlauf ({frames} Frames) und wird NICHT ersetzt")
+                res.status = ST_SKIPPED_DONE
+                res.notes.append(f"--max-frames: vorhandener Ziel-Clip mit {tdur} Frames nicht durch gekuerzten Clip ersetzt")
+                self._frames_done += frames
+                return
 
         # Fortsetzen: fertiger, verifizierter Ziel-Clip vorhanden?
         if dst.exists():
             self._check_existing_umid(plan, dst)
             self._emit_progress(plan, 0.0, "Pruefe vorhandene Zieldatei ...")
-            probs = verify.check_clip(dst, exp, cancel=self.cancel)
-            if not probs and self.o.sony_header:
-                hprobs = verify.check_header(dst, plan.mxf, cancel=self.cancel, src_info=info)
-                if hprobs:
-                    # Nur die Kopfdaten weichen ab (z. B. Ausgabe einer aelteren Version): nachziehen statt neu transkodieren
+            probs = verify.check_clip(dst, exp, cancel=self.cancel, source=src_arg, source_info=info)
+            if probs and self.o.sony_header:
+                # Weichen nur die Kopfdaten ab (z. B. Ausgabe einer aelteren Version), wird nachgezogen statt neu transkodiert
+                if not verify.check_clip(dst, exp, cancel=self.cancel):
                     try:
                         self._adopt_header(plan, dst)
                         # danach die VOLLE Pruefung (nicht nur die Kopfdaten)
@@ -1036,10 +1271,23 @@ class Converter:
                     if after:
                         probs = ["Kopfdaten: " + after[0]]
                     else:
+                        probs = []
                         self.info(f"{plan.name}: Kopfdaten nachgezogen (Datei nicht neu transkodiert)")
                         res.notes.append("Kopfdaten nachgezogen")
+                        self._update_clip_setting(plan, "sony_header", True)
+            if not probs:
+                # K6: Ende der Datei dekodieren - ein Clip mit defektem Ende gilt nicht als fertig
+                tprobs = verify.tail_decode_check(str(dst), frames, fps, cancel=self.cancel)
+                if tprobs:
+                    probs = ["Ende: " + tprobs[0]]
             if not probs:
                 self.info(f"{plan.name}: bereits fertig und verifiziert - uebersprungen")
+                if anc_dropped:
+                    res.notes.append("ANC-Datenspur fehlt im Ziel (beim ersten Lauf nicht uebernehmbar, wird nicht erneut versucht)")
+                    self.warn(f"{plan.name}: ANC-Spur fehlt im Ziel (Uebernahme war beim ersten Lauf nicht moeglich)")
+                if xml_dropped:
+                    res.notes.append("eingebettetes XML fehlt im Ziel (beim ersten Lauf nicht uebernehmbar, wird nicht erneut versucht)")
+                    self.warn(f"{plan.name}: eingebettetes XML fehlt im Ziel (Uebernahme war beim ersten Lauf nicht moeglich)")
                 self._finish_clip_files(plan, dst_dir)
                 self._check_resume_settings(plan)
                 res.status = ST_SKIPPED_DONE
@@ -1049,6 +1297,9 @@ class Converter:
             self.warn(f"{plan.name}: vorhandene Zieldatei unvollstaendig/abweichend ({probs[0]}) - wird neu erzeugt "
                       "(die alte Datei bleibt bis zum erfolgreichen Ersetzen bestehen)")
 
+        # Neuerzeugung: ANC und XML werden (erneut) versucht
+        expect_anc, embed = want_anc, want_xml
+        exp = mk_exp(expect_anc, embed)
         self._clip_t0 = time.time()
         tmpd = tmp_root / plan.stem
         self._shutil_clean(tmpd)
@@ -1075,7 +1326,7 @@ class Converter:
             if xml_file is None:
                 exp.expect_xml = False
 
-        # 4. Wrappen (mit Rueckfall: erst ohne XML, dann ohne ANC)
+        # 4. Wrappen (Rueckfall bei Wrap-/ANC-/XML-Fehlern: erst ohne XML, dann ohne ANC)
         out_mxf = tmpd / "out.mxf"
         attempts = [(anc_file, xml_file)]
         if xml_file is not None:
@@ -1084,6 +1335,7 @@ class Converter:
             attempts.append((None, None))
         last_err = ""
         wrapped = False
+        dropped: dict = {}
         for idx, (anc_f, xml_f) in enumerate(attempts):
             self.cancel.check()
             self._emit_progress(plan, 0.92, "Verpacke MXF (raw2bmx) ...", transcoded=frames)
@@ -1103,20 +1355,23 @@ class Converter:
                 except _HEADER_ERRORS as e:
                     raise RuntimeError(f"MXF-Kopfdaten konnten nicht an die Quelle angeglichen werden: {e}") from e
             self._emit_progress(plan, 0.97, "Pruefe Ergebnis ...", transcoded=frames)
-            probs = verify.check_clip(
-                out_mxf, exp, cancel=self.cancel,
-                source=plan.mxf if self.o.sony_header else None, source_info=info,
-            )
+            probs = verify.check_clip(out_mxf, exp, cancel=self.cancel, source=src_arg, source_info=info)
             if probs:
                 last_err = "; ".join(probs)
+                if not self._anc_xml_related(probs):
+                    # Befund hat mit ANC/XML nichts zu tun: ein Rueckfall ohne sie wuerde nur dasselbe Ergebnis liefern
+                    self.warn(f"{plan.name}: Pruefung des Ergebnisses fehlgeschlagen: {last_err}")
+                    break
                 self.warn(f"{plan.name}: Pruefung des Ergebnisses fehlgeschlagen: {last_err} - Versuch {idx + 1}/{len(attempts)}")
                 continue
             if expect_anc and anc_f is None:
                 res.notes.append("ANC-Datenspur (Kamera-Metadaten) konnte nicht uebernommen werden und fehlt im Ziel")
                 self.warn(f"{plan.name}: ANC-Spur fehlt im Ziel (Uebernahme nicht moeglich)")
+                dropped["anc_dropped"] = True
             if embed and xml_f is None:
                 res.notes.append("eingebettetes XML konnte nicht uebernommen werden")
                 self.warn(f"{plan.name}: eingebettetes XML fehlt im Ziel")
+                dropped["xml_dropped"] = True
             wrapped = True
             break
         if not wrapped:
@@ -1128,9 +1383,10 @@ class Converter:
                 p.unlink()
             except OSError:
                 pass
-        os.replace(out_mxf, dst)
+        self._fsync_file(out_mxf)
+        card.replace_retry(out_mxf, dst)
         self._finish_clip_files(plan, dst_dir)
-        self._record_clip_settings(plan)
+        self._record_clip_settings(plan, **dropped)
         res.status = ST_CONVERTED
         self._work_frames_done += frames
         self._work_secs_done += time.time() - self._clip_t0
@@ -1182,6 +1438,11 @@ class Converter:
                 if plan is not None and (now - last_emit > 0.5 or done >= total):
                     last_emit = now
                     self._emit_progress(plan, done / total, f"Kopiere {fmt_size(done)} / {fmt_size(total)}")
+            fo.flush()
+            try:
+                os.fsync(fo.fileno())
+            except OSError:
+                pass
 
     def _prepare_embed_xml(self, plan: ClipPlan, tmpd: Path) -> Optional[Path]:
         try:
@@ -1217,8 +1478,12 @@ class Converter:
             args += ["-frames:v", str(frames)]
         args += ["-f", "h264", str(v_path)]
         secs = float(Fraction(frames) / fps)
-        for i, w in enumerate(wavs):
-            args += ["-map", f"0:a:{i}", "-c:a", "pcm_s24le", "-rf64", "auto"]
+        # G1: Tonspur j (Reihenfolge wie mxf2raw/bmx = info.audio[j]) kommt aus dem passenden ffmpeg-Audiostream
+        amap = plan.audio_map if len(plan.audio_map) == len(wavs) else None
+        if amap is None and wavs:
+            raise RuntimeError("Zuordnung der Tonspuren fehlt - Clip wird nicht umgewandelt")
+        for j, w in enumerate(wavs):
+            args += ["-map", f"0:a:{amap[j]}", "-c:a", "pcm_s24le", "-rf64", "auto"]
             if self.o.max_frames:
                 args += ["-t", f"{secs:.6f}"]
             args += [str(w)]
@@ -1279,12 +1544,15 @@ class Converter:
         assert info is not None
         args = [
             tools.find_tool("raw2bmx"), "-t", "op1a", "-o", str(out),
+            "--head-fill", "65536",  # Reserve (KLV-Fill) am Ende der Kopfdaten fuer die spaetere Angleichung
             "-f", mxfinfo.rate_arg(fps),
             "-y", info.start_tc or "00:00:00:00",
             "--mp-uid", info.mp_uid, "--fp-uid", info.fp_uid,
             "--dur", str(frames),
             "--aes-3",  # Audio-Mapping wie Sony (ec_label ...02060300, Track-Nummern 0x16NN03xx)
         ]
+        if plan.kag == 512:
+            args += ["--kag-size-512"]  # KAG wie die Quelle
         if plan.seq_off:
             args += ["--seq-off", str(plan.seq_off)]  # SequenceOffset der Tonspuren wie in der Quelle (29.97/59.94)
         if self.o.sony_header:

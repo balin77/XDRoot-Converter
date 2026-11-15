@@ -128,6 +128,7 @@ def parse_mxf2raw(text: str, path: str = "") -> MxfInfo:
     desc_active = False
     pkg_part = ""  # 'mat' / 'fs' innerhalb eines Tracks (Material:/FileSource:)
     cur_text: Optional[dict] = None
+    n_ident = 0
 
     for raw in text.splitlines():
         raw_line = raw.rstrip("\r\n")  # Leerzeichen am Ende gehoeren zum Wert ("Mem ")
@@ -139,11 +140,10 @@ def parse_mxf2raw(text: str, path: str = "") -> MxfInfo:
 
         # Abschnittsmarker
         if stripped.startswith("Identification #"):
-            ctx = "ident"
-            # Es zaehlt die letzte Identification (Sony/bmx schreiben meist nur eine)
-            info.ident_modified = info.ident_company = info.ident_product = ""
-            info.ident_version_string = info.ident_product_uid = info.ident_product_version = ""
-            info.ident_toolkit_version = info.ident_platform = info.ident_generation_uid = ""
+            # Es zaehlt die ERSTE Identification (ursprüngliche Erzeugung = Kamera; spaetere stammen von
+            # Bearbeitungsprogrammen).  Weitere werden ueberlesen.  mxf2raw gibt sie in Dateireihenfolge aus.
+            ctx = "ident_skip" if n_ident else "ident"
+            n_ident += 1
             continue
         if stripped.startswith("MaterialPackage #"):
             ctx = "mp"

@@ -1,4 +1,6 @@
 import copy
+import json
+import os
 import shutil
 import struct
 import tempfile
@@ -304,6 +306,146 @@ class TailDecode(unittest.TestCase):
         self.assertIn("Decodierfehler", "\n".join(out))
 
 
+# --------------------------------------------------------------------------- Ton-Inhalt
+
+
+class AudioContent(unittest.TestCase):
+    A, B, C = b"\x01" * 480, b"\x02" * 480, b"\x03" * 480
+
+    def _run(self, src, tgt, **kw):
+        """src/tgt: {Startframe: [Inhalt je Tonspur]}; gemockt wird nur das Extrahieren."""
+        calls = []
+
+        def fake(path, start, dur, directory, tag, cancel):
+            calls.append((str(path), start, dur))
+            data = (src if str(path) == "S" else tgt)[start]
+            if isinstance(data, Exception):
+                raise data
+            return list(data)
+
+        kw.setdefault("fps", Fraction(50))
+        kw.setdefault("duration", 300)
+        with mock.patch.object(verify, "_extract_audio", side_effect=fake):
+            out = verify.check_audio_content("T", "S", **kw)
+        self.calls = calls
+        return out
+
+    def test_identical_is_clean_and_reads_one_second(self):
+        a = [self.A, self.B, self.C]
+        self.assertEqual(self._run({0: a}, {0: a}), [])
+        self.assertEqual(self.calls, [("S", 0, 50), ("T", 0, 50)])           # 1 s bei 50 fps, nur ein Fenster
+
+    def test_swapped_tracks_detected_and_named(self):
+        out = self._run({0: [self.A, self.B, self.C]}, {0: [self.B, self.A, self.C]})
+        self.assertEqual(len(out), 2)
+        self.assertIn("Tonspur 1: Inhalt weicht von der Quelle ab (Spuren vertauscht?)", out[0])
+        self.assertIn("Quell-Tonspur 2", out[0])
+        self.assertIn("Quell-Tonspur 1", out[1])
+
+    def test_unknown_difference_without_match(self):
+        out = self._run({0: [self.A, self.B]}, {0: [self.A, b"\x09" * 480]})
+        self.assertEqual(len(out), 1)
+        self.assertIn("Tonspur 2: Inhalt weicht von der Quelle ab (Spuren vertauscht?)", out[0])
+        self.assertNotIn("entspricht", out[0])
+
+    def test_shorter_target_compares_common_length(self):
+        self.assertEqual(self._run({0: [self.A, self.B]}, {0: [self.A[:100], self.B[:100]]}), [])
+        out = self._run({0: [self.A, self.B]}, {0: [self.A[:100], self.A[:100]]})
+        self.assertEqual(len(out), 1)
+        self.assertIn("Tonspur 2", out[0])
+
+    def test_track_count_and_empty_data(self):
+        self.assertIn("1 extrahiert statt 2", self._run({0: [self.A, self.B]}, {0: [self.A]})[0])
+        out = self._run({0: [self.A]}, {0: [b""]})
+        self.assertIn("keine Audiodaten", out[0])
+
+    def test_silent_first_window_checks_later_windows(self):
+        z = b"\x00" * 480
+        src = {0: [z, z], 100: [self.A, self.B], 200: [self.A, self.B]}
+        self.assertEqual(self._run(src, {0: [z, z], 100: [self.A, self.B], 200: [self.A, self.B]}), [])
+        self.assertEqual([c[1] for c in self.calls if c[0] == "S"], [0, 100])    # 1/3 reicht: Spuren verschieden
+        out = self._run(src, {0: [z, z], 100: [self.B, self.A], 200: [self.B, self.A]})
+        self.assertEqual(len(out), 2)
+        self.assertIn("(Fenster bei 1/3)", out[0])
+
+    def test_later_window_beyond_short_target_is_skipped(self):
+        z = b"\x00" * 480
+        src = {0: [z, z], 100: [self.A, self.B], 200: [self.A, self.B]}
+        tgt = {0: [z, z], 100: RuntimeError("Start position beyond"), 200: RuntimeError("beyond")}
+        self.assertEqual(self._run(src, tgt), [])
+
+    def test_extraction_failure_is_a_problem_and_cancel_propagates(self):
+        out = self._run({0: RuntimeError("kaputt")}, {0: []})
+        self.assertEqual(len(out), 1)
+        self.assertIn("Tonspuren-Inhalt nicht pruefbar: kaputt", out[0])
+        with mock.patch.object(verify, "_extract_audio", side_effect=tools.Cancelled()):
+            with self.assertRaises(tools.Cancelled):
+                verify.check_audio_content("T", "S", fps=Fraction(50), duration=100)
+
+    def test_fps_and_duration_read_from_source_when_missing(self):
+        info = mxfinfo.MxfInfo(edit_rate=Fraction(25), duration=100)
+        with mock.patch.object(mxfinfo, "read_mxf_info", return_value=info) as rd:
+            self._run({0: [self.A]}, {0: [self.A]}, fps=None, duration=None)
+        rd.assert_called_once()
+        self.assertEqual(self.calls[0], ("S", 0, 25))
+
+    def test_extract_audio_runs_mxf2raw_limited_and_orders_tracks(self):
+        seen = {}
+
+        def fake_run(args, cancel=None, **kw):
+            seen["args"] = [str(a) for a in args]
+            prefix = seen["args"][seen["args"].index("--ess-out") + 1]
+            for n in (10, 2, 0):                                     # numerisch sortieren, nicht alphabetisch
+                Path(f"{prefix}_a{n}.raw").write_bytes(bytes([n]) * 6)
+            Path(f"{prefix}_v0.raw").write_bytes(b"video")           # fremde Datei wird ignoriert
+            return tools.ProcResult(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(tools, "run_capture", side_effect=fake_run), \
+                mock.patch.object(tools, "find_tool", return_value="mxf2raw"):
+            out = verify._extract_audio("quelle.mxf", 7, 50, td, "s", None)
+            self.assertEqual(out, [b"\x00" * 6, b"\x02" * 6, b"\x0a" * 6])
+            self.assertEqual(sorted(os.listdir(td)), ["s_v0.raw"])    # Audio-Rohdateien sind wieder entfernt
+        a = seen["args"]
+        for opt in ("--disable-video", "--disable-data"):
+            self.assertIn(opt, a)
+        self.assertEqual(a[a.index("--start") + 1], "7")
+        self.assertEqual(a[a.index("--dur") + 1], "50")
+        self.assertEqual(a[-1], "quelle.mxf")                         # Input-Optionen stehen vor dem Dateinamen
+        self.assertLess(a.index("--start"), len(a) - 1)
+
+    def test_temp_dir_is_removed(self):
+        made = []
+        real = tempfile.TemporaryDirectory
+
+        def spy(*a, **k):
+            d = real(*a, **k)
+            made.append(d.name)
+            return d
+
+        with mock.patch.object(tempfile, "TemporaryDirectory", spy):
+            self._run({0: [self.A]}, {0: [self.A]})
+        self.assertEqual(len(made), 1)
+        self.assertFalse(os.path.exists(made[0]))
+
+    def test_check_clip_calls_it_only_with_source(self):
+        info = _info("fx6_mxf2raw.txt")
+        probe = mxfinfo.parse_ffprobe(fixture_text("fx6_ffprobe.txt"))
+        exp = verify.ClipExpect(frames=962, mp_uid=info.mp_uid, fp_uid=info.fp_uid, start_tc=info.start_tc,
+                                n_audio=4, fps=Fraction(50), expect_anc=True, expect_xml=True, level="4.2")
+        with mock.patch.object(verify, "check_structure", return_value=[]), \
+                mock.patch.object(mxfinfo, "read_mxf_info", return_value=info), \
+                mock.patch.object(mxfinfo, "run_ffprobe", return_value=probe), \
+                mock.patch.object(verify, "check_header", return_value=[]), \
+                mock.patch.object(verify, "check_audio_content", return_value=["Tonspur 1: Inhalt weicht ab"]) as ac:
+            self.assertEqual(verify.check_clip(Path("x.mxf"), exp), [])
+            ac.assert_not_called()
+            out = verify.check_clip(Path("x.mxf"), exp, source=Path("s.mxf"), source_info=info)
+        self.assertEqual(out, ["Tonspur 1: Inhalt weicht ab"])
+        ac.assert_called_once()
+        self.assertEqual(ac.call_args.args, (Path("x.mxf"), Path("s.mxf")))
+
+
 # --------------------------------------------------------------------------- Kopfdaten (Praefix, direkte Pruefung)
 
 
@@ -358,6 +500,47 @@ class CheckHeaderDirect(unittest.TestCase):
         text = "\n".join(verify.check_header_direct(tgt, src))
         self.assertIn("nicht vorhandenen Track 99", text)
         self.assertIn("LinkedTrackID 77", text)
+
+    def test_extra_source_timecode_track_is_only_a_note(self):
+        extra = self.th.SRC_TRACKS + [("timecode", 6, 0, None)]
+        src = self._file("s.mxf", extra, self.th.SONY_IDENT)
+        tgt = self._file("t.mxf", self.th.SRC_TRACKS, self.th.SONY_IDENT)
+        notes: list = []
+        self.assertEqual(verify.check_header_direct(tgt, src, notes=notes), [])
+        self.assertEqual(len(notes), 2)                              # Material Package und File Package
+        self.assertIn("zusaetzliche Timecode-Tracks", notes[0])
+        self.assertEqual(verify.check_header_direct(tgt, src), [])    # notes ist optional
+
+    def test_target_timecode_id_must_exist_in_source(self):
+        src = self._file("s.mxf", self.th.SRC_TRACKS, self.th.SONY_IDENT)
+        tc9 = [("timecode", 9, 0, None)] + self.th.SRC_TRACKS[1:]
+        tgt = self._file("t.mxf", tc9, self.th.SONY_IDENT)
+        text = "\n".join(verify.check_header_direct(tgt, src))
+        self.assertIn("Track-IDs timecode [9] statt [1]", text)
+        # Bild/Ton/Daten bleiben strikt gleich, auch wenn die Quelle mehr hat
+        more = self.th.SRC_TRACKS + [("sound", 7, 0x16080302, None)]
+        src2 = self._file("s2.mxf", more, self.th.SONY_IDENT)
+        tgt2 = self._file("t2.mxf", self.th.SRC_TRACKS, self.th.SONY_IDENT)
+        self.assertIn("Track-IDs sound", "\n".join(verify.check_header_direct(tgt2, src2)))
+
+    def test_first_identification_is_compared(self):
+        th = self.th
+        s = th.make_card(th.SRC_TRACKS, ident=th.SONY_IDENT)
+        ident2 = s.add("Identification", [("Identification.ThisGenerationUID", b"\x55" * 16),
+                                          ("Identification.ModificationDate", bytes.fromhex("07ea0b0f11000000")),
+                                          ("Identification.CompanyName", th.u16s("Adobe")),
+                                          ("Identification.ProductName", th.u16s("Premiere"))])
+        out = []
+        for n, items, u, k in s.sets:
+            if n == "Preface":
+                first = dict(items)["Preface.Identifications"][8:24]
+                items = [(r, th.batch([first, ident2]) if r == "Preface.Identifications" else v) for r, v in items]
+            out.append((n, items, u, k))
+        s.sets = out
+        src = self.tmp / "s.mxf"
+        src.write_bytes(th.build_file(s.build(6000)))
+        tgt = self._file("t.mxf", th.SRC_TRACKS, th.SONY_IDENT)      # traegt die Werte der ersten Identification
+        self.assertEqual(verify.check_header_direct(tgt, src), [])
 
     def test_missing_anc_in_target_not_reported_here(self):
         src = self._file("s.mxf", self.th.SRC_TRACKS, self.th.SONY_IDENT)
@@ -445,13 +628,41 @@ class VerifyCardMocked(unittest.TestCase):
                     mock.patch.object(verify, "check_structure", return_value=[]), \
                     mock.patch.object(verify, "measure_gop", return_value=[24]), \
                     mock.patch.object(verify, "tail_decode_check", return_value=[]), \
+                    mock.patch.object(verify, "check_audio_content", return_value=[]) as audio, \
                     mock.patch.object(verify, "check_header", return_value=[]):
-                return verify.verify_card(str(self.root), source=str(src_root))
+                rep = verify.verify_card(str(self.root), source=str(src_root))
+            self.audio = audio
+            return rep
 
         no_anc = copy.deepcopy(self.info)
         no_anc.tracks = [t for t in no_anc.tracks if t.essence_type != "ANC_Data"]
         probs = "\n".join(run(no_anc).problems)
         self.assertIn("ANC-Spur: Ziel nein, Quelle ja (gewollt bei --no-anc)", probs)
+        self.assertIn("nicht, dass ANC bewusst weggelassen", probs)      # keine Angabe in der Einstellungsdatei
+        self.audio.assert_called_once()                                  # Ton-Inhalt je umgewandeltem Clip
+        # Einstellungsdatei im Zielordner: ANC bewusst weggelassen -> nur Hinweis
+        settings = self.tmp / "konvertierung_einstellungen.json"
+        for entry in ({"keep_anc": False}, {"keep_anc": True, "anc_failed": True}):
+            settings.write_text(json.dumps({"version": 1, "clips": {"Clip/FX6ENG10562.MXF": dict(entry, neues_feld=7)}}),
+                                encoding="utf-8")
+            rep = run(no_anc)
+            self.assertEqual(rep.problems, [], entry)
+            self.assertTrue(any("ANC-Spur fehlt im Ziel" in n for n in rep.notes), rep.notes)
+        # keep_anc true ohne Fehlerfeld, anderer Clip, kaputte Datei: weiterhin Abweichung
+        for content in (json.dumps({"clips": {"Clip/FX6ENG10562.MXF": {"keep_anc": True}}}),
+                        json.dumps({"clips": {"Clip/ANDERER.MXF": {"keep_anc": False}}}),
+                        "{kaputt", json.dumps([1, 2]), json.dumps({"clips": {"Clip/FX6ENG10562.MXF": 5}})):
+            settings.write_text(content, encoding="utf-8")
+            self.assertTrue(any("ANC-Spur: Ziel nein" in p for p in run(no_anc).problems), content)
+        settings.unlink()
+        # ANC im Ziel vorhanden, in der Quelle nicht: nie durch die Einstellungsdatei entschuldigt
+        settings.write_text(json.dumps({"clips": {"Clip/FX6ENG10562.MXF": {"keep_anc": False}}}), encoding="utf-8")
+        src_without = copy.deepcopy(src_info)
+        src_without.tracks = [t for t in src_without.tracks if t.essence_type != "ANC_Data"]
+        saved, src_info = src_info, src_without
+        self.assertTrue(any("ANC-Spur: Ziel ja, Quelle nein" in p for p in run(_info("fx6_mxf2raw.txt")).problems))
+        src_info = saved
+        settings.unlink()
         fewer = copy.deepcopy(src_info)
         fewer.anc_tracks[0].anc_elements = fewer.anc_tracks[0].anc_elements[:-1]
         probs = "\n".join(run(fewer).problems)
