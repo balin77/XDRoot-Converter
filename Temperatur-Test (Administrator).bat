@@ -24,8 +24,18 @@ set "PYMODE=python"
 echo Starte Temperatur-Test mit Administratorrechten (bitte die Windows-Abfrage bestaetigen) ...
 if "%PYMODE%"=="py" (py -3 -m xdroot_converter.cli --thermal-test --als-administrator) else (python -m xdroot_converter.cli --thermal-test --als-administrator)
 set "RC=%errorlevel%"
-rem Exit-Code 3 = die Erhoehung wurde abgelehnt oder ist fehlgeschlagen; alles andere ist das Ergebnis des Programms selbst
+rem Exit-Codes: 0 = Test erhoeht gestartet bzw. erfolgreich; 1 = der Test lief hier und hat selbst auf Enter gewartet
+rem (Python-Skript, Fenster war schon offen - kein zweites pause); 3 = Erhoehung abgelehnt/fehlgeschlagen (ausfuehrlicher
+rem Hinweis); jeder andere Code (z. B. 2 = falsche Argumente, 9009 = Python fehlt) = Start fehlgeschlagen (kurzer Hinweis).
+if "%RC%"=="0" exit /b 0
 if "%RC%"=="3" goto :elevfail
+if "%RC%"=="1" exit /b 1
+goto :startfail
+
+:startfail
+echo.
+echo Start fehlgeschlagen (Code %RC%).
+pause
 exit /b %RC%
 
 :elevfail

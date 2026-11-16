@@ -30,6 +30,7 @@ PY = sys.executable
 _STATE_ROOT = tempfile.mkdtemp(prefix="xdroot-fanstate-")
 
 
+thermal.THERMAL_TEST_LOG_DIR = Path(_STATE_ROOT)  # thermal_test.txt nie in den echten Programmordner schreiben
 atexit.register(shutil.rmtree, _STATE_ROOT, True)  # (nicht tearDownModule: test_thermal_fixes benutzt ihn mit)
 
 
@@ -1028,7 +1029,7 @@ class ThermalTestCommandTests(unittest.TestCase):
         called = []
         rc, lines = self.go(legion(h), input_fn=lambda p="": called.append(p))
         self.assertEqual(rc, 0)
-        self.assertEqual(lines[-1], "ERGEBNIS: nur Messung möglich")
+        self.assertEqual(lines[-1], "ERGEBNIS: nur Messung möglich - Lüftersteuerung auf diesem Gerät nicht verfügbar")
         self.assertEqual((called, h.writes()), ([], []))
 
     def test_abort_at_prompt_switches_nothing(self):

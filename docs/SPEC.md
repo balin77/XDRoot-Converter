@@ -455,6 +455,38 @@ Ergänzungen nach den Reviews (verbindlich):
   das Tool das nächste Mal **mit Temperaturüberwachung und Administratorrechten** läuft (oder `--thermal-test` gestartet wird).
   Ein erhöhter Prozess sieht Netzlaufwerke des normalen Benutzers in der Regel nicht.
 
+### Abschlussprüfung mit automatischer Wiederholung (Runde 4, Spezifikation)
+
+Anlass: Beim lokalen Test schlug ein Clip wegen eines Lesehängers fehl und musste von Hand per Fortsetzungslauf nachgeholt
+werden; die gründliche Prüfung (`--verify --source --deep`) musste ebenfalls von Hand gestartet werden.
+
+- **Ablauf:** Nach der Umwandlung folgt automatisch eine **Abschlussprüfung** der Zielkarte gegen die Quelle – dieselbe Prüfung
+  wie `--verify <ziel> --source <quelle> --deep` (keine zweite Implementierung, sondern derselbe Code), mit Fortschrittsanzeige.
+- **Wiederholung:** Clips, die in der Umwandlung als Fehler endeten oder in der Abschlussprüfung eine Abweichung haben, werden
+  **neu umgewandelt** (erzwungen, auch wenn ein Ziel-Clip existiert) und danach erneut geprüft – höchstens **2 Wiederholungsrunden**
+  (einstellbar). Es gilt weiter: Ein vorhandener Ziel-Clip wird erst nach erfolgreicher Neuerzeugung ersetzt; die Quelle wird
+  nie verändert. In der Wiederholungsrunde werden nur die betroffenen Clips geprüft (wieder mit vollständigem Dekodieren),
+  am Ende einmal die kartenweiten Punkte (`MEDIAPRO.XML`, Begleitdateien).
+- **Was nicht wiederholt wird:** Clips, die bewusst nur kopiert wurden (4K, Interlaced, nicht analysierbar usw.), und Abweichungen,
+  die keine Neu-Umwandlung beheben kann (z. B. Quelle selbst nicht lesbar). Begleitdateien, die byte-gleich sein müssten und es
+  nicht sind, werden einmal neu kopiert und erneut verglichen. Bleibt danach etwas offen, steht es als Abweichung im Ergebnis.
+- **Ergebnis:** Zusammenfassung, Protokoll und GUI-Abschlussfenster nennen: geprüfte Clips, Clips ohne Abweichung, wiederholte
+  Clips (mit Grund), endgültig fehlerhafte Clips. Nur wenn die Abschlussprüfung ohne Abweichung endet, lautet der Abschluss
+  „Fertig – geprüft“; sonst „Fertig mit Fehlern“ mit den betroffenen Clips. Exit-Code der CLI: 0 nur bei geprüfter Karte ohne
+  Abweichung.
+- **Einstellungen:** Standard **an**, mit vollständigem Dekodieren. GUI: Haken „Nach der Umwandlung prüfen und fehlerhafte Clips
+  wiederholen“ und „gründlich (jeden Clip komplett dekodieren)“. CLI: `--no-auto-verify`, `--auto-verify-quick` (ohne
+  vollständiges Dekodieren), `--retries N` (0–5, Standard 2).
+- **Ausnahmen:** Bei `--max-frames` (Testausgabe) entfällt die Abschlussprüfung. Bei `--only`/`--unlisted skip` gelten die
+  bewusst nicht ausgewählten Clips nicht als Fehler (wie bisher in `--verify --source`); die bekannte Meldung zu in
+  `MEDIAPRO.XML` gelisteten, wegen `--only` fehlenden Clips führt nicht zu Wiederholungen.
+- **Abbruch, Temperatur, Schonmodus:** Abbrechen (GUI, Strg+C) wirkt auch während der Abschlussprüfung; das Ergebnis heißt dann
+  „abgebrochen, Prüfung unvollständig“. Temperaturüberwachung (Pause) und `--threads` gelten auch für die Prüfung.
+- **Fortsetzen:** Ein Fortsetzungslauf, bei dem nichts mehr umzuwandeln ist, führt trotzdem die Abschlussprüfung aus (so lässt
+  sich eine vorhandene Zielkarte nachträglich prüfen und reparieren).
+- **Zeitbedarf:** Die gründliche Prüfung kostete im lokalen Test etwa 8 Minuten für 62 Minuten Material (rund 8 % der
+  Umwandlungszeit).
+
 ### Beleglage (Stand 16.11.2026)
 
 Mit echten Kameradateien unter Windows belegt: Parser, Patcher, Prüfungen und Toninhalts-Vergleich (19 F5-Clips und eine

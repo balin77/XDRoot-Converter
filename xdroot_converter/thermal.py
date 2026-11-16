@@ -58,7 +58,7 @@ FAN_HYSTERESIS_C = 10.0  # Lüfter zurück unter (Lüfter-voll-Schwelle - 10), S
 PAUSE_HYSTERESIS_C = 12.0  # weiter unter (Pausen-Schwelle - 12), Standard 97 -> 85
 DEFAULT_INTERVAL_S = 5.0
 HELPER_STARTUP_TIMEOUT_S = 30.0  # PowerShell-Start + erste WMI-Abfrage
-HELPER_TIMEOUT_S = 10.0  # Zeitlimit je Messung; danach wird der Hilfsprozess beendet (und einmal neu gestartet)
+HELPER_TIMEOUT_S = 10.0  # Zeitlimit je Messung; danach wird der Hilfsprozess beendet (und neu gestartet, bis zu 3 Neustarts je Lauf)
 HELPER_WRITE_TIMEOUT_S = 30.0  # Zeitlimit für Schalt- und Rückleseaufrufe (WMI-Schreiben kann langsam sein)
 DEFAULT_MAX_PAUSE_S = 20 * 60.0  # längste Temperaturpause; danach wird der Lauf sauber abgebrochen
 PAUSE_LOG_INTERVAL_S = 120.0  # während einer Pause alle 2 Minuten eine Protokollzeile
@@ -78,7 +78,6 @@ RESTORE_MAX_ATTEMPTS = 3  # gescheiterte Wiederherstellungen beim Start, danach 
 # --- Lenovo Legion (WMI root\wmi).  Die Klassen/Methoden sind am Gerät gemessen (Get-CimClass).
 # Welche KENNUNG "Lüfter voll" auslöst, ist NICHT belegt (Vermutung aus dem Open-Source-Projekt "Lenovo Legion
 # Toolkit", Legion-Generationen unterscheiden sich) - am Gerät mit --thermal-test zu bestätigen.
-WMI_NAMESPACE = "root\\wmi"
 WMI_CLASS_GAMEZONE = "LENOVO_GAMEZONE_DATA"
 WMI_CLASS_OTHER = "LENOVO_OTHER_METHOD"
 # Neuere Legion-Generationen: LENOVO_OTHER_METHOD.SetFeatureValue(IDs=0x04020000, value=1 an / 0 aus).
@@ -1022,7 +1021,7 @@ class LegionProvider(ThermalProvider):
             return
         why = self._store.check_writable()
         if why:
-            self._fan_note = "Lüftersteuerung nicht verfügbar (die Zustandsdatei kann nicht geschrieben werden)"
+            self._fan_note = "Lüftersteuerung nicht verfügbar (Lüfterzustand kann nicht gesichert werden)"
             self._messages.append(("detail", f"Zustandsdatei: {why}"))
             return
         if not self._handle_leftover_state():
@@ -1052,7 +1051,8 @@ class LegionProvider(ThermalProvider):
         try:
             self._store.delete()
         except OSError as e:
-            self._fan_note = f"Zustandsdatei nicht löschbar ({e.strerror or e})"
+            self._fan_note = "Lüftersteuerung gesperrt (gespeicherter Lüfterzustand nicht löschbar)"
+            self._messages.append(("detail", f"Zustandsdatei nicht löschbar: {e.strerror or e}"))
             return False
         return True
 
@@ -1068,6 +1068,12 @@ class LegionProvider(ThermalProvider):
                 raise ProviderError(f"zurückgelesen {now} statt {info['prev']}")
             self._store.delete_if_same(info)
         except (ThermalError, OSError) as e:
+            if self._aborted or self._closing:
+                # Programmende während der Wiederherstellung: kein Fehlversuch, Datei unverändert lassen
+                self._messages.append(("detail", f"Wiederherstellen aus {path} wegen Programmende unterbrochen "
+                                                 f"(Datei bleibt unverändert): {type(e).__name__}: {e}"))
+                self._fan_note = "Lüftersteuerung gesperrt (vorheriger Lauf nicht sauber beendet)"
+                return False
             n = self._store.bump_attempts(info)
             self._messages.append(("detail", f"Wiederherstellen aus {path} gescheitert (Versuch {n}): "
                                              f"{type(e).__name__}: {e}"))
@@ -1079,8 +1085,7 @@ class LegionProvider(ThermalProvider):
                 self._messages.append(("warn", "Lüfterzustand konnte nicht wiederhergestellt werden; bitte in Lenovo "
                                                f"Vantage prüfen (nach {n} Versuchen wurde die Zustandsdatei verworfen)."))
                 return True
-            self._fan_note = (f"Lüfterzustand nach abgebrochenem Lauf nicht wiederherstellbar (Versuch {n} von "
-                              f"{RESTORE_MAX_ATTEMPTS}; Datei: {path})")
+            self._fan_note = "Lüftersteuerung gesperrt (vorheriger Lauf nicht sauber beendet)"
             return False
         self._messages.append(("info", "Lüfterzustand nach abgebrochenem Lauf wiederhergestellt"))
         return True
@@ -1115,6 +1120,8 @@ class LegionProvider(ThermalProvider):
         cpu = self._data("GetCPUTemp")
         rpms = []
         for m in ("GetFan1Speed", "GetFan2Speed"):
+            if self._closing or self._aborted:
+                raise HelperError("Anbieter wird beendet")
             try:
                 rpms.append(self._data(m))
             except HelperError:
@@ -1233,6 +1240,10 @@ class LegionProvider(ThermalProvider):
             h, self._helper = self._helper, None
         if h is not None:
             self._safe_close(h)
+        # Eigene Kennung freigeben: blieb die Zustandsdatei nach einem gescheiterten Zurückstellen liegen, gilt sie für
+        # den nächsten Lauf in diesem Prozess als "Besitzer tot" (wiederherstellen) statt als "anderer Lauf"
+        if self._token is not None:
+            _HELD_TOKENS.discard(self._token)
 
 
 # --------------------------------------------------------------------------- Verfügbarkeit
@@ -1244,6 +1255,7 @@ class Availability:
     provider: Optional[ThermalProvider] = None
     first: Optional[Messung] = None
     detail: str = ""  # technische Einzelheiten (nur Protokoll)
+    messages: list = field(default_factory=list)  # (Stufe, Text) des Anbieters, wenn er schon geschlossen wurde
 
 
 def check_availability(provider_factory: Optional[Callable] = None, holder: Optional[list] = None) -> Availability:
@@ -1261,14 +1273,25 @@ def check_availability(provider_factory: Optional[Callable] = None, holder: Opti
             raise ProviderUnavailable("Die gemessene Temperatur ist unplausibel", "implausible")
         return Availability(True, provider=prov, first=m)
     except ProviderUnavailable as e:
+        msgs = _take_messages(prov)
         _safe_close(prov)
-        return Availability(False, e.reason, e.code)
+        c = e.__cause__
+        return Availability(False, e.reason, e.code, detail=f"{type(c).__name__}: {c}" if c is not None else "",
+                            messages=msgs)
     except BaseException as e:  # noqa: BLE001
+        msgs = _take_messages(prov)
         _safe_close(prov)
         if not isinstance(e, Exception):
             raise
         return Availability(False, "Die Temperatur konnte nicht gemessen werden", "other",
-                            detail=f"{type(e).__name__}: {e}")
+                            detail=f"{type(e).__name__}: {e}", messages=msgs)
+
+
+def _take_messages(prov) -> list:
+    try:
+        return list(prov.take_messages()) if prov is not None else []
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _safe_close(prov) -> None:
@@ -1375,7 +1398,8 @@ class ThermalController:
         if self.fan_ok:
             self._n("info", f"Lüfterschaltung: {note}")
         else:
-            self._n("warn", f"Lüftersteuerung nicht verfügbar: {note}. Es wird nur gemessen und bei Bedarf pausiert.")
+            what = str(note) if str(note).startswith("Lüftersteuerung") else f"Lüftersteuerung nicht verfügbar: {note}"
+            self._n("warn", f"{what}. Es wird nur gemessen und bei Bedarf pausiert.")
 
     def tick(self, measurement: Optional[Messung] = None) -> None:
         """Eine Messung (oder die übergebene) auswerten.  Wirft nie."""
@@ -1683,9 +1707,13 @@ class ThermalSession:
             self.availability = av
             if self._stop.is_set():  # Lauf ist schon zu Ende: nichts mehr melden, Anbieter freigeben
                 if av.provider is not None:
+                    for level, text in _take_messages(av.provider):  # z. B. Warnung über eine verworfene Zustandsdatei
+                        self._n(level, text)
                     _safe_close(av.provider)
                 return
             if not av.ok:
+                for level, text in av.messages:
+                    self._n(level, text)
                 self._stats.unavailable_reason = av.reason
                 if av.detail:
                     self._n("detail", f"Temperatur nicht verfügbar - Einzelheiten: {av.detail}")
@@ -1777,14 +1805,73 @@ def fan_max_for_check(last: Optional[Messung], during: list):
     return next((x.fan_max_rpm for x in reversed(during) if x.fan_max_rpm), last.fan_max_rpm if last else None)
 
 
+def _out_messages(prov, out: Callable) -> None:
+    """Hinweise des Anbieters (z. B. Warnung über eine verworfene Zustandsdatei) in die Testausgabe übernehmen."""
+    for level, text in _take_messages(prov):
+        out(f"  [{level}] {text}")
+
+
+THERMAL_TEST_FILE = "thermal_test.txt"
+THERMAL_TEST_LOG_DIR: Optional[Path] = None  # None = Programmordner; die Tests setzen hier einen Wegwerf-Ordner
+
+
+def run_thermal_test_logged(out: Callable = print, log_path=None, **kw) -> int:
+    """``run_thermal_test`` und die gesamte Ausgabe zusätzlich in eine UTF-8-Datei (``thermal_test.txt`` im
+    Programmordner, wird überschrieben).  Schreibfehler der Datei stören den Test nicht.  ``log_path`` = Zieldatei."""
+    path = Path(log_path) if log_path is not None else         (THERMAL_TEST_LOG_DIR or Path(__file__).resolve().parent.parent) / THERMAL_TEST_FILE
+    f = None
+    try:
+        f = open(path, "w", encoding="utf-8")
+    except OSError:
+        f = None
+
+    def put(s: str = "") -> None:
+        nonlocal f
+        if f is not None:
+            try:
+                f.write(s + "\n")
+                f.flush()
+            except (OSError, ValueError):
+                f = None
+
+    def tee(s: str = "") -> None:
+        out(s)
+        put(s)
+
+    rc = 1
+    try:
+        rc = run_thermal_test(tee, detail=put, **kw)
+    except BaseException as e:  # noqa: BLE001
+        import traceback
+
+        put(traceback.format_exc())
+        if isinstance(e, KeyboardInterrupt):
+            tee("ERGEBNIS: abgebrochen")
+        elif isinstance(e, Exception):
+            tee(f"ERGEBNIS: Fehler - {type(e).__name__}: {str(e)[:150]}")
+        else:
+            raise
+    finally:
+        if f is not None:
+            tee(f"Diese Ausgabe steht auch in {path} - bitte diese Datei an den Autor schicken.")
+            try:
+                f.close()
+            except OSError:
+                pass
+        else:
+            out("(Die Ausgabedatei konnte nicht geschrieben werden - bitte stattdessen den Fensterinhalt kopieren.)")
+    return rc
+
+
 def run_thermal_test(out: Callable = print, provider_factory: Optional[Callable] = None,
                      sleep: Callable = time.sleep, full_seconds: float = 10.0, samples: int = 5,
-                     input_fn: Optional[Callable] = None) -> int:
+                     input_fn: Optional[Callable] = None, detail: Optional[Callable] = None) -> int:
     """Diagnose für Laien: Anbieter, Rechte, Messungen, dann (nach Enter) Lüfter voll schalten, die Drehzahl vorher /
     während / nachher ausgeben, zurückstellen und ein klares Urteil ('ERGEBNIS: ...') als letzte Zeile.
     Strg+C bricht freundlich ab (die Lüfter werden dann zurückgestellt, Strg+C ist dabei gesperrt).
     Rückgabe 0 = Test lief (auch 'nur Messung möglich'), 1 = Problem/Abbruch.  Der SmartFanMode wird nur angezeigt."""
     input_fn = input_fn or input
+    detail = detail or (lambda s="": None)  # Einzelheiten nur für die Ausgabedatei
     out("=== Temperatur-Diagnose (--thermal-test) ===")
     out(f"Plattform: {sys.platform}; Administratorrechte: {'ja' if is_admin() else 'NEIN'}")
     out(f"WICHTIG: Die Kennung für 'Lüfter voll' (0x{FEATURE_ID_FAN_FULL_SPEED:08X}) ist UNBESTÄTIGT (eine Vermutung aus "
@@ -1796,17 +1883,30 @@ def run_thermal_test(out: Callable = print, provider_factory: Optional[Callable]
     prov = None
     problems = 0
     switched = False
+    restore_ok: Optional[bool] = None
     try:
         prov = provider_factory()
         try:
             prov.open()
         except ProviderUnavailable as e:
             out(f"  -> NICHT VERFÜGBAR: {e.reason}")
+            if e.__cause__ is not None:
+                detail(f"  Technische Ursache: {type(e.__cause__).__name__}: {e.__cause__}")
+            _out_messages(prov, out)
             if e.code == "admin":
                 out("  Hinweis: 'Temperatur-Test (Administrator).bat' bzw. eine Administrator-Konsole benutzen.")
             out("ERGEBNIS: nicht verfügbar - es wurde nichts geschaltet")
             return 1
+        except Exception as e:  # noqa: BLE001  (kein Traceback auf dem Bildschirm; Einzelheiten nur in die Ausgabedatei)
+            import traceback
+
+            detail(traceback.format_exc())
+            _out_messages(prov, out)
+            out(f"  -> FEHLER beim Öffnen: {type(e).__name__}: {e}")
+            out(f"ERGEBNIS: Fehler - {type(e).__name__}: {str(e)[:150]} (es wurde nichts geschaltet)")
+            return 1
         out(f"  Anbieter: {getattr(prov, 'name', '?')} - geöffnet")
+        _out_messages(prov, out)
         smart = getattr(prov, "read_smart_fan_mode", None)
         if smart is not None:
             mode = smart()
@@ -1817,9 +1917,11 @@ def run_thermal_test(out: Callable = print, provider_factory: Optional[Callable]
             + ("" if raw_max is None or plausible_fan_max(raw_max) else "  <- unplausibel, wird nicht verwendet"))
         out(f"Schritt 2: {samples} Messungen")
         last: Optional[Messung] = None
+        last_any: Optional[Messung] = None  # auch unplausible Messung (die Drehzahlen können trotzdem lesbar sein)
         for i in range(samples):
             try:
                 m = prov.measure()
+                last_any = m
                 ok = plausible(m.cpu_temp_c)
                 out(f"  Messung {i + 1}: CPU {m.cpu_temp_c:g} °C, Lüfter {_fmt_rpm(m)}" + ("" if ok else "  <- UNPLAUSIBEL"))
                 if ok:
@@ -1835,10 +1937,12 @@ def run_thermal_test(out: Callable = print, provider_factory: Optional[Callable]
         out(f"Schritt 3: Lüfterschaltung - {note}")
         if not can:
             out("  -> Es wird NICHT geschaltet (nur Messung).")
-            out("ERGEBNIS: nur Messung möglich" + (f" ({problems} Problem(e) bei den Messungen)" if problems else ""))
+            out(f"ERGEBNIS: nur Messung möglich - {note}"
+                + (f" ({problems} Problem(e) bei den Messungen)" if problems else ""))
             return 1 if problems else 0
-        before = ThermalController._top_rpm(last)
-        out(f"  Drehzahl VORHER: {_fmt_rpm(last)}")
+        shown_before = last if last is not None else last_any
+        before = ThermalController._top_rpm(shown_before)
+        out(f"  Drehzahl VORHER: {_fmt_rpm(shown_before)}")
         out(f"  Gleich werden die Lüfter {full_seconds:g} s lang auf voll geschaltet und danach zurückgestellt.")
         try:
             input_fn("Enter drücken zum Fortfahren (Strg+C = abbrechen) ")
@@ -1850,10 +1954,12 @@ def run_thermal_test(out: Callable = print, provider_factory: Optional[Callable]
         interrupted = False
         during: list = []
         err_text = ""
+        really = False  # Lüfter voll wurde tatsächlich geschaltet (geschrieben und zurückgelesen)
         try:
             try:
                 switched = True
                 prov.fan_full()
+                really = True
                 out("  -> Lüfter voll: geschrieben und zurückgelesen (siehe oben)")
                 t_end = time.monotonic() + full_seconds
                 while time.monotonic() < t_end:
@@ -1872,43 +1978,70 @@ def run_thermal_test(out: Callable = print, provider_factory: Optional[Callable]
                 err_text = str(e)
                 out(f"  -> FEHLER beim Schalten: {e}")
                 problems += 1
+                if isinstance(e, FanControlBusy):
+                    switched = False  # nichts geschrieben: nichts zurückzustellen
         finally:
             if switched:
                 with sigint_ignored():  # ein zweites Strg+C darf das Zurückstellen nicht unterbrechen
-                    out("Schritt 4: Lüfterzustand wiederherstellen")
+                    announce = really or interrupted  # bei einem Schaltfehler nur melden, wenn das Zurückstellen scheitert
+                    if announce:
+                        out("Schritt 4: Lüfterzustand wiederherstellen")
                     try:
-                        prov.fan_restore()
-                        out("  -> wiederhergestellt: geschrieben und zurückgelesen (siehe oben)")
+                        prov.fan_restore()  # bei Unsicherheit trotzdem versuchen (ohne gespeicherten Zustand wirkungslos)
+                        restore_ok = True
+                        if announce:
+                            out("  -> wiederhergestellt: geschrieben und zurückgelesen (siehe oben)")
                     except ThermalError as e:
+                        restore_ok = False
+                        if not announce:
+                            out("Schritt 4: Lüfterzustand wiederherstellen")
                         out(f"  -> FEHLER beim Wiederherstellen: {e}  (Lüfter von Hand zurücksetzen!)")
                         problems += 1
                     after = None
-                    try:
-                        after = prov.measure()
-                        out(f"  Drehzahl NACHHER: CPU {after.cpu_temp_c:g} °C, Lüfter {_fmt_rpm(after)}")
-                    except ThermalError:
-                        pass
+                    if announce:
+                        try:
+                            after = prov.measure()
+                            out(f"  Drehzahl NACHHER: CPU {after.cpu_temp_c:g} °C, Lüfter {_fmt_rpm(after)}")
+                        except ThermalError:
+                            pass
+        warn = ("" if restore_ok is not False else
+                " ACHTUNG: Die Lüfter konnten nicht zurückgestellt werden - bitte in Lenovo Vantage prüfen oder den "
+                "Test erneut starten.")
         if interrupted:
-            out("ERGEBNIS: abgebrochen (Lüfter wurden zurückgestellt)" if not problems
-                else "ERGEBNIS: abgebrochen, aber das Zurückstellen meldete einen Fehler - Lüfter prüfen!")
+            out("ERGEBNIS: abgebrochen (die Lüfter wurden zurückgestellt)" if restore_ok
+                else "ERGEBNIS: abgebrochen." + (warn or " ACHTUNG: Ob die Lüfter zurückgestellt wurden, ist unklar - "
+                                                 "bitte in Lenovo Vantage prüfen."))
+            return 1
+        if err_text and not really:
+            out(f"ERGEBNIS: nicht geschaltet - {err_text}{warn}")
             return 1
         near_before = fans_near_max(before, fan_max_for_check(last, during))
         top_during = max([r for r in (ThermalController._top_rpm(x) for x in during) if r is not None], default=None)
         fan_max = fan_max_for_check(last, during)
         if near_before:
             out(f"ERGEBNIS: Die Lüfter liefen schon vorher nahe Maximum ({before:.0f} U/min) - eine Wirkung von 'Lüfter voll' "
-                "ist so nicht messbar (Test bei kühlem Rechner wiederholen)" + ("" if not problems else f" - {problems} Problem(e), siehe oben"))
+                "ist so nicht messbar (Test bei kühlem Rechner wiederholen)" + ("" if not problems else f" - {problems} Problem(e), siehe oben") + warn)
         elif top_during is not None and fan_effect_confirmed(before, top_during, fan_max):
             out(f"ERGEBNIS: Lüfter voll WIRKT (Drehzahl von {before or 0:.0f} auf {top_during:.0f} U/min)"
-                + ("" if not problems else f" - aber {problems} Problem(e), siehe oben"))
+                + ("" if not problems else f" - aber {problems} Problem(e), siehe oben") + warn)
         else:
-            why = f" ({err_text})" if err_text else (" (Drehzahlen nicht lesbar)" if top_during is None or before is None else "")
-            out(f"ERGEBNIS: KEINE Wirkung messbar{why} - bitte diese Ausgabe an den Autor zurückmelden")
+            if before is None and top_during is None:
+                why = " (Drehzahlen nicht lesbar)"
+            elif before is None:
+                why = " (Drehzahl vorher nicht lesbar)"
+            elif top_during is None:
+                why = " (Drehzahl während voll nicht lesbar)"
+            else:
+                why = ""
+            out(f"ERGEBNIS: KEINE Wirkung messbar{why} - bitte diese Ausgabe an den Autor zurückmelden" + warn)
         return 1 if problems else 0
     except KeyboardInterrupt:
         out("")
-        if switched:
+        if switched and restore_ok is True:
             out("ERGEBNIS: abgebrochen (die Lüfter wurden zurückgestellt)")
+        elif switched:
+            out("ERGEBNIS: abgebrochen. ACHTUNG: Ob die Lüfter zurückgestellt wurden, ist unklar - bitte in Lenovo "
+                "Vantage prüfen oder den Test erneut starten.")
         else:
             out("ERGEBNIS: abgebrochen (es wurde nichts geschaltet)")
         return 1

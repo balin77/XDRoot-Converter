@@ -24,8 +24,16 @@ set "PYMODE=python"
 echo Starte XDROOT-Converter mit Administratorrechten (bitte die Windows-Abfrage bestaetigen) ...
 if "%PYMODE%"=="py" (py -3 -m xdroot_converter --als-administrator) else (python -m xdroot_converter --als-administrator)
 set "RC=%errorlevel%"
-rem Exit-Code 3 = die Erhoehung wurde abgelehnt oder ist fehlgeschlagen; alles andere ist das Ergebnis des Programms selbst
+rem Exit-Codes: 0 = alles in Ordnung; 3 = Erhoehung abgelehnt/fehlgeschlagen (ausfuehrlicher Hinweis); jeder andere Code
+rem ungleich 0 = Start fehlgeschlagen (kurzer Hinweis, Fenster bleibt offen)
+if "%RC%"=="0" exit /b 0
 if "%RC%"=="3" goto :elevfail
+goto :startfail
+
+:startfail
+echo.
+echo Start fehlgeschlagen (Code %RC%).
+pause
 exit /b %RC%
 
 :elevfail

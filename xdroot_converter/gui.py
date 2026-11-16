@@ -429,15 +429,17 @@ class App(_Base):  # type: ignore[misc,valid-type]
         ttk.Label(fs, text="x264-Preset:").grid(row=0, column=2, sticky="w", padx=(12, 4), pady=1)
         cb = ttk.Combobox(fs, values=PRESETS, textvariable=self.var_preset, width=12, state="readonly")
         cb.grid(row=0, column=3, sticky="w", padx=4, pady=1)
-        # Bitraten-Hinweis in derselben Zeile (eine leere Zeile darunter wuerde Hoehe kosten)
-        ttk.Label(fs, textvariable=self.var_br_hint, foreground="#9a6700").grid(
-            row=0, column=4, sticky="w", padx=4, pady=1)
+        # Bitraten-Hinweis: eigene Zeile unter der Bitrate (umbrechend, wie die anderen Hinweise); ohne Text ausgeblendet
+        self.lbl_br_hint = ttk.Label(fs, textvariable=self.var_br_hint, foreground="#9a6700", wraplength=400,
+                                     justify="left")
+        self.lbl_br_hint.grid(row=1, column=0, columnspan=5, sticky="ew", padx=4, pady=0)
+        self.lbl_br_hint.grid_remove()
         ck = ttk.Checkbutton(fs, text="Clips, die nicht in MEDIAPRO.XML stehen, überspringen",
                              variable=self.var_skip_unlisted)
-        ck.grid(row=1, column=0, columnspan=5, sticky="w", padx=4, pady=1)
+        ck.grid(row=2, column=0, columnspan=5, sticky="w", padx=4, pady=1)
         # Temperaturüberwachung: Schalter und beide Schwellen in EINER Zeile
         tf = ttk.Frame(fs)
-        tf.grid(row=2, column=0, columnspan=5, sticky="w")
+        tf.grid(row=3, column=0, columnspan=5, sticky="w")
         ck_th = ttk.Checkbutton(tf, text="Temperatur überwachen", variable=self.var_thermal_on,
                                 command=self._update_thermal_fields)
         ck_th.grid(row=0, column=0, sticky="w", padx=4, pady=1)
@@ -448,10 +450,10 @@ class App(_Base):  # type: ignore[misc,valid-type]
         e_pause = ttk.Entry(tf, textvariable=self.var_temp_pause, width=5)
         e_pause.grid(row=0, column=4, sticky="w", padx=4, pady=1)
         self.lbl_th_hint = ttk.Label(fs, text=HINT_THERMAL, wraplength=400, justify="left", foreground="#555555")
-        self.lbl_th_hint.grid(row=3, column=0, columnspan=5, sticky="ew", padx=(26, 4), pady=0)
+        self.lbl_th_hint.grid(row=4, column=0, columnspan=5, sticky="ew", padx=(26, 4), pady=0)
         # Schonmodus (unabhängig von der Messung): Feld und kurzer Hinweis in einer Zeile
         cf = ttk.Frame(fs)
-        cf.grid(row=4, column=0, columnspan=5, sticky="w")
+        cf.grid(row=5, column=0, columnspan=5, sticky="w")
         ttk.Label(cf, text="CPU-Kerne begrenzen auf:").grid(row=0, column=0, sticky="w", padx=4, pady=1)
         e_thr = ttk.Entry(cf, textvariable=self.var_threads, width=5)
         e_thr.grid(row=0, column=1, sticky="w", padx=4, pady=1)
@@ -499,7 +501,25 @@ class App(_Base):  # type: ignore[misc,valid-type]
                                      foreground="#555555", wraplength=700)
         self.lbl_thermal.grid(row=10, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 0))
         for lbl in (self.lbl_status, self.lbl_thermal):  # lange Texte umbrechen, statt aus dem Fenster zu laufen
-            lbl.bind("<Configure>", lambda e, w=lbl: w.configure(wraplength=max(200, e.width - 8)))
+            lbl.bind("<Configure>", lambda e, w=lbl: (w.configure(wraplength=max(200, e.width - 8)),
+                                                      self._schedule_minsize()))
+        # wird die Status- oder Temperaturzeile zwei-/einzeilig, passt sich die Mindesthöhe an (entprellt, nur im Leerlauf)
+        self.var_status.trace_add("write", lambda *_a: self._schedule_minsize())
+        self.var_thermal.trace_add("write", lambda *_a: self._schedule_minsize())
+
+    def _schedule_minsize(self) -> None:
+        if getattr(self, "_minsize_pending", False):
+            return
+        self._minsize_pending = True
+
+        def run() -> None:
+            self._minsize_pending = False
+            self._update_minsize()
+
+        try:
+            self.after_idle(run)
+        except Exception:  # noqa: BLE001
+            self._minsize_pending = False
 
     def _toggle_settings(self) -> None:
         if self.settings_open.get():
@@ -543,8 +563,23 @@ class App(_Base):  # type: ignore[misc,valid-type]
             br = parse_bitrate(self.var_bitrate.get())
         except ValueError:
             self.var_br_hint.set("")
+            self._show_br_hint()
             return
         self.var_br_hint.set(HINT_BITRATE if br != 50 else "")
+        self._show_br_hint()
+
+    def _show_br_hint(self) -> None:
+        lbl = getattr(self, "lbl_br_hint", None)
+        if lbl is None:
+            return
+        try:
+            if self.var_br_hint.get():
+                lbl.grid()
+            else:
+                lbl.grid_remove()
+            self._schedule_minsize()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _set_inputs(self, enabled: bool) -> None:
         for w, normal in self._locked_widgets:
@@ -569,6 +604,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
         try:
             width = max(150, int(self.frm_settings.winfo_width()) - 60)
             self.lbl_th_hint.configure(wraplength=width)
+            self.lbl_br_hint.configure(wraplength=width + 30)
         except Exception:  # noqa: BLE001
             pass
 

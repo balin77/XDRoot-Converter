@@ -3,9 +3,9 @@
   python -m xdroot_converter.cli <quelle> <ziel> [--bitrate 50] [--preset medium] [--max-frames N]
   python -m xdroot_converter.cli --verify <ziel-xdroot> [--source <quell-xdroot>] [--deep]
   python -m xdroot_converter.cli --mxf-info <datei.MXF>
-  python -m xdroot_converter.cli --thermal-test        (Diagnose Temperatur/Luefter; Administrator-Konsole)
+  python -m xdroot_converter.cli --thermal-test        (Diagnose Temperatur/Lüfter; Administrator-Konsole)
 
-Temperaturueberwachung: --thermal auto|off (Standard auto), --temp-fan GRAD, --temp-pause GRAD;
+Temperaturüberwachung: --thermal auto|off (Standard auto), --temp-fan GRAD, --temp-pause GRAD;
 Schonmodus: --threads N (ffmpeg-Threads begrenzen).
 """
 
@@ -46,6 +46,7 @@ class CliReporter(converter.Reporter):
 
 
 THREADS_MAX = 256  # wie die Oberflaeche
+NB = " "  # geschütztes Leerzeichen: "97 °C" bricht in --help nicht zwischen Zahl und Einheit um
 
 
 def _positive_int(text: str) -> int:
@@ -73,6 +74,15 @@ def _temp_value(text: str) -> float:
     return v
 
 
+def _os_message(e: OSError, path) -> str:
+    """Deutsche Meldung statt des (englischen) strerror-Textes."""
+    if isinstance(e, FileNotFoundError):
+        return f"Datei nicht gefunden: {path}"
+    if isinstance(e, (PermissionError, IsADirectoryError)):
+        return f"Kein Zugriff auf: {path}"
+    return f"Datei nicht lesbar: {path}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="xdroot_converter.cli", description="Sony XDROOT: XAVC-Intra -> XAVC-L")
     ap.add_argument("source", nargs="?", help="Quellordner (XDROOT oder Elternordner)")
@@ -92,21 +102,22 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--verbose", action="store_true",
                     help="auch Einzelheiten ausgeben (z. B. jede Aenderung der MXF-Kopfdaten); sie stehen immer in konvertierung.log")
     ap.add_argument("--thermal", choices=["auto", "off"], default="auto",
-                    help="Temperaturueberwachung (Messung, Luefter voll, Pause); auto = nur wenn ein Anbieter nutzbar ist "
-                         "(Standard), sonst laeuft alles unveraendert")
+                    help="Temperaturüberwachung (Messung, Lüfter voll, Pause); auto = nur wenn ein Anbieter nutzbar ist "
+                         "(Standard), sonst läuft alles unverändert")
     ap.add_argument("--temp-fan", type=_temp_value, default=thermal.DEFAULT_FAN_ON_C, metavar="GRAD",
-                    help=f"Luefter voll ab dieser CPU-Temperatur (Standard {thermal.DEFAULT_FAN_ON_C:g} °C; zurück 10 °C darunter; erlaubt {thermal.TEMP_FAN_MIN:.0f} bis {thermal.TEMP_FAN_MAX:.0f})")
+                    help=f"Lüfter voll ab dieser CPU-Temperatur (Standard {thermal.DEFAULT_FAN_ON_C:g}{NB}°C; zurück 10{NB}°C darunter; erlaubt {thermal.TEMP_FAN_MIN:.0f} bis {thermal.TEMP_FAN_MAX:.0f}{NB}°C)")
     ap.add_argument("--temp-pause", type=_temp_value, default=thermal.DEFAULT_PAUSE_C, metavar="GRAD",
-                    help=f"ffmpeg anhalten ab dieser CPU-Temperatur (Standard {thermal.DEFAULT_PAUSE_C:g} °C; weiter 12 °C darunter; erlaubt {thermal.TEMP_PAUSE_MIN:.0f} bis {thermal.TEMP_PAUSE_MAX:.0f})")
+                    help=f"ffmpeg anhalten ab dieser CPU-Temperatur (Standard {thermal.DEFAULT_PAUSE_C:g}{NB}°C; weiter 12{NB}°C darunter; erlaubt {thermal.TEMP_PAUSE_MIN:.0f} bis {thermal.TEMP_PAUSE_MAX:.0f}{NB}°C)")
     ap.add_argument("--threads", type=_positive_int, default=None, metavar="N",
-                    help="Schonmodus: ffmpeg hoechstens N Threads (1 bis 256; Decoder und Encoder; auch bei --verify --deep) - weniger "
-                         "Waerme, dauert laenger (Standard: unbegrenzt). Achtung: x264 mit anderer Kernzahl erzeugt einen "
+                    help="Schonmodus: ffmpeg höchstens N Threads (1 bis 256; Decoder und Encoder; auch bei --verify --deep) - weniger "
+                         "Wärme, dauert länger (Standard: unbegrenzt). Achtung: x264 mit anderer Kernzahl erzeugt einen "
                          "gleichwertigen, aber NICHT bitgleichen Datenstrom.")
     ap.add_argument("--thermal-test", action="store_true",
-                    help="Diagnose: Anbieter, Rechte, 5 Messungen, nach Enter Luefter 10 s voll und zurueck, Urteil in der "
-                         "letzten Zeile (braucht Administratorrechte; es laeuft nur der Test)")
+                    help="Diagnose: Anbieter, Rechte, 5 Messungen, nach Enter Lüfter 10 s voll und zurück, Urteil in der "
+                         "letzten Zeile; die Ausgabe steht auch in thermal_test.txt (braucht Administratorrechte; "
+                         "es läuft nur der Test)")
     ap.add_argument("--als-administrator", action="store_true",
-                    help="nur mit --thermal-test: den Test in einer Administrator-Konsole starten (Windows fragt per UAC)")
+                    help="nur mit --thermal-test: den Test in einer Administrator-Konsole starten (Windows fragt nach der Bestätigung)")
     ap.add_argument("--mxf-info", metavar="DATEI", help="Header-Metadaten einer MXF-Datei ausgeben (Diagnose)")
     ap.add_argument("--verify", metavar="ZIEL", help="Ziel-XDROOT (oder Elternordner) pruefen")
     ap.add_argument("--source", dest="verify_source", metavar="QUELLE", help="mit --verify: zusaetzlich gegen Quelle vergleichen")
@@ -137,18 +148,21 @@ def main(argv=None) -> int:
                 rc = elevate.relaunch_as_admin(True, elevate.THERMAL_SCRIPT, out=say)
                 return 0 if rc == 0 else elevate.EXIT_ELEVATION_FAILED
             # schon erhoeht: Test direkt in diesem Fenster, am Ende bleibt es bis Enter offen (Ergebnis lesbar)
-            return elevate.run_with_enter_prompt(lambda: thermal.run_thermal_test(say))
-        return thermal.run_thermal_test(say)
+            return elevate.run_with_enter_prompt(lambda: thermal.run_thermal_test_logged(say))
+        return thermal.run_thermal_test_logged(say)
 
     if args.mxf_info:
         from . import mxfheader
+        if os.path.isdir(args.mxf_info):
+            print(f"FEHLER: '{args.mxf_info}' ist ein Ordner, keine MXF-Datei.", file=sys.stderr)
+            return 2
         try:
             print(mxfheader.describe(args.mxf_info))
         except mxfheader.MxfParseError as e:
             print(f"FEHLER: {e}", file=sys.stderr)
             return 1
         except OSError as e:
-            print(f"FEHLER: Die Datei '{args.mxf_info}' kann nicht gelesen werden ({e.strerror or e}).", file=sys.stderr)
+            print(f"FEHLER: {_os_message(e, args.mxf_info)}", file=sys.stderr)
             return 2
         return 0
 
@@ -158,10 +172,10 @@ def main(argv=None) -> int:
             rep = verify.verify_card(args.verify, args.verify_source, deep=args.deep, log=lambda s: print(s, flush=True),
                                      cancel=cancel, threads=args.threads)
         except FileNotFoundError as e:  # Ordner fehlt / kein XDROOT darin (die Meldung nennt den Pfad)
-            print(f"FEHLER: {e}", file=sys.stderr)
+            print(f"FEHLER: {e if e.errno is None else _os_message(e, e.filename or args.verify)}", file=sys.stderr)
             return 2
         except OSError as e:
-            print(f"FEHLER: Die Daten konnten nicht gelesen werden ({e.strerror or e}).", file=sys.stderr)
+            print(f"FEHLER: {_os_message(e, e.filename or args.verify)}", file=sys.stderr)
             return 2
         print(rep.text())
         return 0 if rep.ok else 1

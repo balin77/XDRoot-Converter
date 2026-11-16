@@ -78,6 +78,9 @@ class BatStaticTests(unittest.TestCase):
             txt = (ROOT / name).read_text(encoding="ascii")
             self.assertNotIn("if errorlevel 1 (", txt)
             self.assertIn('if "%RC%"=="3" goto :elevfail', txt)
+            self.assertIn('if "%RC%"=="0" exit /b 0', txt)
+            self.assertIn("goto :startfail", txt)
+            self.assertIn("Start fehlgeschlagen (Code %RC%).", txt)
             self.assertNotIn("||", txt, "kein '|| ( ... )'-Block")
             self.assertIn(":nodir", txt)
 
@@ -133,14 +136,24 @@ class BatRunTests(unittest.TestCase):
                 rc, out = self.run_bat(name, 0)
                 self.assertEqual(rc, 0, out)
                 self.assertNotIn("abgebrochen oder ist fehlgeschlagen", out)
-            with self.subTest(bat=name, case="Ergebnis negativ / Absturz"):
+            with self.subTest(bat=name, case="Code 1"):
                 rc, out = self.run_bat(name, 1)
                 self.assertEqual(rc, 1, out)
-                self.assertNotIn("abgebrochen oder ist fehlgeschlagen", out, "kein Hinweis, wenn der Test lief")
+                self.assertNotIn("abgebrochen oder ist fehlgeschlagen", out)
+                if name.startswith("Temperatur"):  # das Python-Skript hat selbst auf Enter gewartet: kein zweites pause
+                    self.assertNotIn("Start fehlgeschlagen", out)
+                else:
+                    self.assertIn("Start fehlgeschlagen (Code 1)", out)
+            with self.subTest(bat=name, case="anderer Code"):
+                rc, out = self.run_bat(name, 2)
+                self.assertEqual(rc, 2, out)
+                self.assertIn("Start fehlgeschlagen (Code 2)", out)
+                self.assertNotIn("abgebrochen oder ist fehlgeschlagen", out)
             with self.subTest(bat=name, case="Erhoehung abgelehnt"):
                 rc, out = self.run_bat(name, elevate.EXIT_ELEVATION_FAILED)
                 self.assertEqual(rc, 1, out)
                 self.assertIn("abgebrochen oder ist fehlgeschlagen", out)
+                self.assertNotIn("Start fehlgeschlagen", out)
 
     def test_no_python_gives_readable_message(self):
         sysdir = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
@@ -331,8 +344,10 @@ class StateFileValidationTests(unittest.TestCase):
             p.open()
             can, note = p.fan_control_info()
             self.assertFalse(can)
-            self.assertIn(str(store.path), note)
-            self.assertIn(f"Versuch {n} von 3", note)
+            self.assertNotIn(str(store.path), note, "Pfad nur im Protokoll")
+            msgs = " ".join(t for _l, t in p.take_messages())
+            self.assertIn(str(store.path), msgs)
+            self.assertIn(f"Versuch {n})", msgs)
             self.assertEqual(json.loads(store.path.read_text(encoding="utf-8"))["attempts"], n)
         # Versuch 3: Datei wird verworfen, klare Warnung, die Steuerung ist frei
         p = legion(h, state_store=store)
@@ -647,8 +662,11 @@ class ThermalTestInterruptTests(unittest.TestCase):
                     mock.patch("traceback.print_exc"), mock.patch("builtins.print"):
                 self.assertEqual(mod.main(), 1, exc)
             self.assertEqual(len(asked), 1, exc)
-        with mock.patch.object(cli, "main", side_effect=SystemExit(5)), self.assertRaises(SystemExit):
-            mod.main()
+        asked = []
+        with mock.patch.object(cli, "main", side_effect=SystemExit(5)),                 mock.patch("builtins.input", lambda p="": asked.append(p) or ""):
+            self.assertEqual(mod.main(), 5, "SystemExit: erst Enter, dann derselbe Exit-Code")
+        self.assertEqual(len(asked), 1)
+        self.assertIn("drücken", asked[0])
 
 
 # --------------------------------------------------------------------------- M5: Wirkungspruefung

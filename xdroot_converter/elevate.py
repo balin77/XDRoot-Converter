@@ -62,7 +62,7 @@ def relaunch_as_admin(console: bool, script_name: str = GUI_SCRIPT, project_dir:
                       executable: Optional[str] = None) -> int:
     """Startet ``<Projektordner>/<script_name>`` erhoeht.  0 = Erhoehung angestossen, 1 = abgelehnt/fehlgeschlagen."""
     if sys.platform != "win32" and shell_execute is None:
-        out("Der Start mit Administratorrechten ist nur unter Windows moeglich.")
+        out("Der Start mit Administratorrechten ist nur unter Windows möglich.")
         return 1
     pd = Path(project_dir) if project_dir is not None else PROJECT_DIR
     script = (pd / script_name).resolve()
@@ -72,7 +72,7 @@ def relaunch_as_admin(console: bool, script_name: str = GUI_SCRIPT, project_dir:
     try:
         exe = interpreter_for(console, executable)
     except InterpreterNotFound as e:
-        out(f"{e} Der Start mit Administratorrechten ist nicht moeglich.")
+        out(f"{e} Der Start mit Administratorrechten ist nicht möglich.")
         return 1
     fn = shell_execute or _shell_execute
     try:
@@ -116,7 +116,7 @@ def start_detached(script_name: str = GUI_SCRIPT, project_dir: Optional[Path] = 
     return 0
 
 
-def run_with_enter_prompt(run: Callable, prompt: str = "\nEnter druecken zum Schliessen ...",
+def run_with_enter_prompt(run: Callable, prompt: str = "\nEnter drücken zum Schließen ...",
                           out: Callable = print) -> int:
     """Fuehrt ``run()`` (liefert einen Exit-Code) aus und wartet am Ende IMMER auf Enter, damit ein Konsolenfenster offen
     bleibt - auch nach Strg+C oder einer Ausnahme.  SystemExit wird ohne Abfrage durchgereicht."""

@@ -1169,7 +1169,7 @@ class Converter:
             sess.stop()
         except Exception as e:  # noqa: BLE001
             try:
-                self.warn(f"Temperaturueberwachung konnte nicht sauber beendet werden: {e}")
+                self.warn(f"Temperaturüberwachung konnte nicht sauber beendet werden: {e}")
             except Exception:  # noqa: BLE001
                 pass
         try:

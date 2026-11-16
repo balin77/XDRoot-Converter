@@ -460,7 +460,7 @@ class StateFileTests(unittest.TestCase):
             p.open()
             can, note = p.fan_control_info()
             self.assertFalse(can)
-            self.assertIn("Zustandsdatei", note)
+            self.assertIn("nicht gesichert", note)
             with self.assertRaises(thermal.ProviderError):
                 p.fan_full()
             self.assertEqual(h.writes(), [])
@@ -540,7 +540,7 @@ class StateFileTests(unittest.TestCase):
         p.open()
         can, note = p.fan_control_info()
         self.assertFalse(can)
-        self.assertIn("nicht wiederherstellbar", note)
+        self.assertIn("vorheriger Lauf nicht sauber beendet", note)
         self.assertTrue(store.path.exists())
 
     def test_corrupt_file_is_removed_with_warning(self):
