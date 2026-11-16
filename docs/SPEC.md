@@ -469,7 +469,7 @@ Ergänzungen nach den Reviews (verbindlich):
 
 Befund am Lenovo Legion Pro 7 16IRX8H (mit Administratorrechten): `LENOVO_GAMEZONE_DATA.GetCPUTemp` antwortet, liefert aber
 `Data=0` (unplausibel, deshalb „nicht verfügbar“). Der Legion-Anbieter hat deshalb eine **Quellenkette**; die erste Quelle mit
-plausiblem Wert (über 0 bis 125 °C) bei der Öffnung gilt für den ganzen Lauf und wird einmal im Protokoll genannt
+plausiblem Wert (über 0 bis 125 °C; bei der Quellenwahl zusätzlich mindestens 20 °C, siehe „Untergrenze der Quellenwahl“) bei der Öffnung gilt für den ganzen Lauf und wird einmal im Protokoll genannt
 („Temperaturquelle: …“). Fällt sie im Lauf aus, gilt das normale Verhalten bei Messausfällen (kein stilles Umschalten).
 Alle Quellen sind **nur lesend**; es kommt kein neuer Schreibaufruf hinzu (`SetFeatureValue` weiter nur für `0x04020000` mit 0/1).
 
@@ -489,15 +489,32 @@ unverändert die Grenze über 0 bis 125 °C.
 „CPU 71 °C (Quelle unbestätigt)“. Bei c/d ist die Protokollzeile zur Quelle eine **Warnung** („Schwellen gelten für die CPU; die
 Zone liegt meist darunter – Schutz eingeschränkt, ggf. CPU-Kerne begrenzen“), und `--thermal-test` hängt „nur grobe
 Thermalzone – Schutz eingeschränkt“ (c/d) bzw. „Temperaturquelle unbestätigt“ (b) an das Urteil. **Konstant-Wächter** (nur b, c,
-d): Liefert die gewählte Quelle 36 Messungen in Folge (3 min) exakt denselben Wert, gilt sie als ausgefallen (Lüfter zurück,
-„Temperatur nicht verfügbar: Temperaturquelle liefert einen konstanten Wert“, Umwandlung läuft weiter).
+d): Liefert die gewählte Quelle 36 Messungen in Folge (3 min) exakt denselben Wert, gilt sie **nur dann** als ausgefallen
+(Lüfter zurück, „Temperatur nicht verfügbar: Temperaturquelle liefert einen konstanten Wert“, Umwandlung läuft weiter), wenn
+(1) sich der Wert seit dem Öffnen der Quelle **nie** geändert hat (toter Festwert/falsch gedeutetes Flag) **und** (2) gerade
+weder eine Pause noch „Lüfter voll“ aktiv ist **und** (3) der Wert unter der Lüfter-Schwelle liegt. Hat sich der Wert schon
+einmal geändert, oder liegt er über der Schwelle bzw. ist Pause/Lüfter aktiv, löst der Wächter **keinen** Ausfall aus (Pause
+und Lüfter bleiben, die normalen Regeln inkl. maximaler Pausendauer gelten), sondern schreibt höchstens **eine** Warnzeile je Lauf
+(„Temperaturquelle liefert seit 3 min denselben Wert – träge Quelle?“); die Überwachung läuft weiter.
+**Beschriftung:** Meldungen nennen die Quelle einheitlich als „CPU“ (a), „CPU (Quelle unbestätigt)“ (b) bzw. „Thermalzone
+(grob, nicht CPU)“ (c/d) – in der Pause-Statuszeile, den Pausen-Protokollzeilen, dem Überhitzungs-Abbruch („… kühlt nicht ab“)
+und in `--thermal-test`.
 
 **Robustheit/Sicherheit:** Hängt oder stirbt der Hilfsprozess bei einer Quelle oder der Drehzahl-Ausweichquelle, wird er neu
 gestartet und mit der nächsten Quelle weitergemacht; ein Fehler der Drehzahl-Ausweichquelle macht eine funktionierende
-Temperaturquelle nie unverfügbar. Das PowerShell-Skript (läuft als Administrator) hat eine **feste Erlaubnisliste**:
+Temperaturquelle nie unverfügbar. **Drehzahl im Lauf:** Hängt oder fehlert das Lesen der Drehzahl (Hauptquelle oder Ausweichquelle)
+im Lauf, wird die schon gelesene Temperatur **nicht verworfen**: Der Hilfsprozess wird (innerhalb von `MAX_HELPER_RESTARTS`) neu
+gestartet und die Messung geht ohne Drehzahl weiter; beim 2. Mal wird die Drehzahlquelle für den Rest des Laufs abgeschaltet
+(eine Info-Zeile im Protokoll). **Lüftersteuerung beim Öffnen:** Hängt/fehlert das Lesen von `GetFeatureValue(0x04020000)` beim
+Öffnen, wird der Hilfsprozess neu gestartet und einmal wiederholt; scheitert das erneut, bleibt der Anbieter verfügbar, nur die
+Lüftersteuerung entfällt (Status „Lüftersteuerung nicht verfügbar (Hilfsprozess antwortete nicht beim Lesen der Kennung)“;
+Anzeige und Pause funktionieren). **Einzelne Fehler im Lauf:** Eine Fehlerantwort der Temperaturquelle (`HelperRemoteError`) zählt
+wie ein unplausibler Wert (`bad_limit`, Standard 3 in Folge), erst danach gilt die Überwachung als ausgefallen. **Zeitlimit:**
+`READ PERF` darf bei der Öffnungsprüfung der Quelle d 20 s brauchen (im Lauf 10 s). Das PowerShell-Skript (läuft als Administrator) hat eine **feste Erlaubnisliste**:
 `LENOVO_GAMEZONE_DATA` {GetCPUTemp, GetFan1Speed, GetFan2Speed, GetFanMaxSpeed, GetSmartFanMode}; `LENOVO_OTHER_METHOD.GetFeatureValue`
 nur mit `IDs` ∈ {0x04020000, 0x05040000, 0x04030001, 0x04030002}; `SetFeatureValue` nur mit `IDs=0x04020000` und `value` 0 oder 1.
-Alles andere endet vor jedem CIM-Aufruf mit `BadArgs`.
+Alles andere endet vor jedem CIM-Aufruf mit `BadArgs`; Parameternamen gelten streng und gross/klein-genau (nur exakt `IDs` und
+`value`, jeder höchstens einmal).
 
 Der Hilfsprozess kennt dafür zwei feste lesende Befehle (`READ ACPI`, `READ PERF`). **Drehzahl:** liefern `GetFan1Speed`/
 `GetFan2Speed` keinen plausiblen Wert (100–12000 U/min), dient `GetFeatureValue(0x04030001/0x04030002)` (unbestätigt) als

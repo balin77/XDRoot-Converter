@@ -99,10 +99,14 @@ KELVIN_OFFSET = 273.15
 # Temperaturen (GetFeatureValue liefert je Kennung beliebige Zahlen).  Im Lauf gilt weiter die Grenze von ``plausible``.
 TEMP_SOURCE_MIN_C = 20.0
 # Konstant-Wächter für die Quellen b, c, d: liefert die gewählte Quelle so viele Messungen in Folge exakt denselben Wert
-# (36 x 5 s = 3 min), gilt sie als ausgefallen.  Nicht für Quelle a (GetCPUTemp).
+# (36 x 5 s = 3 min), gilt sie NUR dann als ausgefallen, wenn sich der Wert seit dem Öffnen nie geändert hat UND gerade
+# weder Pause noch "Lüfter voll" aktiv sind UND der Wert unter der Lüfter-Schwelle liegt; sonst nur eine Warnzeile je Lauf.
+# Nicht für Quelle a (GetCPUTemp).
 CONSTANT_GUARD_COUNT = 36
 CONSTANT_GUARD_SOURCES = ("feature", "acpi", "perf")
 COARSE_SOURCES = ("acpi", "perf")  # Thermalzonen: grob, nicht die CPU selbst
+PERF_OPEN_TIMEOUT_S = 20.0  # READ PERF kann beim ersten Aufruf (Öffnungsprüfung der Quelle d) langsam sein; im Lauf gilt HELPER_TIMEOUT_S
+RPM_FAIL_LIMIT = 2  # Fehler/Hänger der Drehzahlquelle im Lauf: ab dem 2. Mal wird sie für den Rest des Laufs abgeschaltet
 # Quellenkette der CPU-Temperatur: (Schlüssel, Beschriftung).  Die erste Quelle mit plausiblem Wert gilt für den Lauf.
 TEMP_SOURCES = (
     ("gamezone", "Lenovo GetCPUTemp"),
@@ -291,6 +295,16 @@ def fmt_span(seconds: float) -> str:
     return f"{seconds:.0f} s" if seconds < 120 else f"{seconds / 60:.0f} min"
 
 
+def source_name(source: str = "") -> str:
+    """Bezeichnung der Temperaturquelle für Meldungen: 'CPU' (Standard/Quelle a), 'CPU (Quelle unbestätigt)' (b) oder
+    'Thermalzone (grob, nicht CPU)' (c/d)."""
+    if source in COARSE_SOURCES:
+        return "Thermalzone (grob, nicht CPU)"
+    if source == "feature":
+        return "CPU (Quelle unbestätigt)"
+    return "CPU"
+
+
 def format_status(m: Messung, fan_full: bool = False, paused: bool = False, cfg: Optional[ThermalConfig] = None,
                   fan_effect: str = "confirmed", fan_reason: str = "") -> str:
     """Statuszeile der Oberfläche, z. B. 'CPU 87 °C · Lüfter 4800/5100 U/min · Lüfter voll'.
@@ -300,9 +314,11 @@ def format_status(m: Messung, fan_full: bool = False, paused: bool = False, cfg:
     ``fan_reason``: Grund, warum die Lüftersteuerung nicht verfügbar ist (wird angehängt)."""
     cfg = cfg or ThermalConfig()
     t = m.cpu_temp_c
-    if paused:
-        return f"Pause wegen Temperatur ({t:.0f} °C), weiter unter {cfg.resume_c:.0f} °C"
     src = getattr(m, "source", "")
+    if paused:
+        if src in COARSE_SOURCES or src == "feature":
+            return f"Pause wegen Temperatur – {source_name(src)} {t:.0f} °C, weiter unter {cfg.resume_c:.0f} °C"
+        return f"Pause wegen Temperatur ({t:.0f} °C), weiter unter {cfg.resume_c:.0f} °C"
     if src in COARSE_SOURCES:
         parts = [f"Thermalzone {t:.0f} °C (grob, nicht CPU)"]
     elif src == "feature":
@@ -420,7 +436,9 @@ function Handle([string]$cmd) {
   if ($cls -notmatch '^LENOVO_[A-Z_]+$' -or $m -notmatch '^[A-Za-z0-9_]+$') { throw 'BadArgs' }
   $prm = @{}
   for ($i = 3; $i -lt $t.Count; $i++) {
-    if ($t[$i] -notmatch '^([A-Za-z]+)=([0-9]{1,10})$') { throw 'BadArgs' }
+    # Parameternamen streng und gross/klein-genau: nur exakt IDs und value, jeder höchstens einmal
+    if ($t[$i] -cnotmatch '^(IDs|value)=([0-9]{1,10})$') { throw 'BadArgs' }
+    if ($prm.ContainsKey($Matches[1])) { throw 'BadArgs' }
     $prm[$Matches[1]] = [uint32]$Matches[2]
   }
   # Feste Erlaubnisliste (der Prozess läuft als Administrator): alles andere wird OHNE Aufruf abgelehnt.
@@ -910,6 +928,7 @@ class LegionProvider(ThermalProvider):
         self._aborted = False
         self._closing = False  # finish()/stop() läuft: kein Neustart des Hilfsprozesses mehr, Messung scheitert sofort
         self._restarts = 0  # Neustarts wegen Messfehlern in diesem Lauf
+        self._rpm_failures = 0  # Hänger/Abstürze beim Lesen der Drehzahl im Lauf
         self._token: Optional[str] = None  # Besitzerkennung der eigenen Zustandsdatei
         self._fan_mode = ""  # "feature" | ""
         self._fan_note = "Lüftersteuerung auf diesem Gerät nicht verfügbar"
@@ -1094,7 +1113,7 @@ class LegionProvider(ThermalProvider):
             raise ProviderError(f"GetFeatureValue(0x{feature_id:08X}) lieferte {v!r}")
         return v
 
-    def _read_zones(self, what: str) -> dict:
+    def _read_zones(self, what: str, timeout: Optional[float] = None) -> dict:
         """Feste lesende Abfrage des Hilfsprozesses ('ACPI' oder 'PERF'): {Feldname: [Zahlen]}.  Leere/nicht lesbare
         Einträge einer Zone (z. B. ein fehlendes Feld) werden weggelassen; ein fehlendes Feld ergibt eine leere Liste."""
         if what not in ("ACPI", "PERF"):
@@ -1103,7 +1122,10 @@ class LegionProvider(ThermalProvider):
         if helper is None:
             raise HelperError("Hilfsprozess nicht aktiv")
         try:
-            payload = helper.call(f"READ {what}")
+            if timeout is not None:
+                payload = helper.call(f"READ {what}", timeout=timeout)
+            else:
+                payload = helper.call(f"READ {what}")
         except HelperRemoteError as e:
             self._t(f"  WMI READ {what} -> FEHLER {e.code or '-'}: {e.message}")
             raise
@@ -1127,10 +1149,11 @@ class LegionProvider(ThermalProvider):
     def _fmt_list(values) -> str:
         return "; ".join(f"{x:.1f}" for x in values)
 
-    def _source_value(self, key: str) -> tuple:
+    def _source_value(self, key: str, opening: bool = False) -> tuple:
         """(Rohtext, umgerechnet als Text, Wert in °C) einer Temperaturquelle (nie None).  Wirft ``ThermalError``, wenn
         die Quelle nichts liefert.  Bei Zonenquellen zählt der höchste plausible Wert (gibt es keinen, der höchste Wert
-        überhaupt, damit der Regler ihn als unplausibel zählt)."""
+        überhaupt, damit der Regler ihn als unplausibel zählt).  ``opening``: Öffnungsprüfung (READ PERF darf beim ersten
+        Aufruf länger dauern: ``PERF_OPEN_TIMEOUT_S``)."""
         if key == "gamezone":
             v = self._data("GetCPUTemp")
             return str(v), f"{v} °C", float(v)
@@ -1144,7 +1167,7 @@ class LegionProvider(ThermalProvider):
             conv = [kelvin10_to_c(x) for x in raw]
             rawtxt = ",".join(f"{x:g}" for x in raw) + " (Zehntel-Kelvin)"
         elif key == "perf":
-            z = self._read_zones("PERF")
+            z = self._read_zones("PERF", PERF_OPEN_TIMEOUT_S if opening else None)
             kel, hp = z.get("Temperature", []), z.get("HighPrecisionTemperature", [])
             if not kel and not hp:
                 raise ProviderError("keine Thermalzone (Leistungszähler) gemeldet oder Felder fehlen")
@@ -1170,7 +1193,7 @@ class LegionProvider(ThermalProvider):
             head = f"  Temperaturquelle {chr(97 + i)}) {label}: "
             helper_dead = False
             try:
-                raw, conv, val = self._source_value(key)
+                raw, conv, val = self._source_value(key, opening=True)
             except HelperRemoteError as e:
                 if key == "gamezone" and _is_denied(e):
                     raise ProviderUnavailable(
@@ -1286,24 +1309,38 @@ class LegionProvider(ThermalProvider):
         try:
             self._fan_max_raw = self._data("GetFanMaxSpeed")
             self._fan_max = self._fan_max_raw
-        except ThermalError:
+        except ThermalError as e:
             self._fan_max = None
+            if isinstance(e, HelperError):
+                self._try_restart()  # die Temperaturquelle ist schon gewählt und darf nicht darunter leiden
         self._probe_fan_control()
 
     def _probe_fan_control(self) -> None:
         """Lüfterschaltung nur LESEND prüfen (kein Schreibaufruf ausser der Wiederherstellung nach einem
         abgebrochenen Lauf): Kennung lesbar?  Zustandsdatei schreibbar?  Anderer Lauf aktiv?"""
         self._fan_mode = ""
-        try:
-            self._feature_get()
-        except HelperError as e:
-            self._t(f"  Hilfsprozess ausgefallen: {e}")
-            raise ProviderUnavailable("Die Temperaturabfrage über PowerShell ist ausgefallen", "powershell") from e
-        except ThermalError as e:
-            self._fan_note = "Lüftersteuerung auf diesem Gerät nicht verfügbar"
-            self._messages.append(("detail", f"Lüfterkennung 0x{FEATURE_ID_FAN_FULL_SPEED:08X} nicht lesbar: "
-                                             f"{type(e).__name__}: {e}"))
-            return
+        for attempt in range(2):
+            try:
+                self._feature_get()
+                break
+            except HelperError as e:
+                # Die Temperaturquelle ist schon gewählt: ein Hänger/Absturz hier macht nur die Lüftersteuerung unverfügbar
+                # (Anzeige und Pause funktionieren weiter).  Hilfsprozess neu starten, einmal erneut versuchen.
+                self._t(f"  Hilfsprozess beim Lesen der Lüfterkennung ausgefallen: {e}")
+                if self._aborted or self._closing:
+                    raise ProviderUnavailable("Anbieter wurde beendet.", "other") from e
+                restarted = self._try_restart()
+                if attempt == 0 and restarted:
+                    continue
+                self._fan_note = "Lüftersteuerung nicht verfügbar (Hilfsprozess antwortete nicht beim Lesen der Kennung)"
+                self._messages.append(("detail", f"Lüfterkennung 0x{FEATURE_ID_FAN_FULL_SPEED:08X} nicht lesbar: "
+                                                 f"{type(e).__name__}: {e}"))
+                return
+            except ThermalError as e:
+                self._fan_note = "Lüftersteuerung auf diesem Gerät nicht verfügbar"
+                self._messages.append(("detail", f"Lüfterkennung 0x{FEATURE_ID_FAN_FULL_SPEED:08X} nicht lesbar: "
+                                                 f"{type(e).__name__}: {e}"))
+                return
         why = self._store.check_writable()
         if why:
             self._fan_note = "Lüftersteuerung nicht verfügbar (Lüfterzustand kann nicht gesichert werden)"
@@ -1408,18 +1445,48 @@ class LegionProvider(ThermalProvider):
         rpms = []
         if self._fan_source == "feature":
             fans = (("GetFeatureValue", FEATURE_ID_FAN1_SPEED), ("GetFeatureValue", FEATURE_ID_FAN2_SPEED))
+        elif self._fan_source == "off":
+            fans = ()  # Drehzahlquelle wegen wiederholter Fehler für den Rest des Laufs abgeschaltet
         else:
             fans = (("GetFan1Speed", None), ("GetFan2Speed", None))
+        failed = self._helper
         for m, fid in fans:
             if self._closing or self._aborted:
                 raise HelperError("Anbieter wird beendet")
             try:
                 rpms.append(self._data(m) if fid is None else self._feature_raw(fid))
-            except HelperError:
-                raise
+            except HelperBusy:
+                break  # Hilfsprozess gerade belegt (Zurückstellen): diese Messung ohne Drehzahl, nichts anfassen
+            except HelperError as e:
+                # Die Temperatur ist schon gelesen und darf nicht verworfen werden: Drehzahlfehler zählen nur für die Drehzahl
+                self._rpm_failed(failed, e)
+                rpms = []
+                break
             except ThermalError:
                 pass  # Drehzahl ist nur Anzeige
         return Messung(float(cpu), tuple(rpms), self._fan_max, self._temp_source)
+
+    def _rpm_failed(self, failed, e: Exception) -> None:
+        """Hänger/Absturz des Hilfsprozesses beim Lesen der Drehzahl: neu starten (innerhalb von ``MAX_HELPER_RESTARTS``), die
+        Messung geht ohne Drehzahl weiter; beim ``RPM_FAIL_LIMIT``-ten Mal wird die Drehzahlquelle für den Rest des
+        Laufs abgeschaltet.  Wirft nie."""
+        self._rpm_failures += 1
+        self._t(f"  Drehzahl lesen scheiterte ({e}); Messung ohne Drehzahl")
+        if self._closing or self._aborted:
+            return
+        try:
+            with self._rlock:
+                cur = self._helper
+                if cur is failed or cur is None or not getattr(cur, "alive", True):
+                    if self._restarts < MAX_HELPER_RESTARTS:
+                        self._restarts += 1
+                        self._restart_locked()
+        except Exception as e2:  # noqa: BLE001
+            self._t(f"  Neustart des Hilfsprozesses gescheitert: {type(e2).__name__}: {e2}")
+        if self._rpm_failures >= RPM_FAIL_LIMIT and self._fan_source != "off":
+            self._fan_source = "off"
+            self._messages.append(("info", "Die Drehzahlquelle hängt oder fällt aus und wird für den Rest des Laufs "
+                                           "abgeschaltet (die Temperaturüberwachung läuft weiter)."))
 
     def fan_control_info(self) -> tuple:
         return bool(self._fan_mode), self._fan_note
@@ -1638,6 +1705,9 @@ class ThermalController:
         self._bad = 0
         self._const_val: Optional[float] = None  # Konstant-Wächter (Quellen b, c, d)
         self._const_n = 0
+        self._const_changed = False  # seit dem Öffnen der Quelle schon einmal eine Änderung des Werts gesehen?
+        self._const_warned = False  # Warnzeile "denselben Wert" höchstens einmal je Lauf
+        self._src = ""  # Schlüssel der Quelle der letzten Messung (für Beschriftungen)
         self._up_fan = self._down_fan = self._up_pause = self._down_pause = 0
         self._pause_t0 = 0.0
         self._pause_log_t = 0.0
@@ -1710,8 +1780,24 @@ class ThermalController:
         except Exception as e:  # noqa: BLE001
             if self._finished or self._closing:
                 return  # der Lauf endet gerade: kein verspätetes "ausgefallen"
+            if isinstance(e, HelperRemoteError):
+                # Ein einzelner Fehler der Quelle (z. B. WMI meldet kurz "Fehler") zählt wie ein unplausibler Wert;
+                # erst bad_limit Fehler in Folge sind ein Ausfall.  Hänger/Absturz des Hilfsprozesses sind schon beim Anbieter
+                # (Neustart-Limit) behandelt und gelten sofort als Ausfall.
+                with self._act:
+                    if self._finished or self.failed or self.aborted:
+                        return
+                    self._bad += 1
+                    if self._bad >= self.cfg.bad_limit:
+                        self._fail("Die Temperaturmessung ist ausgefallen",
+                                   detail=f"{self._bad} Messfehler in Folge (zuletzt {type(e).__name__}: {e})")
+                    else:
+                        self._n("detail", f"Temperaturmessung fehlgeschlagen ({self._bad}/{self.cfg.bad_limit}): "
+                                          f"{type(e).__name__}: {e}")
+                return
             self._fail("Die Temperaturmessung ist ausgefallen", detail=f"{type(e).__name__}: {e}")
             return
+        self._drain()
         try:
             self._evaluate(m)
         except Exception as e:  # noqa: BLE001
@@ -1729,18 +1815,29 @@ class ThermalController:
                     self._fail("Die Temperaturmessung liefert unbrauchbare Werte", detail=f"{self._bad} unplausible Messungen in Folge (zuletzt {t} °C)")
                 return
             self._bad = 0
-            if getattr(m, "source", "") in CONSTANT_GUARD_SOURCES:
-                # Eine Quelle, die nie ihren Wert ändert (fester Wert, träge/tote Zone), schützt nicht: als ausgefallen werten
+            self._src = getattr(m, "source", "") or ""
+            c = self.cfg
+            if self._src in CONSTANT_GUARD_SOURCES:
+                # Konstant-Wächter.  Ausfall NUR bei einem toten Festwert (seit dem Öffnen NIE eine Änderung gesehen) und
+                # wenn der Schutz gerade nichts zu tun hat (keine Pause, kein "Lüfter voll", Wert unter der Lüfter-Schwelle).
+                # Sonst höchstens eine Warnzeile je Lauf: eine träge Zone über der Schwelle darf Pause/Lüfter nie aufheben.
                 if self._const_val is not None and t == self._const_val:
                     self._const_n += 1
                 else:
+                    if self._const_val is not None:
+                        self._const_changed = True
                     self._const_val, self._const_n = t, 1
                 if self._const_n >= CONSTANT_GUARD_COUNT:
-                    self._fail("Temperaturquelle liefert einen konstanten Wert",
-                               detail=f"{self._const_n} Messungen in Folge exakt {t} °C ({m.source})")
-                    return
+                    if not self._const_changed and not self.paused and not self.fan_full and t < c.fan_on_c:
+                        self._fail("Temperaturquelle liefert einen konstanten Wert",
+                                   detail=f"{self._const_n} Messungen in Folge exakt {t} °C ({m.source}), "
+                                          "nie eine Änderung gesehen")
+                        return
+                    if not self._const_warned:
+                        self._const_warned = True
+                        self._n("warn", f"Temperaturquelle liefert seit {fmt_span(CONSTANT_GUARD_COUNT * DEFAULT_INTERVAL_S)} "
+                                        "denselben Wert – träge Quelle?")
             self.last = m
-            c = self.cfg
             if self.stats.max_cpu_c is None or t > self.stats.max_cpu_c:
                 self.stats.max_cpu_c = float(t)
 
@@ -1801,16 +1898,17 @@ class ThermalController:
             return True
         if now - self._pause_log_t >= self.cfg.pause_log_s:
             self._pause_log_t = now
-            self._n("warn", f"Pause dauert seit {fmt_span(elapsed)}, CPU {t:.0f} °C (weiter unter {self.cfg.resume_c:g} °C).")
+            self._n("warn", f"Pause dauert seit {fmt_span(elapsed)}, {source_name(self._src)} {t:.0f} °C "
+                            f"(weiter unter {self.cfg.resume_c:g} °C).")
         return False
 
     def _overheat_abort(self, t: float, elapsed: float) -> None:
-        reason = (f"Abgebrochen: CPU kühlt nicht ab ({t:.0f} °C nach {fmt_span(elapsed)} Pause). Rechner abkühlen "
+        reason = (f"Abgebrochen: {source_name(self._src)} kühlt nicht ab ({t:.0f} °C nach {fmt_span(elapsed)} Pause). Rechner abkühlen "
                   "lassen, Lüftung prüfen, dann erneut starten (setzt fort); ggf. 'CPU-Kerne begrenzen' einstellen.")
         self.aborted = reason
         self.stats.abort_reason = reason
         self._end_pause()  # Zeit zählen und fortsetzen, dann sauber abbrechen (wie ein Benutzer-Abbruch)
-        self._s(f"CPU {t:.0f} °C - {reason}", "unavailable")
+        self._s(f"{source_name(self._src)} {t:.0f} °C - {reason}", "unavailable")
         if self._on_abort is not None:
             try:
                 self._on_abort(reason)
@@ -2261,7 +2359,7 @@ def run_thermal_test(out: Callable = print, provider_factory: Optional[Callable]
                 m = prov.measure()
                 last_any = m
                 ok = plausible(m.cpu_temp_c)
-                out(f"  Messung {i + 1}: CPU {m.cpu_temp_c:g} °C, Lüfter {_fmt_rpm(m)}" + ("" if ok else "  <- UNPLAUSIBEL"))
+                out(f"  Messung {i + 1}: {source_name(getattr(m, 'source', ''))} {m.cpu_temp_c:g} °C, Lüfter {_fmt_rpm(m)}" + ("" if ok else "  <- UNPLAUSIBEL"))
                 if ok:
                     last = m
                 else:
@@ -2305,7 +2403,7 @@ def run_thermal_test(out: Callable = print, provider_factory: Optional[Callable]
                     try:
                         m = prov.measure()
                         during.append(m)
-                        out(f"  während voll: CPU {m.cpu_temp_c:g} °C, Lüfter {_fmt_rpm(m)}")
+                        out(f"  während voll: {source_name(getattr(m, 'source', ''))} {m.cpu_temp_c:g} °C, Lüfter {_fmt_rpm(m)}")
                     except ThermalError as e:
                         out(f"  während voll: FEHLER {e}")
             except KeyboardInterrupt:
@@ -2339,7 +2437,7 @@ def run_thermal_test(out: Callable = print, provider_factory: Optional[Callable]
                     if announce:
                         try:
                             after = prov.measure()
-                            out(f"  Drehzahl NACHHER: CPU {after.cpu_temp_c:g} °C, Lüfter {_fmt_rpm(after)}")
+                            out(f"  Drehzahl NACHHER: {source_name(getattr(after, 'source', ''))} {after.cpu_temp_c:g} °C, Lüfter {_fmt_rpm(after)}")
                         except ThermalError:
                             pass
         warn = ("" if restore_ok is not False else
