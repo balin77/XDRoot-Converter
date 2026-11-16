@@ -1262,6 +1262,15 @@ def _length(v: Optional[bytes]) -> Optional[int]:
     return struct.unpack(">q", v)[0] if v is not None and len(v) == 8 else None
 
 
+_INT64_MAX = (1 << 63) - 1
+
+
+def _pack_length(v: int) -> Optional[bytes]:
+    """Int64 (big endian) fuer eine Laenge/Dauer; None, wenn der Wert ausserhalb 0..2^63-1 liegt (kaputtes Ziel/Quelle)
+    - struct.pack wuerde sonst struct.error werfen."""
+    return struct.pack(">q", v) if 0 <= v <= _INT64_MAX else None
+
+
 def _derive_sound_duration(tgt: HeaderMetadata, ts: Structure, track: TrackView, new_rate: Fraction) -> Optional[int]:
     """ContainerDuration (in Samples der neuen Rate) aus dem Ziel ableiten: Bild-Deskriptor-ContainerDuration
     und Sequenzdauer der Ton-Spur.  Nur wenn alle verfuegbaren Quellen denselben ganzzahligen Wert ergeben."""
@@ -1271,17 +1280,18 @@ def _derive_sound_duration(tgt: HeaderMetadata, ts: Structure, track: TrackView,
         pd = tdesc.get(id(pt.set))
         if pd is None:
             continue
-        cd, pr = _length(tgt.get(pd, _CD)), _rate(tgt.get(pd, _SR))
-        if cd is not None and pr:
+        cd, pr = _length(tgt.get(pd, _CD)), _usable_rate(tgt.get(pd, _SR))
+        if cd is not None and cd >= 0 and pr:
             cands.append(cd * new_rate / pr)
     if track.sequence is not None:
         dur = _length(tgt.get(track.sequence, "StructuralComponent.Duration"))
-        er = _rate(tgt.get(track.set, "Track.EditRate"))
-        if dur is not None and er:
+        er = _usable_rate(tgt.get(track.set, "Track.EditRate"))
+        if dur is not None and dur >= 0 and er:
             cands.append(dur * new_rate / er)
     if not cands or len(set(cands)) != 1 or cands[0].denominator != 1:
         return None
-    return int(cands[0])
+    iv = int(cands[0])
+    return iv if 0 <= iv <= _INT64_MAX else None
 
 
 def _sound_rate_and_duration(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, n: int, track: TrackView,
@@ -1307,8 +1317,9 @@ def _sound_rate_and_duration(tgt: HeaderMetadata, src: HeaderMetadata, ts: Struc
         cd = _length(t_cd)
         if cd is not None and cd >= 0 and old_r is not None:
             v = cd * new_r / old_r
-            if v.denominator == 1:
-                keep[_CD] = struct.pack(">q", int(v))
+            packed = _pack_length(int(v)) if v.denominator == 1 else None
+            if packed is not None:
+                keep[_CD] = packed
                 return
         v = _derive_sound_duration(tgt, ts, track, new_r)
         if v is None:

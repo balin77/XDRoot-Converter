@@ -3,6 +3,10 @@
   python -m xdroot_converter.cli <quelle> <ziel> [--bitrate 50] [--preset medium] [--max-frames N]
   python -m xdroot_converter.cli --verify <ziel-xdroot> [--source <quell-xdroot>] [--deep]
   python -m xdroot_converter.cli --mxf-info <datei.MXF>
+  python -m xdroot_converter.cli --thermal-test        (Diagnose Temperatur/Luefter; Administrator-Konsole)
+
+Temperaturueberwachung: --thermal auto|off (Standard auto), --temp-fan GRAD, --temp-pause GRAD;
+Schonmodus: --threads N (ffmpeg-Threads begrenzen).
 """
 
 from __future__ import annotations
@@ -13,13 +17,17 @@ import signal
 import sys
 import time
 
-from . import converter, tools, verify
+from . import converter, thermal, tools, verify
 
 
 class CliReporter(converter.Reporter):
     def __init__(self, verbose: bool = False) -> None:
         self._last = 0.0
         self.verbose = verbose
+        self._temp_text = ""  # letzte Temperatur-Statuszeile (wird an die Fortschrittszeile angehaengt)
+
+    def thermal_status(self, text: str, state: str) -> None:
+        self._temp_text = text if state in ("ok", "fan", "pause") else ""
 
     def log(self, level: str, msg: str) -> None:
         if level == "detail" and not self.verbose:
@@ -33,7 +41,36 @@ class CliReporter(converter.Reporter):
             return
         self._last = now
         eta = f", Rest ca. {converter.fmt_duration(eta_s)}" if eta_s else ""
-        print(f"  [{clip_name}] {clip_frac * 100:5.1f} % - gesamt {total_frac * 100:5.1f} %{eta} {text}", flush=True)
+        temp = f" | {self._temp_text}" if self._temp_text else ""
+        print(f"  [{clip_name}] {clip_frac * 100:5.1f} % - gesamt {total_frac * 100:5.1f} %{eta} {text}{temp}", flush=True)
+
+
+THREADS_MAX = 256  # wie die Oberflaeche
+
+
+def _positive_int(text: str) -> int:
+    try:
+        v = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{text}' ist keine ganze Zahl") from None
+    if v < 1:
+        raise argparse.ArgumentTypeError("muss mindestens 1 sein")
+    if v > THREADS_MAX:
+        raise argparse.ArgumentTypeError(f"darf hoechstens {THREADS_MAX} sein")
+    return v
+
+
+def _temp_value(text: str) -> float:
+    """Argumenttyp fuer eine Temperaturschwelle: nur die Zahl.  Die Grenzen (wie in der Oberflaeche) werden erst nach dem
+    Parsen mit ``thermal.check_limits`` geprueft, und nur bei eingeschalteter Ueberwachung (--thermal off prueft nichts).
+    (argparse setzt den Optionsnamen selbst vor die Meldung.)"""
+    try:
+        v = float(text.replace(",", "."))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{text}' ist keine Zahl") from None
+    if v != v or v in (float("inf"), float("-inf")):
+        raise argparse.ArgumentTypeError(f"'{text}' ist keine gueltige Temperatur")
+    return v
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,6 +91,22 @@ def build_parser() -> argparse.ArgumentParser:
                     help="MXF-Kopfdaten NICHT an die Quelle angleichen (Ausgabe traegt dann bmx-Kennungen und bmx-Track-IDs)")
     ap.add_argument("--verbose", action="store_true",
                     help="auch Einzelheiten ausgeben (z. B. jede Aenderung der MXF-Kopfdaten); sie stehen immer in konvertierung.log")
+    ap.add_argument("--thermal", choices=["auto", "off"], default="auto",
+                    help="Temperaturueberwachung (Messung, Luefter voll, Pause); auto = nur wenn ein Anbieter nutzbar ist "
+                         "(Standard), sonst laeuft alles unveraendert")
+    ap.add_argument("--temp-fan", type=_temp_value, default=thermal.DEFAULT_FAN_ON_C, metavar="GRAD",
+                    help=f"Luefter voll ab dieser CPU-Temperatur (Standard {thermal.DEFAULT_FAN_ON_C:g} °C; zurück 10 °C darunter; erlaubt {thermal.TEMP_FAN_MIN:.0f} bis {thermal.TEMP_FAN_MAX:.0f})")
+    ap.add_argument("--temp-pause", type=_temp_value, default=thermal.DEFAULT_PAUSE_C, metavar="GRAD",
+                    help=f"ffmpeg anhalten ab dieser CPU-Temperatur (Standard {thermal.DEFAULT_PAUSE_C:g} °C; weiter 12 °C darunter; erlaubt {thermal.TEMP_PAUSE_MIN:.0f} bis {thermal.TEMP_PAUSE_MAX:.0f})")
+    ap.add_argument("--threads", type=_positive_int, default=None, metavar="N",
+                    help="Schonmodus: ffmpeg hoechstens N Threads (1 bis 256; Decoder und Encoder; auch bei --verify --deep) - weniger "
+                         "Waerme, dauert laenger (Standard: unbegrenzt). Achtung: x264 mit anderer Kernzahl erzeugt einen "
+                         "gleichwertigen, aber NICHT bitgleichen Datenstrom.")
+    ap.add_argument("--thermal-test", action="store_true",
+                    help="Diagnose: Anbieter, Rechte, 5 Messungen, nach Enter Luefter 10 s voll und zurueck, Urteil in der "
+                         "letzten Zeile (braucht Administratorrechte; es laeuft nur der Test)")
+    ap.add_argument("--als-administrator", action="store_true",
+                    help="nur mit --thermal-test: den Test in einer Administrator-Konsole starten (Windows fragt per UAC)")
     ap.add_argument("--mxf-info", metavar="DATEI", help="Header-Metadaten einer MXF-Datei ausgeben (Diagnose)")
     ap.add_argument("--verify", metavar="ZIEL", help="Ziel-XDROOT (oder Elternordner) pruefen")
     ap.add_argument("--source", dest="verify_source", metavar="QUELLE", help="mit --verify: zusaetzlich gegen Quelle vergleichen")
@@ -69,23 +122,57 @@ def main(argv=None) -> int:
             pass
     args = build_parser().parse_args(argv)
 
+    if args.als_administrator and not args.thermal_test:
+        build_parser().error("--als-administrator gibt es hier nur zusammen mit --thermal-test")
+    if args.thermal_test:
+        if args.source or args.target:
+            print("Hinweis: --thermal-test ist eine reine Diagnose - es laeuft NUR der Test, keine Umwandlung "
+                  "(Quelle/Ziel werden ignoriert).", flush=True)
+        say = lambda s="": print(s, flush=True)  # noqa: E731
+        if args.als_administrator:
+            from . import elevate
+            if not thermal.is_admin():
+                # Erhoehung in einem neuen Konsolenfenster (start_thermal_test.py); dieses Fenster endet sofort.  Exit-Code 3 =
+                # Erhoehung abgelehnt/fehlgeschlagen (die .bat zeigt nur dann den Hinweis)
+                rc = elevate.relaunch_as_admin(True, elevate.THERMAL_SCRIPT, out=say)
+                return 0 if rc == 0 else elevate.EXIT_ELEVATION_FAILED
+            # schon erhoeht: Test direkt in diesem Fenster, am Ende bleibt es bis Enter offen (Ergebnis lesbar)
+            return elevate.run_with_enter_prompt(lambda: thermal.run_thermal_test(say))
+        return thermal.run_thermal_test(say)
+
     if args.mxf_info:
         from . import mxfheader
         try:
             print(mxfheader.describe(args.mxf_info))
-        except (mxfheader.MxfParseError, OSError) as e:
+        except mxfheader.MxfParseError as e:
             print(f"FEHLER: {e}", file=sys.stderr)
             return 1
+        except OSError as e:
+            print(f"FEHLER: Die Datei '{args.mxf_info}' kann nicht gelesen werden ({e.strerror or e}).", file=sys.stderr)
+            return 2
         return 0
 
     if args.verify:
         cancel = tools.CancelToken()
-        rep = verify.verify_card(args.verify, args.verify_source, deep=args.deep, log=lambda s: print(s, flush=True), cancel=cancel)
+        try:
+            rep = verify.verify_card(args.verify, args.verify_source, deep=args.deep, log=lambda s: print(s, flush=True),
+                                     cancel=cancel, threads=args.threads)
+        except FileNotFoundError as e:  # Ordner fehlt / kein XDROOT darin (die Meldung nennt den Pfad)
+            print(f"FEHLER: {e}", file=sys.stderr)
+            return 2
+        except OSError as e:
+            print(f"FEHLER: Die Daten konnten nicht gelesen werden ({e.strerror or e}).", file=sys.stderr)
+            return 2
         print(rep.text())
         return 0 if rep.ok else 1
 
     if not args.source or not args.target:
         build_parser().error("Quelle und Ziel angeben (oder --verify)")
+    if args.thermal != "off":  # wie die Oberflaeche: bei ausgeschalteter Ueberwachung werden die Grenzen nicht geprueft
+        try:
+            thermal.check_limits(args.temp_fan, args.temp_pause, "--temp-fan", "--temp-pause")
+        except ValueError as e:
+            build_parser().error(str(e))
     opts = converter.Options(
         source=args.source,
         target=args.target,
@@ -97,6 +184,10 @@ def main(argv=None) -> int:
         embed_xml=args.embed_xml,
         keep_anc=not args.no_anc,
         sony_header=not args.no_sony_header,
+        thermal=args.thermal,
+        temp_fan=args.temp_fan,
+        temp_pause=args.temp_pause,
+        threads=args.threads,
     )
     cancel = tools.CancelToken()
     hits = [0]
@@ -110,6 +201,7 @@ def main(argv=None) -> int:
         else:
             # zweites Strg+C: Kindprozesse hart beenden und sofort aussteigen (Sperre/Temp-Dateien raeumt der naechste Lauf auf)
             cancel.kill_all()
+            thermal.shutdown_all(timeout=4.0)  # Luefterzustand wiederherstellen, Hilfsprozess beenden (os._exit ueberspringt atexit)
             os._exit(130)
 
     for name in ("SIGINT", "SIGTERM", "SIGBREAK"):

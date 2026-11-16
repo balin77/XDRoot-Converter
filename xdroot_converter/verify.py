@@ -641,8 +641,10 @@ def tail_decode_check(path: str, frames: int, fps: Optional[Fraction], cancel: O
 # --------------------------------------------------------------------------- Tiefenpruefung
 
 
-def deep_decode_check(path: str, cancel: Optional[tools.CancelToken] = None) -> tuple[int, list[str]]:
-    """Dekodiert Video und Audio komplett; liefert (Videoframes, Fehlerzeilen)."""
+def deep_decode_check(path: str, cancel: Optional[tools.CancelToken] = None,
+                      threads: Optional[int] = None) -> tuple[int, list[str]]:
+    """Dekodiert Video und Audio komplett; liefert (Videoframes, Fehlerzeilen).  ``threads``: ffmpeg-Decoder-Threads
+    begrenzen (Schonmodus, None = unbegrenzt)."""
     frames = [0]
 
     def on_line(line: str) -> None:
@@ -654,7 +656,8 @@ def deep_decode_check(path: str, cancel: Optional[tools.CancelToken] = None) -> 
 
     res = tools.run_capture(
         [tools.find_tool("ffmpeg"), "-hide_banner", "-nostdin", "-v", "error", "-nostats",
-         "-progress", "pipe:1", "-i", path, "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"],
+         "-progress", "pipe:1", *(["-threads", str(int(threads))] if threads else []),
+         "-i", path, "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"],
         cancel=cancel,
         on_stdout_line=on_line,
         keep_lines=200,
@@ -787,6 +790,7 @@ def verify_card(
     deep: bool = False,
     log: Callable[[str], None] = lambda s: None,
     cancel: Optional[tools.CancelToken] = None,
+    threads: Optional[int] = None,
 ) -> VerifyReport:
     rep = VerifyReport()
     tgt = card.find_xdroot(target)
@@ -915,7 +919,8 @@ def verify_card(
                     prob(f"Decode-Test am Clip-Ende: {e}")
             if deep:
                 log(f"  Tiefenpruefung (kompletter Decode): {rel}")
-                n, errs = deep_decode_check(str(mxf_path), cancel=cancel)
+                n, errs = (deep_decode_check(str(mxf_path), cancel=cancel, threads=threads) if threads
+                           else deep_decode_check(str(mxf_path), cancel=cancel))
                 if errs:
                     prob(f"Decodierfehler: {errs[:3]}")
                 if n != info.duration:

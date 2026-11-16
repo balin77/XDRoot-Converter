@@ -265,11 +265,13 @@ Ausgabe von Version 1: 117 Abweichungen zur Quelle in 45 Sätzen; Runde 2: 30 Ab
 
 Grenzen: Belegt nur gegen eine **synthetische** Quelle (mit bmx erzeugt, auf Sony-Track-IDs gesetzt) und gegen die
 `mxf2raw`-Ausgaben echter Dateien; `MXFDump`-Ausgaben echter Kameradateien liegen nicht im Repository. Siehe Hinweis oben in
-`docs/MXF-VERGLEICH.md`. Fehlt noch: lokaler Lauf von `scripts/mxf_vergleich.py` mit F55-Quelle, FX6-Referenz und Ziel.
+`docs/MXF-VERGLEICH.md`. Der lokale Lauf von `scripts/mxf_vergleich.py` mit echter F55-Quelle, FX6-Referenz und Ziel ist am
+16.11.2026 nachgeholt: `docs/analysis/vergleich_f55_ziel_fx6.md` (20 Abweichungen Quelle ≠ Ziel, alle im Video-Deskriptor).
 
 ## Umsetzungsstand nach den Fix-Runden (Runde 2, ergänzt)
 
-Alles unten ist nur mit **synthetischem Material unter Linux** belegt (siehe `README.md`, „Getesteter Stand“). Die Testanzahl
+Alles unten wurde zuerst mit **synthetischem Material unter Linux** belegt; was davon inzwischen mit echten Kameradateien unter
+Windows geprüft ist, steht unter „Beleglage“ am Ende und in `README.md`, „Getesteter Stand“. Die Testanzahl
 steht bewusst nicht hier; maßgeblich ist die Ausgabe von `python -m unittest discover -s tests`.
 
 ### Patcher (`mxfheader.py`)
@@ -284,6 +286,17 @@ steht bewusst nicht hier; maßgeblich ist die Ausgabe von `python -m unittest di
     Block-Align, Locked, Ref-Level usw.) müssen in Quelle und Ziel **übereinstimmen**, sonst ist es ein Fehler (der Clip gilt
     als fehlgeschlagen, die Datei bleibt unverändert). `AvgBps` wie in der Quelle (nur wenn dort vorhanden). Verweise auf andere
     Sets werden **nicht** übernommen. Die Set-Klasse wird nur bei gleichem `EssenceContainer` übernommen.
+    `FileDescriptor.SampleRate` wie in der Quelle (echte Sony-Dateien: 48000/1). `ContainerDuration` ist im Ziel genau dann
+    vorhanden, wenn die Quelle sie hat (echte Sony-Dateien: nicht); ändert sich die Rate, wird der Wert exakt umgerechnet, sonst
+    abgeleitet oder mit Hinweis weggelassen, nie geraten.
+  - Daten-(ANC-)Deskriptor und MultipleDescriptor: `ContainerDuration` nur, wenn die Quelle sie hat (nur entfernen).
+  - Bild-Deskriptor: Die **codec-unabhängigen** Items kommen aus der Quelle, wenn sie dort vorhanden sind und `StoredWidth`,
+    `StoredHeight`, `FrameLayout` übereinstimmen: `SampledWidth/Height`, `SampledX/YOffset`, `DisplayWidth/Height`,
+    `DisplayX/YOffset`, `VideoLineMap`, `ImageAlignmentOffset`, `ImageStartOffset`, `ImageEndOffset`, `SignalStandard`,
+    `AspectRatio`, `CaptureGamma`, `PaddingBits`, `ReversedByteOrder`, `BlackRefLevel`, `WhiteReflevel`, `ColorRange`
+    (die CDCI-Items nur bei Zielklasse CDCI/MPEG-Video). Nie geändert: Set-Klasse, `PictureEssenceCoding`, `EssenceContainer`,
+    `SubDescriptors`, `ComponentDepth`, Subsampling, `ColorSiting`, `ColorPrimaries`, `CodingEquations`; nichts wird gelöscht.
+  - `Preface.EssenceContainers`: Reihenfolge wie in der Quelle, Menge unverändert.
   - TextObject: MIME-Typ und Description wie Quelle bzw. `text/xml` / leer.
   - Vor dem Schreiben wird erneut geparst und validiert; bei Fehler bleibt die Datei unverändert.
 - `--seq-off`: Die `SequenceOffset`-Werte der Quell-Tonspuren (relevant bei 29,97/59,94 fps) werden aus der Quelle gelesen und
@@ -356,8 +369,101 @@ auf eine unvollständige Zielkarte, Rückfragen beim Start (u. a. „Fortsetzen?
 robustes Polling und Schließen während des Laufs. `XDROOT-Converter.bat` sucht Python ≥ 3.11 mit tkinter (`py -3`, dann
 `python`; Start per `pyw`, sonst `pythonw.exe` aus `where python`, sonst mit Konsole) und zeigt sonst eine Anleitung.
 
-### Noch nicht belegt
+### Temperaturüberwachung und Schonmodus (Runde 3, Spezifikation)
 
-Verhalten gegenüber echten Kameradateien (Parser, Patcher, Prüfungen, Toninhalts-Vergleich mit echtem AES3), Windows-Pfade (.bat, GUI,
-Sperre, Strg+C, Wiederholungen bei gesperrten Dateien), 56-GB-Clips (WAV > 4 GB), Schnittprogramme und Sony-Werkzeuge. Review-Stand:
-drei Runden paralleler Opus-Reviews (Metadaten/MXF, Ablauf/Robustheit, Oberfläche), die dritte ohne grobe Befunde. Siehe `docs/NAECHSTE-SCHRITTE.md`.
+Anlass: Beim lokalen Test stürzte der Rechner des Autors (ein Lenovo-Legion-Notebook) während einer langen Umwandlung wegen
+Überhitzung ab. Ziel: Die Umwandlung soll die CPU-Temperatur anzeigen, bei Bedarf die Lüfter auf volle Drehzahl schalten und
+notfalls pausieren. Nichts davon darf die Umwandlung behindern, wenn die Hardware es nicht unterstützt.
+
+- **Modul `xdroot_converter/thermal.py`**, getrennt in
+  - **Anbieter** (hardwareabhängig): liefert `Messung(cpu_temp_c, lüfter_drehzahlen)` und kann „Lüfter voll“ ein-/ausschalten.
+    Mitgeliefert wird ein Anbieter für **Lenovo Legion** über WMI (`root\wmi`: `LENOVO_GAMEZONE_DATA.GetCPUTemp`,
+    `GetFan1Speed`/`GetFan2Speed`/`GetFanMaxSpeed`, `GetSmartFanMode` nur lesend; `LENOVO_OTHER_METHOD.GetFeatureValue`/
+    `SetFeatureValue` für „Lüfter voll“).
+    Der Zugriff braucht **Administratorrechte** (ohne sie „Zugriff verweigert“). Da nur die Standardbibliothek erlaubt ist, läuft
+    der WMI-Zugriff über **einen** dauerhaft laufenden, versteckten PowerShell-Hilfsprozess (Befehle über stdin, Antworten
+    zeilenweise über stdout), nicht über einen neuen Prozess je Messung. Andere Geräte: neuen Anbieter ergänzen (Schnittstelle
+    und ein kurzes Beispiel sind im Modul dokumentiert).
+  - **Regler** (hardwareunabhängig, mit Attrappen-Anbieter testbar): Schwellen mit Hysterese.
+    Standard: Lüfter voll ab **85 °C**, zurück unter **75 °C**; Pause ab **97 °C**, weiter unter **85 °C**. Alle Schwellen
+    einstellbar. Mehrere Messungen in Folge entscheiden (kein Schalten wegen eines einzelnen Ausreißers).
+- **Verfügbarkeit:** Ist kein Anbieter nutzbar (anderes Gerät, keine Adminrechte, PowerShell fehlt, Messung unplausibel
+  ≤ 0 °C oder > 125 °C), zeigt die Oberfläche „Temperatur nicht verfügbar“ mit dem Grund, und die Umwandlung läuft unverändert.
+  Fällt der Anbieter während des Laufs aus, gilt dasselbe; ein Fehler der Überwachung ist **nie** ein Fehler der Umwandlung.
+- **Lüfter voll:** Der vorherige Zustand wird vor dem ersten Schalten gelesen und **am Ende des Laufs, bei Abbruch und bei
+  Strg+C wiederhergestellt**. Kann der Zustand nicht gelesen werden, wird nicht geschaltet.
+- **Pause:** Der laufende `ffmpeg`-Prozess wird angehalten (Windows: `NtSuspendProcess`/`NtResumeProcess`, POSIX:
+  `SIGSTOP`/`SIGCONT`) und nach dem Abkühlen fortgesetzt. Zeitüberwachungen dürfen einen angehaltenen Prozess nicht als hängend
+  abbrechen. Abbrechen (GUI, Strg+C) muss auch während einer Pause sofort wirken (erst fortsetzen, dann beenden). Pausen stehen
+  im Protokoll und in der Zusammenfassung (Anzahl, Gesamtdauer). Die Pause wirkt auch ohne Lüftersteuerung, braucht aber eine
+  Temperaturmessung.
+- **Schonmodus (ohne Messung, überall):** `--threads N` bzw. Einstellung „CPU-Kerne begrenzen“ gibt `ffmpeg` für Decoder und
+  Encoder höchstens N Threads (Standard: unbegrenzt). Senkt die Wärme, kostet Zeit. Der Wert steht in der Einstellungsdatei nur
+  zur Information und löst beim Fortsetzen keine Warnung „andere Einstellungen“ aus (das Ergebnis hängt nicht davon ab; falls
+  sich das wegen x264-Slice/Thread-Verhalten nicht halten lässt, als Einstellung wie Preset behandeln und das begründen).
+- **Bedienung:** GUI-Statuszeile während des Laufs, z. B. „CPU 87 °C · Lüfter 4800/5100 U/min · Lüfter voll“ bzw. „Pause wegen
+  Temperatur (98 °C), weiter unter 85 °C“; Einstellungen für Überwachung an/aus, beide Schwellen und Kernbegrenzung.
+  CLI: `--thermal auto|off` (Standard `auto`), `--temp-fan GRAD`, `--temp-pause GRAD`, `--threads N` und
+  `--thermal-test` (Diagnose: Anbieter, Rechte, 5 Messungen, Lüfter 10 s voll und zurück, mit klarer Ausgabe je Schritt).
+- **Start mit Adminrechten:** `XDROOT-Converter (Administrator).bat` startet die GUI mit UAC-Abfrage; die normale `.bat` bleibt
+  unverändert. Ohne Adminrechte weist die GUI einmal dezent darauf hin, wie man die Überwachung bekommt.
+- **Grenzen:** Welche Kennung „Lüfter voll“ auslöst, ist geräteabhängig (Legion-Generationen unterscheiden sich) und muss am
+  Gerät mit `--thermal-test` belegt werden. Die Schwellen sind Vorgaben, keine Garantie gegen Abstürze.
+
+Ergänzungen nach den Reviews (verbindlich):
+
+- **Kein Leistungsmodus:** Der Lenovo-„SmartFanMode“ wird nur gelesen und angezeigt, **nie geschaltet** (der Leistungsmodus hebt
+  die CPU-Leistungsgrenzen an und erzeugt mehr Wärme). „Lüfter voll“ läuft ausschließlich über die Feature-Kennung; ist sie nicht
+  nutzbar, wird nur gemessen und pausiert.
+- **Wirkung belegen:** Die Anzeige „Lüfter voll“ erscheint nur, wenn die Drehzahl nach dem Schalten messbar gestiegen ist; sonst
+  „Lüfter voll angefordert (keine Wirkung messbar)“. `--thermal-test` vergleicht die Drehzahl vorher/während/nachher und endet
+  mit einer eindeutigen Ergebniszeile.
+- **Sicherheit unter Adminrechten:** PowerShell wird nur über den festen Pfad im Windows-Systemverzeichnis gestartet (keine
+  Suche im Arbeitsordner oder `PATH`), das CIM-Modul ausdrücklich aus `$PSHOME` geladen. In den PowerShell-Text gelangen nur
+  Konstanten und Zahlen.
+- **Zurückstellen ist robust:** Antwortet die Schnittstelle nicht, wird der Hilfsprozess neu gestartet und das Zurückstellen
+  wiederholt. Vor dem ersten Schalten wird der vorherige Zustand in eine Zustandsdatei im Benutzerprofil geschrieben
+  (`%LOCALAPPDATA%\XDROOT-Converter\`); nach einem Absturz stellt der nächste Start ihn wieder her. Hält ein anderer laufender
+  Prozess die Datei, misst diese Instanz nur. Der vorherige Zustand wird unmittelbar vor dem Schalten gelesen.
+- **Pause:** Hält alle laufenden Hilfsprogramme des Laufs an (praktisch `ffmpeg`), während der Pause sind die Lüfter voll.
+  Alle 2 Minuten eine Protokollzeile. Kühlt die CPU nach **20 Minuten** Pause nicht unter die Fortsetz-Schwelle, wird der
+  **Lauf sauber abgebrochen** (fortsetzbar) mit eigenem Grund; das ist sicherer als unter Übertemperatur weiterzurechnen.
+- **Schwellen:** Einstellbar sind „Lüfter voll ab“ (50–110 °C) und „Pause ab“ (60–120 °C, größer als die Lüfter-Schwelle); die
+  Rückschalt-Schwellen sind abgeleitet (−10 °C bzw. −12 °C). Zum Einschalten zählen 2, zum Zurückschalten 3 Messungen in Folge
+  (Messabstand 5 s).
+- **Intern** ist die Überwachung aus (`Options.thermal = "off"`); CLI und GUI schalten sie ein (`auto`).
+- **`--threads`:** x264 erzeugt mit anderer Kernzahl einen gleichwertigen, aber nicht bitgleichen Datenstrom. Für das Fortsetzen
+  ist das unerheblich, weil jeder Clip für sich steht. Gilt auch für `--verify --deep`.
+- **Start mit Adminrechten:** Die Rechte-Erhöhung macht Python selbst (`--als-administrator`, `ShellExecuteW` mit `runas`),
+  nicht die `.bat`; gestartet wird ein Startskript über seinen absoluten Pfad, das Startfehler in einem Fenster zeigt.
+  Zusätzlich `Temperatur-Test (Administrator).bat` für die Diagnose.
+- **Zustandsdatei, Einzelheiten:** Sie wird exklusiv angelegt (zwei gleichzeitige Läufe können sich den Zustand nicht
+  gegenseitig überschreiben; der zweite misst nur) und nur vom Besitzer gelöscht. Beim Lesen gelten nur die bekannte Kennung
+  und die Werte 0/1; alles andere gilt als beschädigt, wird gelöscht und **nie in die Hardware geschrieben**. Scheitert das
+  Wiederherstellen dreimal, wird die Datei mit deutlicher Warnung entfernt, damit die Steuerung nicht dauerhaft gesperrt bleibt.
+- **Wirkungsregel:** „Lüfter voll“ gilt als belegt, wenn die Drehzahl binnen 20 s um mindestens 15 % steigt oder (bei
+  plausibler Maximaldrehzahl und vorher niedrigerer Drehzahl) 90 % des Maximums erreicht. Ohne lesbare Drehzahl: „Lüfter voll
+  angefordert“.
+- **`--thermal-test`:** nennt die Kennung ausdrücklich unbestätigt, verlangt vor dem Schalten eine Bestätigung mit Enter, zeigt
+  Drehzahl vorher/während/nachher und endet immer mit einer Zeile `ERGEBNIS: …`; Strg+C stellt zurück und endet ohne Traceback.
+- **Programme:** Externe Programme werden nur über absolute Pfade gestartet (`tools/`, danach absolute `PATH`-Einträge, unter
+  Windows nur `.exe`), nie aus dem Arbeitsordner.
+- **Startskripte:** `start_gui.pyw` und `start_thermal_test.py` im Programmordner werden über ihren absoluten Pfad gestartet.
+  Startfehler der GUI erscheinen in einem Fenster und in `start_fehler.txt`; der Temperatur-Test zeigt Fehler in seinem
+  Konsolenfenster, das bis zur Bestätigung mit Enter offen bleibt.
+- **Nicht abgedeckt:** Wird das Programm hart beendet (Task-Manager) oder stürzt der Rechner ab, bleiben die Lüfter voll, bis
+  das Tool das nächste Mal **mit Temperaturüberwachung und Administratorrechten** läuft (oder `--thermal-test` gestartet wird).
+  Ein erhöhter Prozess sieht Netzlaufwerke des normalen Benutzers in der Regel nicht.
+
+### Beleglage (Stand 16.11.2026)
+
+Mit echten Kameradateien unter Windows belegt: Parser, Patcher, Prüfungen und Toninhalts-Vergleich (19 F5-Clips und eine
+F55-Karte mit 76 Clips, `--verify --source --deep` ohne Abweichung), Satz-für-Satz-Vergleich mit einer FX6-Referenz, `.bat`-Start,
+Sperre, Strg+C, Fortsetzen, hartes Beenden, Fortsetzen nach einem Rechnerabsturz. Zahlen und verbleibende Abweichungen:
+`docs/NAECHSTE-SCHRITTE.md`.
+
+Von Hand geprüft: Import der umgewandelten F55-Karte in DaVinci Resolve und Sony Catalyst Browse (Karte erkannt, Wiedergabe,
+Tonspuren; Timecode-Anzeige nicht verglichen).
+
+Noch nicht belegt: andere Schnittprogramme und Sony-Werkzeuge, Clips über 10 GB (WAV > 4 GB), andere Bildraten als 50p mit
+Kameradateien, Wiederholungen bei gesperrten Dateien, GUI-Bedienung von Hand, echte Temperaturmessung und Lüftersteuerung.

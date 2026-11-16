@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover
     tk = None  # type: ignore[assignment]
     filedialog = messagebox = ttk = None  # type: ignore[assignment]
 
-from . import __version__, card, converter, tools
+from . import __version__, card, converter, thermal, tools
 
 PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"]
 
@@ -37,6 +37,15 @@ HINT_FOLDERS = ("Die Quelle wird nur gelesen und nie verändert. Als Ziel einen 
                 "darin entsteht der Ordner XDROOT.")
 HINT_BITRATE = "Kennung in den Metadaten bleibt AVC50"
 HIDDEN_LEVELS = ("detail",)
+TEMP_FAN_MIN, TEMP_FAN_MAX = thermal.TEMP_FAN_MIN, thermal.TEMP_FAN_MAX  # gleiche Grenzen wie die CLI
+TEMP_PAUSE_MIN, TEMP_PAUSE_MAX = thermal.TEMP_PAUSE_MIN, thermal.TEMP_PAUSE_MAX
+THREADS_MAX = 256
+HINT_THERMAL = "Nur als Administrator und auf Lenovo Legion; sonst läuft alles unverändert."
+HINT_THREADS = "leer = alle Kerne; weniger = kühler, aber langsamer"
+LOG_MIN_PX = 80  # so viel Protokoll bleibt bei Mindesthöhe (auch mit geöffneten Einstellungen) sichtbar
+HINT_ADMIN = ("Hinweis: Für die Temperaturanzeige und die Lüftersteuerung braucht das Programm Administratorrechte. "
+              "Dazu „XDROOT-Converter (Administrator).bat“ statt der normalen Startdatei benutzen. "
+              "Die Umwandlung läuft auch ohne.")
 
 
 # =========================================================================== reine Logik
@@ -56,6 +65,40 @@ def parse_bitrate(text: str) -> float:
             f"Die Bitrate {text.strip()} Mbit/s liegt außerhalb des erlaubten Bereichs "
             f"({BITRATE_MIN:.0f} bis {BITRATE_MAX:.0f} Mbit/s)."
         )
+    return v
+
+
+def _parse_number(text: str, label: str, lo: float, hi: float) -> float:
+    raw = (text or "").strip().replace(",", ".")
+    try:
+        v = float(raw)
+    except ValueError:
+        raise ValueError(f"{label}: „{(text or '').strip()}“ ist keine Zahl.") from None
+    if v != v or not (lo <= v <= hi):
+        raise ValueError(f"{label}: {raw} °C liegt außerhalb des erlaubten Bereichs ({lo:.0f} bis {hi:.0f} °C).")
+    return v
+
+
+def parse_temp_limits(fan_text: str, pause_text: str) -> tuple:
+    """(Lüfter-voll-Schwelle, Pausen-Schwelle) in °C aus den Eingabefeldern; ValueError mit deutscher Meldung."""
+    fan = _parse_number(fan_text, "Lüfter voll ab", TEMP_FAN_MIN, TEMP_FAN_MAX)
+    pause = _parse_number(pause_text, "Pause ab", TEMP_PAUSE_MIN, TEMP_PAUSE_MAX)
+    if fan >= pause:
+        raise ValueError("Die Pausen-Temperatur muss höher sein als die Temperatur für „Lüfter voll“.")
+    return fan, pause
+
+
+def parse_threads(text: str) -> Optional[int]:
+    """Anzahl der CPU-Kerne/Threads für ffmpeg; leer = unbegrenzt (None).  ValueError mit deutscher Meldung."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        v = int(raw)
+    except ValueError:
+        raise ValueError(f"CPU-Kerne begrenzen: „{raw}“ ist keine ganze Zahl (leer lassen = unbegrenzt).") from None
+    if not (1 <= v <= THREADS_MAX):
+        raise ValueError(f"CPU-Kerne begrenzen: bitte einen Wert zwischen 1 und {THREADS_MAX} eingeben (leer = unbegrenzt).")
     return v
 
 
@@ -191,6 +234,9 @@ def completion_message(summary) -> tuple[str, str, str]:
     parts: list[str] = []
     if summary.cancelled:
         kind, title = "warning", "Abgebrochen"
+        reason = str(getattr(summary, "abort_reason", "") or "")
+        if reason:  # Abbruch durch die Temperaturüberwachung (Pause zu lang): eigener, klarer Grund
+            parts.append(reason)
         parts.append("Die Umwandlung wurde abgebrochen. Bereits fertige Clips bleiben erhalten.")
         parts.append("Die Zielkarte ist unvollständig. Ein erneuter Lauf mit demselben Zielordner setzt fort.")
     elif failed or copy_errors:
@@ -205,6 +251,11 @@ def completion_message(summary) -> tuple[str, str, str]:
         kind, title = "info", "Fertig"
         parts.append("Die Umwandlung ist erfolgreich beendet.")
     parts.append(counts)
+    pauses = int(getattr(summary, "pauses", 0) or 0)
+    if pauses > 0:
+        hot = getattr(summary, "max_cpu_c", None)
+        parts.append(f"Temperaturpausen: {pauses}, gesamt {_fmt_pause(getattr(summary, 'pause_seconds', 0.0))}"
+                     + (f" (höchste CPU-Temperatur {hot:.0f} °C)" if hot else ""))
     if failed:
         lines = ["Fehlgeschlagene Clips:"]
         for r in failed[:MAX_LISTED_FAILED]:
@@ -236,10 +287,19 @@ def completion_message(summary) -> tuple[str, str, str]:
     return kind, title, "\n\n".join(parts)
 
 
+def _fmt_pause(seconds: float) -> str:
+    """'X min Y s' (bzw. 'Y s' unter einer Minute)."""
+    total = max(0, int(round(float(seconds or 0))))
+    m, sec = divmod(total, 60)
+    return f"{m} min {sec} s" if m else f"{sec} s"
+
+
 def finish_status(summary) -> str:
     if summary.fatal:
         return "Fehler: " + str(summary.fatal)
     if summary.cancelled:
+        if getattr(summary, "abort_reason", ""):
+            return "Abgebrochen: CPU kühlt nicht ab."
         return "Abgebrochen."
     if summary.failed:
         return f"Fertig mit {summary.failed} Fehler(n) – siehe Protokoll."
@@ -262,6 +322,9 @@ class QueueReporter(converter.Reporter):
 
     def clip_done(self, result) -> None:
         self.q.put(("clip_done", result))
+
+    def thermal_status(self, text: str, state: str) -> None:
+        self.q.put(("thermal", text, state))
 
 
 _Base = tk.Tk if tk is not None else object
@@ -305,6 +368,12 @@ class App(_Base):  # type: ignore[misc,valid-type]
         self.var_preset = tk.StringVar(value="medium")
         self.var_skip_unlisted = tk.BooleanVar(value=False)
         self.var_status = tk.StringVar(value="Bereit.")
+        self.var_thermal = tk.StringVar(value="")
+        self.var_thermal_on = tk.BooleanVar(value=True)
+        self.var_temp_fan = tk.StringVar(value=f"{thermal.DEFAULT_FAN_ON_C:g}")
+        self.var_temp_pause = tk.StringVar(value=f"{thermal.DEFAULT_PAUSE_C:g}")
+        self.var_threads = tk.StringVar(value="")
+        self._admin_hint_shown = False
         self.var_overview = tk.StringVar(value="Bitte Quellordner wählen.")
         self.var_br_hint = tk.StringVar(value="")
         self.var_clip_label = tk.StringVar(value="")
@@ -352,23 +421,49 @@ class App(_Base):  # type: ignore[misc,valid-type]
         # Einstellungen (einklappbar)
         self.btn_settings = ttk.Button(root, text="Einstellungen anzeigen", command=self._toggle_settings)
         self.btn_settings.grid(row=4, column=0, sticky="w", **pad)
-        self.frm_settings = ttk.LabelFrame(root, text="Einstellungen", padding=8)
-        ttk.Label(self.frm_settings, text="Bitrate (Mbit/s):").grid(row=0, column=0, sticky="w", padx=4, pady=2)
-        sp = ttk.Spinbox(self.frm_settings, from_=10, to=100, increment=5, width=6, textvariable=self.var_bitrate)
-        sp.grid(row=0, column=1, sticky="w", padx=4, pady=2)
-        ttk.Label(self.frm_settings, text="x264-Preset:").grid(row=0, column=2, sticky="w", padx=(16, 4), pady=2)
-        cb = ttk.Combobox(self.frm_settings, values=PRESETS, textvariable=self.var_preset, width=12, state="readonly")
-        cb.grid(row=0, column=3, sticky="w", padx=4, pady=2)
-        ttk.Label(self.frm_settings, textvariable=self.var_br_hint, foreground="#9a6700").grid(
-            row=2, column=0, columnspan=4, sticky="w", padx=4, pady=2)
-        ck = ttk.Checkbutton(
-            self.frm_settings, text="Clips, die nicht in MEDIAPRO.XML stehen, überspringen",
-            variable=self.var_skip_unlisted,
-        )
-        ck.grid(row=1, column=0, columnspan=4, sticky="w", padx=4, pady=2)
-        # (Widget, Zustand im freigegebenen Betrieb)
+        self.frm_settings = ttk.LabelFrame(root, text="Einstellungen", padding=(6, 2, 6, 4))
+        fs = self.frm_settings
+        ttk.Label(fs, text="Bitrate (Mbit/s):").grid(row=0, column=0, sticky="w", padx=4, pady=1)
+        sp = ttk.Spinbox(fs, from_=10, to=100, increment=5, width=6, textvariable=self.var_bitrate)
+        sp.grid(row=0, column=1, sticky="w", padx=4, pady=1)
+        ttk.Label(fs, text="x264-Preset:").grid(row=0, column=2, sticky="w", padx=(12, 4), pady=1)
+        cb = ttk.Combobox(fs, values=PRESETS, textvariable=self.var_preset, width=12, state="readonly")
+        cb.grid(row=0, column=3, sticky="w", padx=4, pady=1)
+        # Bitraten-Hinweis in derselben Zeile (eine leere Zeile darunter wuerde Hoehe kosten)
+        ttk.Label(fs, textvariable=self.var_br_hint, foreground="#9a6700").grid(
+            row=0, column=4, sticky="w", padx=4, pady=1)
+        ck = ttk.Checkbutton(fs, text="Clips, die nicht in MEDIAPRO.XML stehen, überspringen",
+                             variable=self.var_skip_unlisted)
+        ck.grid(row=1, column=0, columnspan=5, sticky="w", padx=4, pady=1)
+        # Temperaturüberwachung: Schalter und beide Schwellen in EINER Zeile
+        tf = ttk.Frame(fs)
+        tf.grid(row=2, column=0, columnspan=5, sticky="w")
+        ck_th = ttk.Checkbutton(tf, text="Temperatur überwachen", variable=self.var_thermal_on,
+                                command=self._update_thermal_fields)
+        ck_th.grid(row=0, column=0, sticky="w", padx=4, pady=1)
+        ttk.Label(tf, text="Lüfter voll ab (°C):").grid(row=0, column=1, sticky="w", padx=(12, 4), pady=1)
+        e_fan = ttk.Entry(tf, textvariable=self.var_temp_fan, width=5)
+        e_fan.grid(row=0, column=2, sticky="w", padx=4, pady=1)
+        ttk.Label(tf, text="Pause ab (°C):").grid(row=0, column=3, sticky="w", padx=(12, 4), pady=1)
+        e_pause = ttk.Entry(tf, textvariable=self.var_temp_pause, width=5)
+        e_pause.grid(row=0, column=4, sticky="w", padx=4, pady=1)
+        self.lbl_th_hint = ttk.Label(fs, text=HINT_THERMAL, wraplength=400, justify="left", foreground="#555555")
+        self.lbl_th_hint.grid(row=3, column=0, columnspan=5, sticky="ew", padx=(26, 4), pady=0)
+        # Schonmodus (unabhängig von der Messung): Feld und kurzer Hinweis in einer Zeile
+        cf = ttk.Frame(fs)
+        cf.grid(row=4, column=0, columnspan=5, sticky="w")
+        ttk.Label(cf, text="CPU-Kerne begrenzen auf:").grid(row=0, column=0, sticky="w", padx=4, pady=1)
+        e_thr = ttk.Entry(cf, textvariable=self.var_threads, width=5)
+        e_thr.grid(row=0, column=1, sticky="w", padx=4, pady=1)
+        self.lbl_thr_hint = ttk.Label(cf, text=HINT_THREADS, foreground="#555555")
+        self.lbl_thr_hint.grid(row=0, column=2, sticky="w", padx=4, pady=1)
+        # Hinweistexte passen ihre Umbruchbreite der Breite des Rahmens an (auch bei Mindestgröße lesbar)
+        fs.bind("<Configure>", self._wrap_setting_hints)
+        # (Widget, Zustand im freigegebenen Betrieb); die Temperaturfelder steuert _update_thermal_fields
         lock.extend([(e_src, "normal"), (b_src, "normal"), (e_dst, "normal"), (b_dst, "normal"),
-                     (sp, "normal"), (cb, "readonly"), (ck, "normal")])
+                     (sp, "normal"), (cb, "readonly"), (ck, "normal"), (ck_th, "normal"),
+                     (e_thr, "normal")])
+        self._temp_fields = [e_fan, e_pause]
 
         bf = ttk.Frame(root)
         bf.grid(row=5, column=0, columnspan=3, sticky="w", **pad)
@@ -397,8 +492,14 @@ class App(_Base):  # type: ignore[misc,valid-type]
         self.txt.tag_configure("error", foreground="#b00020")
         self.txt.tag_configure("sep", foreground="#666666")
 
-        ttk.Label(root, textvariable=self.var_status, relief="sunken", anchor="w").grid(
-            row=9, column=0, columnspan=3, sticky="ew", padx=8, pady=(4, 0))
+        self.lbl_status = ttk.Label(root, textvariable=self.var_status, relief="sunken", anchor="w", justify="left",
+                                    wraplength=700)
+        self.lbl_status.grid(row=9, column=0, columnspan=3, sticky="ew", padx=8, pady=(4, 0))
+        self.lbl_thermal = ttk.Label(root, textvariable=self.var_thermal, anchor="w", justify="left",
+                                     foreground="#555555", wraplength=700)
+        self.lbl_thermal.grid(row=10, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 0))
+        for lbl in (self.lbl_status, self.lbl_thermal):  # lange Texte umbrechen, statt aus dem Fenster zu laufen
+            lbl.bind("<Configure>", lambda e, w=lbl: w.configure(wraplength=max(200, e.width - 8)))
 
     def _toggle_settings(self) -> None:
         if self.settings_open.get():
@@ -406,9 +507,36 @@ class App(_Base):  # type: ignore[misc,valid-type]
             self.btn_settings.configure(text="Einstellungen anzeigen")
             self.settings_open.set(False)
         else:
-            self.frm_settings.grid(row=4, column=1, columnspan=2, sticky="ew", padx=8, pady=4)
+            self.frm_settings.grid(row=4, column=1, columnspan=2, sticky="ew", padx=8, pady=2)
             self.btn_settings.configure(text="Einstellungen verbergen")
             self.settings_open.set(True)
+        self._update_minsize()
+
+    def _scale(self) -> float:
+        try:
+            return max(1.0, float(self.winfo_fpixels("1i")) / 96.0)
+        except Exception:  # noqa: BLE001
+            return 1.0
+
+    def required_height(self) -> int:
+        """Hoehe, die alle festen Teile (inkl. Status- und Temperaturzeile) brauchen, plus ``LOG_MIN_PX`` Protokoll."""
+        self.update_idletasks()
+        return int(self.winfo_reqheight() - self.txt.winfo_reqheight() + LOG_MIN_PX * self._scale())
+
+    def _update_minsize(self) -> None:
+        """Mindesthoehe so setzen, dass auch bei geoeffneten Einstellungen Status- und Temperaturzeile und mindestens
+        ``LOG_MIN_PX`` Protokoll sichtbar bleiben (hoechstens Bildschirmhoehe - 120); ein zu kleines Fenster waechst."""
+        try:
+            s = self._scale()
+            base = int(520 * s)
+            need = max(base, self.required_height())
+            sh = int(self.winfo_screenheight())
+            need = min(need, max(300, sh - 120))
+            self.minsize(self.minsize()[0], need)
+            if self.winfo_height() < need:
+                self.geometry(f"{max(self.winfo_width(), 1)}x{need}")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _update_br_hint(self) -> None:
         try:
@@ -424,6 +552,25 @@ class App(_Base):  # type: ignore[misc,valid-type]
                 w.configure(state=normal if enabled else "disabled")
             except Exception:  # noqa: BLE001
                 pass
+        self._update_thermal_fields(enabled)
+
+    def _update_thermal_fields(self, inputs_enabled: Optional[bool] = None) -> None:
+        """Temperaturfelder nur bedienbar, wenn die Überwachung an ist (und die Eingaben nicht gesperrt sind)."""
+        if inputs_enabled is None:
+            inputs_enabled = not self._ui_running
+        on = bool(self.var_thermal_on.get()) and inputs_enabled
+        for w in getattr(self, "_temp_fields", []):
+            try:
+                w.configure(state="normal" if on else "disabled")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _wrap_setting_hints(self, _event=None) -> None:
+        try:
+            width = max(150, int(self.frm_settings.winfo_width()) - 60)
+            self.lbl_th_hint.configure(wraplength=width)
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------ Ordner / Übersicht
     def _browse_src(self) -> None:
@@ -508,6 +655,15 @@ class App(_Base):  # type: ignore[misc,valid-type]
             messagebox.showwarning("XDROOT-Converter", str(e))
             return
         try:
+            if self.var_thermal_on.get():  # bei ausgeschalteter Überwachung werden die Temperaturfelder nicht geprüft
+                temp_fan, temp_pause = parse_temp_limits(self.var_temp_fan.get(), self.var_temp_pause.get())
+            else:
+                temp_fan, temp_pause = thermal.DEFAULT_FAN_ON_C, thermal.DEFAULT_PAUSE_C
+            threads = parse_threads(self.var_threads.get())
+        except ValueError as e:
+            messagebox.showwarning("XDROOT-Converter", str(e))
+            return
+        try:
             tools.check_tools()
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("XDROOT-Converter", str(e))
@@ -552,6 +708,8 @@ class App(_Base):  # type: ignore[misc,valid-type]
         opts = converter.Options(
             source=src, target=dst, bitrate_mbps=bitrate, preset=self.var_preset.get() or "medium",
             unlisted="skip" if self.var_skip_unlisted.get() else "convert",
+            thermal="auto" if self.var_thermal_on.get() else "off",
+            temp_fan=temp_fan, temp_pause=temp_pause, threads=threads,
         )
         # Übersichts-Analyse beenden; der Worker wartet auf ihr Ende (kein paralleler Scan)
         self._cancel_overview()
@@ -627,6 +785,12 @@ class App(_Base):  # type: ignore[misc,valid-type]
             clip_txt, total_txt = progress_texts(name, text, tf or 0.0, eta)
             self.var_clip_label.set(clip_txt)
             self.var_total_label.set(total_txt)
+        elif kind == "thermal":
+            _k, text, state = item
+            self.var_thermal.set(text)
+            if state == "admin" and not self._admin_hint_shown:
+                self._admin_hint_shown = True  # einmaliger, dezenter Hinweis
+                self._append(HINT_ADMIN, "sep")
         elif kind == "overview":
             _k, token, text, ok = item
             if token == self.overview_token:
@@ -712,6 +876,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
 
     def _reset_buttons(self, status: str) -> None:
         self._ui_running = False
+        self.var_thermal.set("")
         try:
             self._set_inputs(True)
             self.btn_start.configure(state="normal")

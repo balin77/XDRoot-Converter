@@ -1,5 +1,25 @@
 # MXF-Kopfdaten-Vergleich (Runde 2, Stand nach den Fix-Runden, neu gemessen)
 
+> **Nachtrag 16.11.2026: Vergleich mit echten Kameradateien liegt vor**
+>
+> Der Vergleich wurde lokal mit einer echten F55-Karte (Quelle), dem daraus erzeugten Ziel und einem echten FX6-XAVC-L-Clip
+> (Referenz) wiederholt: [analysis/vergleich_f55_ziel_fx6.md](analysis/vergleich_f55_ziel_fx6.md). Ergebnis und Bewertung
+> jeder verbleibenden Abweichung: [NAECHSTE-SCHRITTE.md](NAECHSTE-SCHRITTE.md).
+>
+> Was sich dadurch gegenüber dem Text unten geändert hat:
+>
+> - Echte Sony-Dateien (F5, F55, FX6) haben **KAG 512**, zwei Partitionen (Header mit Essenz und Index, Footer), Track-IDs
+>   1 (Timecode), 2 (Video), ab 3 Ton, danach ANC, und **keine Track-Namen**.
+> - Der Sound-Deskriptor echter Dateien hat `SampleRate` 48000/1 und keine `ContainerDuration`; der Patcher übernimmt das
+>   jetzt (die Aussage in Abschnitt 2, er behalte `ContainerDuration` und `SampleRate` des Ziels, gilt nicht mehr).
+> - Der Video-Deskriptor echter Quellen hat `StoredHeight` 1088, `SampledHeight` 1080, `VideoLineMap` [42, 0] und
+>   Schwarz-/Weißpegel; die codec-unabhängigen Items werden jetzt aus der Quelle übernommen.
+> - Abweichungen Quelle ≠ Ziel mit echter Quelle: 20 in 3 Sätzen (Set-Klasse, `PictureEssenceCoding`, `AVCSubDescriptor`,
+>   `ColorPrimaries`/`CodingEquations`).
+>
+> Die Abschnitte 1 bis 5 unten beschreiben weiterhin die Messung mit der **synthetischen** Quelle und sind als Beleg der
+> Mechanik zu lesen, nicht als Aussage über Sony. Abschnitt 6 ist bis auf Punkt 4 (Schnittprogramm, Sony Catalyst) erledigt.
+
 > **Wichtig zur Beleglage (bitte zuerst lesen)**
 >
 > Im Repository liegen von den **echten Kameradateien nur `mxf2raw`-Ausgaben**

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 import threading
@@ -28,6 +27,22 @@ class Cancelled(Exception):
     """Wird ausgeloest, wenn der Benutzer abbricht."""
 
 
+def _search_path(name: str) -> Optional[str]:
+    """Eigene PATH-Suche statt shutil.which (which sucht unter Windows zuerst im Arbeitsordner und nimmt PATHEXT wie
+    .bat/.com): nur ABSOLUTE Ordner, unter Windows nur '<name>.exe', sonst der bloße Name mit Ausführrecht; nie der
+    Arbeitsordner.  Ergebnis ist immer ein absoluter Pfad."""
+    win = sys.platform == "win32"
+    fname = name + ".exe" if win else name
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        d = d.strip().strip('"')
+        if not d or not os.path.isabs(d):
+            continue
+        cand = os.path.join(d, fname)
+        if os.path.isfile(cand) and (win or os.access(cand, os.X_OK)):
+            return os.path.abspath(cand)
+    return None
+
+
 def find_tool(name: str) -> str:
     """Pfad zu einem Programm: erst tools/**/<name>.exe, dann PATH."""
     if name in _cache and os.path.exists(_cache[name]):
@@ -40,7 +55,7 @@ def find_tool(name: str) -> str:
         if hits:
             found = str(hits[-1])
     if found is None:
-        found = shutil.which(name)
+        found = _search_path(name)
     if found is None:
         raise ToolNotFound(
             f"Programm '{exe}' nicht gefunden (weder in {tools_dir} noch im PATH). "
@@ -63,17 +78,76 @@ def check_tools() -> dict[str, str]:
     return {n: find_tool(n) for n in _PROGRAMS}
 
 
+def suspend_process(proc: subprocess.Popen) -> bool:
+    """Prozess anhalten (Windows: NtSuspendProcess, POSIX: SIGSTOP).  True bei Erfolg; jeder Fehler -> False."""
+    try:
+        if proc.poll() is not None:
+            return False
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            nt = ctypes.WinDLL("ntdll")
+            nt.NtSuspendProcess.restype = ctypes.c_long
+            nt.NtSuspendProcess.argtypes = [wintypes.HANDLE]
+            return nt.NtSuspendProcess(int(proc._handle)) >= 0  # type: ignore[attr-defined]
+        import signal
+
+        os.kill(proc.pid, signal.SIGSTOP)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def resume_process(proc: subprocess.Popen) -> bool:
+    """Angehaltenen Prozess fortsetzen (Windows: NtResumeProcess, POSIX: SIGCONT).  True bei Erfolg."""
+    try:
+        if proc.poll() is not None:
+            return False
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            nt = ctypes.WinDLL("ntdll")
+            nt.NtResumeProcess.restype = ctypes.c_long
+            nt.NtResumeProcess.argtypes = [wintypes.HANDLE]
+            return nt.NtResumeProcess(int(proc._handle)) >= 0  # type: ignore[attr-defined]
+        import signal
+
+        os.kill(proc.pid, signal.SIGCONT)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 class CancelToken:
-    """Gemeinsames Abbruch-Objekt; beendet registrierte Prozesse."""
+    """Gemeinsames Abbruch-Objekt; beendet registrierte Prozesse.  Kann sie ausserdem anhalten (Temperaturpause)."""
 
     def __init__(self) -> None:
         self._event = threading.Event()
-        self._lock = threading.Lock()
+        # RLock: der Signal-Handler (Hauptthread, ruft cancel()) kann einen Aufruf des Hauptthreads unterbrechen, der die Sperre haelt
+        self._lock = threading.RLock()
         self._procs: list[subprocess.Popen] = []
+        self.pause_error = ""  # Grund, wenn pause() Prozesse nicht anhalten konnte ('' = nichts zu melden)
+        self._paused = False
+        self._paused_since = 0.0
+        self._paused_total = 0.0
+        self._suspended: list[subprocess.Popen] = []
 
     @property
     def cancelled(self) -> bool:
         return self._event.is_set()
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    def paused_time(self) -> float:
+        """Summe aller Pausenzeiten in Sekunden (eine laufende Pause zaehlt mit).  Zeitueberwachungen ziehen
+        diese Zeit ab, damit ein angehaltener Prozess nie als haengend gilt."""
+        with self._lock:
+            extra = time.monotonic() - self._paused_since if self._paused else 0.0
+            return self._paused_total + extra
 
     def check(self) -> None:
         if self._event.is_set():
@@ -82,6 +156,8 @@ class CancelToken:
     def register(self, proc: subprocess.Popen) -> None:
         with self._lock:
             self._procs.append(proc)
+            if self._paused and not self._event.is_set() and suspend_process(proc):
+                self._suspended.append(proc)
         if self._event.is_set():
             kill_process(proc)
 
@@ -89,9 +165,49 @@ class CancelToken:
         with self._lock:
             if proc in self._procs:
                 self._procs.remove(proc)
+            if proc in self._suspended:
+                self._suspended.remove(proc)
+
+    def pause(self) -> bool:
+        """Alle registrierten Prozesse anhalten (und spaeter registrierte, bis ``resume``).  True nur, wenn mindestens
+        ein Prozess wirklich angehalten wurde.  False, wenn schon pausiert, abgebrochen, kein Prozess laeuft oder das
+        Anhalten fehlschlug (dann steht der Grund in ``pause_error``; es wird keine Pausenzeit gezaehlt)."""
+        with self._lock:
+            self.pause_error = ""
+            if self._paused or self._event.is_set():
+                return False
+            done: list[subprocess.Popen] = []
+            failed = 0
+            for p in list(self._procs):
+                if suspend_process(p):
+                    done.append(p)
+                elif p.poll() is None:
+                    failed += 1
+            if not done:
+                if failed:
+                    self.pause_error = f"{failed} Prozess(e) konnten nicht angehalten werden (NtSuspendProcess/SIGSTOP fehlgeschlagen)"
+                return False
+            self._paused = True
+            self._paused_since = time.monotonic()
+            self._suspended.extend(done)
+        return True
+
+    def resume(self) -> bool:
+        """Pause beenden: angehaltene Prozesse fortsetzen.  False, wenn nicht pausiert."""
+        with self._lock:
+            if not self._paused:
+                return False
+            self._paused = False
+            self._paused_total += time.monotonic() - self._paused_since
+            procs, self._suspended = self._suspended, []
+            for p in procs:
+                resume_process(p)
+        return True
 
     def cancel(self) -> None:
+        """Abbrechen: erst fortsetzen (ein angehaltener Prozess soll sauber enden koennen), dann beenden."""
         self._event.set()
+        self.resume()
         self.kill_all()
 
     def kill_all(self) -> None:
@@ -102,6 +218,18 @@ class CancelToken:
             kill_process(p)
 
 
+def system_directory() -> Optional[str]:
+    """Windows-Systemverzeichnis ueber GetSystemDirectoryW (nicht ueber PATH/Arbeitsordner); None = unbekannt."""
+    try:
+        import ctypes
+
+        buf = ctypes.create_unicode_buffer(520)
+        n = ctypes.windll.kernel32.GetSystemDirectoryW(buf, 520)  # type: ignore[attr-defined]
+        return buf.value if 0 < n < 520 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def kill_process(proc: subprocess.Popen) -> None:
     """Prozess (unter Windows samt Prozessbaum) beenden.  Schlaegt taskkill fehl oder fehlt es,
     wird trotzdem ``proc.kill()`` versucht."""
@@ -110,10 +238,11 @@ def kill_process(proc: subprocess.Popen) -> None:
             return
     except Exception:
         return
-    if sys.platform == "win32":
+    sysdir = system_directory() if sys.platform == "win32" else None
+    if sysdir:  # absoluter Pfad: unter Administratorrechten darf kein taskkill.exe aus dem Arbeitsordner laufen
         try:
             subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                [os.path.join(sysdir, "taskkill.exe"), "/F", "/T", "/PID", str(proc.pid)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=CREATE_NO_WINDOW,
@@ -277,12 +406,15 @@ def run_capture(
     t2.start()
     timed_out = False
     t_start = time.monotonic()
+    pause0 = cancel.paused_time() if cancel is not None else 0.0
     try:
         while proc.poll() is None:
             if cancel is not None and cancel.cancelled:
                 kill_process(proc)
                 break
-            if timeout is not None and time.monotonic() - t_start > timeout:
+            # Pausenzeit (Temperaturpause, Prozess angehalten) zaehlt nicht zur Zeitueberwachung
+            paused = (cancel.paused_time() - pause0) if cancel is not None else 0.0
+            if timeout is not None and time.monotonic() - t_start - paused > timeout:
                 timed_out = True
                 kill_process(proc)
                 break

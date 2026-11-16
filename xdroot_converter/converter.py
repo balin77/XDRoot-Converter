@@ -10,6 +10,7 @@ import re
 import shutil
 import socket
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import card, mxfheader, mxfinfo, tools, verify
+from . import thermal as _thermal_mod  # (Options.thermal ist ein Feld; Modulname nicht verdecken)
 
 TMP_NAME = "_tmp_xdroot_converter"
 LOG_NAME = "konvertierung.log"
@@ -69,6 +71,15 @@ class Options:
     keep_anc: bool = True
     set_create_date: bool = True
     sony_header: bool = True  # MXF-Kopfdaten (Identification, Track-IDs ...) aus der Quell-MXF uebernehmen
+    # Schonmodus / Temperaturueberwachung (Runde 3).  Der Standard hier ist "off" (Ablauf exakt wie bisher); CLI und GUI
+    # schalten auf "auto" (Messung, wenn ein Anbieter nutzbar ist, sonst unveraendert).
+    thermal: str = "off"  # 'auto' | 'off'
+    temp_fan: float = _thermal_mod.DEFAULT_FAN_ON_C  # Luefter voll ab (Grad C); zurueck unter temp_fan - 10
+    temp_pause: float = _thermal_mod.DEFAULT_PAUSE_C  # Pause ab (Grad C); weiter unter temp_pause - 12
+    threads: Optional[int] = None  # ffmpeg -threads fuer Decoder und Encoder (None = unbegrenzt)
+    thermal_interval_s: float = _thermal_mod.DEFAULT_INTERVAL_S  # Messabstand
+    thermal_provider: Optional[object] = None  # nur Tests: Fabrik fuer einen Attrappen-Anbieter
+    thermal_max_pause_s: float = _thermal_mod.DEFAULT_MAX_PAUSE_S  # laengste Temperaturpause, danach Abbruch (fortsetzbar)
 
 
 class Reporter:
@@ -86,6 +97,11 @@ class Reporter:
     def clip_done(self, result: "ClipResult") -> None:
         pass
 
+    def thermal_status(self, text: str, state: str) -> None:
+        """Statuszeile der Temperaturueberwachung; ``state``: ok | fan | pause | unavailable | admin (= Adminrechte
+        fehlen) | '' (Ueberwachung beendet)."""
+        pass
+
 
 @dataclass
 class ClipResult:
@@ -95,6 +111,7 @@ class ClipResult:
     dst_size: int = 0
     frames: int = 0
     seconds: float = 0.0
+    pause_seconds: float = 0.0  # davon Temperaturpause (ffmpeg angehalten)
     notes: list = field(default_factory=list)
     target_ok: bool = False  # FEHLER, aber ein vorhandener umgewandelter Ziel-Clip blieb unangetastet erhalten
     foreign: bool = False  # FEHLER, weil im Ziel eine fremde Datei (andere UMID) liegt - wurde nicht ueberschrieben
@@ -110,6 +127,11 @@ class RunSummary:
     out_root: Optional[Path] = None
     fatal: str = ""
     copy_errors: list = field(default_factory=list)  # [(relativer Pfad, Meldung)] beim Kopieren der Struktur
+    pauses: int = 0  # Temperaturpausen (ffmpeg angehalten)
+    pause_seconds: float = 0.0
+    max_cpu_c: Optional[float] = None
+    thermal_note: str = ""  # z. B. "Temperatur nicht verfuegbar: ..." (leer = keine Besonderheit)
+    abort_reason: str = ""  # Abbruch durch die Temperaturueberwachung (Pause zu lang); gesetzt zusammen mit cancelled
 
     def count(self, status: str) -> int:
         return sum(1 for r in self.results if r.status == status)
@@ -158,7 +180,8 @@ class RunSummary:
                 continue
             lines.append(
                 f"{r.name}: {r.status}  {fmt_size(r.src_size)} -> {fmt_size(r.dst_size)}"
-                + (f"  ({r.frames} Frames, {r.seconds:.0f} s)" if r.frames else "")
+                + ((f"  ({r.frames} Frames, {r.seconds:.0f} s"
+                    + (f", davon Pause {r.pause_seconds:.0f} s" if r.pause_seconds >= 1 else "") + ")") if r.frames else "")
             )
             for n in r.notes:
                 lines.append(f"    - {n}")
@@ -177,9 +200,19 @@ class RunSummary:
                 f"kopiert: {self.count(ST_COPIED)}, Fehler: {self.failed}"
                 + (", ABGEBROCHEN" if self.cancelled else "")
                 + f" - Dauer {fmt_duration(self.seconds)}"
+                + (f" (davon Pause {fmt_duration(self.pause_seconds)})" if self.pauses else "")
             )
+        if self.abort_reason:
+            lines.append(self.abort_reason)
         for rel, msg in self.copy_errors:
             lines.append(f"FEHLER beim Kopieren von {rel}: {msg}")
+        if self.pauses:
+            lines.append(f"Temperaturpausen: {self.pauses}, gesamt {fmt_duration(self.pause_seconds)}"
+                         + (f" (höchste gemessene CPU-Temperatur {self.max_cpu_c:.0f} °C)" if self.max_cpu_c else ""))
+        elif self.max_cpu_c:
+            lines.append(f"Höchste gemessene CPU-Temperatur: {self.max_cpu_c:.0f} °C, keine Pause nötig")
+        if self.thermal_note:
+            lines.append(self.thermal_note)
         inc = self.incomplete_text()
         if inc:
             lines.append(inc)
@@ -603,17 +636,24 @@ class Converter:
         self._settings_store: dict = {"version": 1, "clips": {}}
         self._settings_path: Optional[Path] = None
         self._resume_diffs: dict = {}
+        self._log_lock = threading.Lock()  # der Temperatur-Thread schreibt ebenfalls ins Protokoll
+        self._thermal: Optional[_thermal_mod.ThermalSession] = None
+        self._thermal_closed = False
+        self._thermal_summary: Optional[RunSummary] = None
+        self._pause0_clip = 0.0
+        self._abort_reason = ""  # gesetzt, wenn die Temperaturueberwachung den Lauf abbricht
 
     # ------------------------------------------------------------------ Logging
     def _log(self, level: str, msg: str) -> None:
         self.rep.log(level, msg)
-        if self._logf is not None:
-            ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            try:
-                self._logf.write(f"{ts} [{level}] {msg}\n")
-                self._logf.flush()
-            except Exception:
-                pass
+        with self._log_lock:
+            if self._logf is not None:
+                ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                try:
+                    self._logf.write(f"{ts} [{level}] {msg}\n")
+                    self._logf.flush()
+                except Exception:
+                    pass
 
     def info(self, m: str) -> None:
         self._log("info", m)
@@ -805,6 +845,8 @@ class Converter:
             "bitrate_mbps": self.o.bitrate_mbps, "preset": self.o.preset, "sony_header": self.o.sony_header,
             "embed_xml": self.o.embed_xml, "keep_anc": self.o.keep_anc,
             "ffmpeg": v.get("ffmpeg", "?"), "raw2bmx": v.get("raw2bmx", "?"),
+            # nur zur Information: steht NICHT in _SETTING_LABELS, loest also beim Fortsetzen keine Warnung aus
+            "threads": self.o.threads,
         }
 
     def _load_settings(self, target_dir: Path) -> None:
@@ -881,7 +923,19 @@ class Converter:
 
     # ------------------------------------------------------------------ Hauptablauf
     def run(self) -> RunSummary:
+        """Lauf durchfuehren.  Die Temperaturueberwachung (falls aktiv) wird in JEDEM Fall beendet und der
+        Luefterzustand wiederhergestellt - auch bei Abbruch, Strg+C oder einer unerwarteten Ausnahme."""
+        self._thermal_closed = False
+        self._thermal = None
+        self._abort_reason = ""
+        try:
+            return self._run()
+        finally:
+            self._thermal_stop()
+
+    def _run(self) -> RunSummary:
         summary = RunSummary()
+        self._thermal_summary = summary
         t0 = time.time()
         out_root: Optional[Path] = None
         tmp_root: Optional[Path] = None
@@ -912,7 +966,13 @@ class Converter:
             self.info(f"Start: Quelle {src_root} -> Ziel {out_root}")
             if self.o.max_frames:
                 self.warn(f"TESTLAUF: nur die ersten {self.o.max_frames} Frames je Clip; dur/Duration werden NICHT angepasst")
-            self.info(f"Einstellungen: Bitrate {self.o.bitrate_mbps} Mbit/s, Preset {self.o.preset}")
+            self.info(f"Einstellungen: Bitrate {self.o.bitrate_mbps} Mbit/s, Preset {self.o.preset}"
+                      + (f", ffmpeg-Threads begrenzt auf {self.o.threads}" if self.o.threads else ""))
+            ncpu = os.cpu_count()
+            if self.o.threads and ncpu and self.o.threads >= ncpu:
+                self.info(f"Hinweis: {self.o.threads} Threads sind nicht weniger als die {ncpu} CPU-Kerne dieses Rechners - "
+                          "die Begrenzung begrenzt nichts (kein Fehler).")
+            self._thermal_start()
             if not self.o.sony_header:
                 self.warn("Kopfdaten-Angleichung ABGESCHALTET (--no-sony-header): Die Dateien tragen bmx-Kennungen "
                           "(BBC/bmx, Toolkit/Platform) und bmx-Track-IDs (1001/2001/...) statt der Sony-Kennungen der Quelle.")
@@ -991,6 +1051,7 @@ class Converter:
                     summary.results.append(res)
                     continue
                 t_clip = time.time()
+                pause_clip0 = self.cancel.paused_time()
                 dst = out_root / "Clip" / plan.mxf.name
                 try:
                     self._process_clip(plan, src_root, out_root, tmp_root, res)
@@ -1005,6 +1066,7 @@ class Converter:
                     res.notes.append(str(e))
                     self.error(f"{plan.name}: {e}")
                 res.seconds = time.time() - t_clip
+                res.pause_seconds = max(0.0, self.cancel.paused_time() - pause_clip0)
                 try:
                     res.dst_size = dst.stat().st_size if dst.exists() else 0
                 except OSError:
@@ -1026,12 +1088,14 @@ class Converter:
                         self.warn(f"Testmarker konnte nicht entfernt werden: {e}")
         except tools.Cancelled:
             summary.cancelled = True
+            summary.abort_reason = self._abort_reason
             self.warn("Abgebrochen. Bereits fertige Clips bleiben erhalten; ein erneuter Lauf setzt fort.")
         except Exception as e:  # noqa: BLE001
             summary.fatal = str(e)
             self.error(f"Abbruch wegen Fehler: {e}")
         finally:
             try:
+                self._thermal_stop()  # Pause beenden, Luefter wiederherstellen; Zahlen fuer die Zusammenfassung
                 # MEDIAPRO.XML immer passend zum tatsaechlichen Zustand (Ist-Zustand des Ziels) schreiben
                 if touched:
                     try:
@@ -1057,6 +1121,71 @@ class Converter:
             finally:
                 release_lock(lock_path)  # auch bei KeyboardInterrupt/anderen BaseExceptions freigeben
         return summary
+
+    # ------------------------------------------------------------------ Temperaturueberwachung
+    def _thermal_start(self) -> None:
+        """Messthread starten (best effort: ein Fehler hier ist nie ein Fehler der Umwandlung)."""
+        if self.o.thermal != "auto":
+            return
+        try:
+            cfg = _thermal_mod.ThermalConfig.from_limits(self.o.temp_fan, self.o.temp_pause,
+                                                         max_pause_s=self.o.thermal_max_pause_s)
+            self._thermal = _thermal_mod.ThermalSession(
+                cfg, self.cancel, notify=self._thermal_notify, status=self._thermal_status,
+                provider_factory=self.o.thermal_provider, interval_s=self.o.thermal_interval_s,
+                on_abort=self._thermal_abort)
+            self._thermal.start()
+        except Exception as e:  # noqa: BLE001
+            self._thermal = None
+            self.warn("Die Temperaturüberwachung konnte nicht gestartet werden; die Umwandlung läuft unverändert.")
+            self._log("detail", f"Temperaturüberwachung nicht gestartet: {type(e).__name__}: {e}")
+
+    def _thermal_abort(self, reason: str) -> None:
+        """Pause dauerte zu lange: Lauf sauber abbrechen wie bei einem Benutzer-Abbruch (fortsetzbar), mit eigenem Grund."""
+        self._abort_reason = reason
+        self._log("warn", reason)  # ein Abbruch durch die Überwachung ist kein Fehler (die Zusammenfassung zeigt "Fehler: 0")
+        self.cancel.cancel()
+
+    def _thermal_notify(self, level: str, msg: str) -> None:
+        try:
+            self._log(level, msg)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _thermal_status(self, text: str, state: str) -> None:
+        try:
+            self.rep.thermal_status(text, state)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _thermal_stop(self) -> None:
+        """Idempotent, wirft nie.  Beendet den Messthread (setzt eine Pause fort, stellt die Luefter wieder her,
+        beendet den Hilfsprozess) und uebertraegt die Zahlen in die Zusammenfassung."""
+        sess = self._thermal
+        if sess is None or self._thermal_closed:
+            return
+        self._thermal_closed = True
+        try:
+            sess.stop()
+        except Exception as e:  # noqa: BLE001
+            try:
+                self.warn(f"Temperaturueberwachung konnte nicht sauber beendet werden: {e}")
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            st = sess.stats
+            sm = self._thermal_summary
+            if sm is not None:
+                sm.pauses, sm.pause_seconds, sm.max_cpu_c = st.pauses, st.pause_seconds, st.max_cpu_c
+                if st.unavailable_reason:
+                    sm.thermal_note = f"Temperatur nicht verfügbar/ausgefallen: {st.unavailable_reason}"
+        except Exception:  # noqa: BLE001
+            pass
+        self._thermal_status("", "")
+
+    def _clip_active_secs(self) -> float:
+        """Sekunden seit Clip-Beginn OHNE Temperaturpausen (fuer die Restzeit-Schaetzung)."""
+        return max(0.0, time.time() - self._clip_t0 - (self.cancel.paused_time() - self._pause0_clip))
 
     # ------------------------------------------------------------------ Hilfen
     @staticmethod
@@ -1167,7 +1296,7 @@ class Converter:
         eta = None
         if transcoded is not None:
             work_frames = self._work_frames_done + transcoded
-            work_secs = self._work_secs_done + (time.time() - self._clip_t0)
+            work_secs = self._work_secs_done + self._clip_active_secs()
             if work_secs > 5 and work_frames > 0:
                 remaining = max(0, self._frames_pending - work_frames)
                 eta = remaining / (work_frames / work_secs)
@@ -1369,6 +1498,7 @@ class Converter:
         expect_anc, embed = want_anc, want_xml
         exp = mk_exp(expect_anc, embed)
         self._clip_t0 = time.time()
+        self._pause0_clip = self.cancel.paused_time()
         tmpd = tmp_root / plan.stem
         self._shutil_clean(tmpd)
         tmpd.mkdir(parents=True, exist_ok=True)
@@ -1457,7 +1587,7 @@ class Converter:
         self._record_clip_settings(plan, **dropped)
         res.status = ST_CONVERTED
         self._work_frames_done += frames
-        self._work_secs_done += time.time() - self._clip_t0
+        self._work_secs_done += self._clip_active_secs()
         self._emit_progress(plan, 1.0, "fertig")
         self._frames_done += frames
         self.info(f"{plan.name}: fertig ({fmt_size(plan.mxf.stat().st_size)} -> {fmt_size(dst.stat().st_size)})")
@@ -1532,15 +1662,17 @@ class Converter:
             f"aud=1:nal-hrd=vbr:keyint={n}:min-keyint={n}:scenecut=0:b-pyramid=none:"
             "colorprim=bt709:transfer=bt709:colormatrix=bt709:chromaloc=0:force-cfr=1"
         )
+        thr = ["-threads", str(int(self.o.threads))] if self.o.threads else []  # Schonmodus: Decoder + Encoder
         args = [
             tools.find_tool("ffmpeg"), "-hide_banner", "-nostdin", "-y", "-nostats", "-v", "error",
             "-progress", "pipe:1",
-            "-i", str(plan.mxf),
+            *thr, "-i", str(plan.mxf),
             "-map", "0:v:0", "-c:v", "libx264", "-profile:v", "high422", "-pix_fmt", "yuv422p10le",
             "-level:v", level, "-preset", self.o.preset, "-color_range", "tv",
             "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", bitrate,
             "-g", str(n), "-bf", "2", "-fps_mode", "passthrough",
             "-x264-params", x264,
+            *thr,
         ]
         if self.o.max_frames:
             args += ["-frames:v", str(frames)]

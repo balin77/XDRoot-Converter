@@ -9,12 +9,14 @@ re-wraps it with bmx (`raw2bmx`), keeps UMIDs, duration, timecode, audio (bit-ex
 against the source), ANC camera metadata, thumbnails and all other files, and patches only the codec fields in
 `MEDIAPRO.XML` and `Clip/*M01.XML`. Unanalysable `.MXF` files (garbage, 0 bytes, aborted recordings) are copied
 unchanged with a warning. Python 3.11+, no pip packages; GUI (tkinter) and CLI. The user interface and
-documentation are in German. Status: Version 1 was tested locally by the author with real F5 XAVC-I HD 50p
-material; for the F55 and the FX6 XAVC-L reference only analysis outputs (`mxf2raw` etc.) exist, no conversion run. Everything added afterwards (header
-patcher, new checks, safeguards for resuming, GUI changes, start script) was tested **only on Linux with synthetic material**
-(an AVC-Intra source generated with bmx); it has **not** been run on Windows or with real camera files yet. No Sony tool
-and no NLE has been tried. Three rounds of parallel reviews (metadata/MXF, workflow/robustness, GUI) were done; the third
-reported no gross errors, which is no substitute for tests with camera files. **Please note:** the MXF
+documentation are in German. Status (November 2026): tested by the author on Windows with real camera material: 19 clips
+from a Sony PMW-F5 card and a complete 76-clip F55 card (XAVC-I HD 50p, 104 GB) were converted and passed
+`--verify --source --deep` without deviations; the MXF headers were compared set by set against a real Sony FX6 XAVC-L
+clip (remaining differences are listed in `docs/NAECHSTE-SCHRITTE.md`). Ctrl+C, resuming, a hard kill, two parallel runs
+and an unplanned machine crash were exercised on Windows. The converted F55 card was imported by the author into DaVinci
+Resolve and Sony Catalyst Browse (card recognised, playback and audio tracks fine; timecode display not compared).
+**Not tested:** other NLEs and Sony tools, frame rates other than 50p with camera files, and real temperature readings
+and fan control of the optional temperature monitor (needs administrator rights and a Lenovo Legion). **Please note:** the MXF
 headers of the output carry the **Sony identifiers of the source camera** (company/product/version
 copied from the source file, Sony track IDs 2, 3, ...), but the files were **created by this tool, not by a
 camera**. They are not bit-identical to a camera recording, and playback in NLEs and Sony tools is
@@ -76,7 +78,9 @@ Unter Linux wurden Umwandlung, Fortsetzen, Abbruch und `--verify` mit einer **sy
 `XDROOT-Converter.bat` starten, **Quellordner** (XDROOT oder dessen Elternordner) und **Zielordner**
 wählen, **Konvertieren**. Im Zielordner entstehen `XDROOT\` und `konvertierung.log`.
 Unter „Einstellungen" lassen sich Bitrate (Standard 50 Mbit/s), x264-Preset und das Überspringen von
-Clips, die nicht in `MEDIAPRO.XML` stehen, einstellen; Hinweise zu den Einstellungen stehen in der Oberfläche. Enthält der
+Clips, die nicht in `MEDIAPRO.XML` stehen, einstellen, außerdem die Temperaturüberwachung („Temperatur überwachen“, „Lüfter
+voll ab“, „Pause ab“) und „CPU-Kerne begrenzen“ (siehe „Temperaturüberwachung und Schonmodus“); Hinweise zu den Einstellungen
+stehen in der Oberfläche. Enthält der
 Zielordner schon ein XDROOT, fragt das Programm vor dem Start „Fortsetzen?“ (weitere Rückfragen beim Start, z. B. zu
 abweichenden Einstellungen). **Abbrechen** beendet alle laufenden Prozesse und räumt temporäre Dateien auf; ein erneuter Lauf mit
 demselben Ziel setzt fort (siehe unten). Am Ende erscheint ein **Abschlussfenster** (Fertig / Fertig mit Fehlern / Abgebrochen /
@@ -91,7 +95,10 @@ python -m xdroot_converter.cli <quelle> <ziel> [--bitrate 50] [--preset medium] 
                                [--no-sony-header] [--verbose]
 python -m xdroot_converter.cli --verify <ziel> [--source <quelle>] [--deep]
 python -m xdroot_converter.cli --mxf-info <datei.MXF>
+python -m xdroot_converter.cli --thermal-test
 ```
+
+Weitere Optionen zu Temperatur und Schonmodus (`--threads`, `--thermal`, `--temp-fan`, `--temp-pause`) stehen in der Tabelle.
 
 | Option | Bedeutung |
 |---|---|
@@ -105,6 +112,10 @@ python -m xdroot_converter.cli --mxf-info <datei.MXF>
 | `--embed-xml auto` / `always` / `never` | `M01.XML` in die MXF einbetten (`auto`: nur wenn die Quelle es auch hat) |
 | `--no-anc` | ANC-Datenspur (Kamera-Metadaten) nicht übernehmen |
 | `--no-sony-header` | MXF-Kopfdaten **nicht** an die Quelle angleichen (Standard: Identification, Track-IDs usw. werden aus der Quell-MXF übernommen); die Ausgabe trägt dann bmx-Kennungen, und `--verify` ohne `--source` meldet dafür Abweichungen |
+| `--threads N` | Schonmodus: `ffmpeg` nutzt höchstens N Kerne (weniger Wärme, dauert länger); wirkt auch bei `--verify --deep` |
+| `--thermal auto` / `off` | Temperaturüberwachung (Standard `auto`; ohne nutzbare Messung läuft alles wie gewohnt), siehe unten |
+| `--temp-fan GRAD`, `--temp-pause GRAD` | Schwellen für „Lüfter voll“ (Standard 85 °C, erlaubt 50–110) und Pause (Standard 97 °C, erlaubt 60–120, höher als die Lüfter-Schwelle); zurückgeschaltet wird 10 °C bzw. 12 °C darunter |
+| `--thermal-test` | Diagnose der Temperaturmessung und Lüftersteuerung (braucht Administratorrechte) |
 | `--verbose` | auch Einzelheiten ausgeben (z. B. jede Änderung der MXF-Kopfdaten); sie stehen immer in `konvertierung.log` |
 | `--mxf-info DATEI` | Header-Metadaten einer MXF-Datei ausgeben (Diagnose, liest nur) |
 | `--verify ZIEL` | Ziel-XDROOT (oder Elternordner) prüfen, siehe unten |
@@ -183,29 +194,58 @@ Details und Messwerte: [docs/SPEC.md](docs/SPEC.md).
 
 ## Getesteter Stand
 
-**Bitte ehrlich lesen:**
+**Bitte ehrlich lesen** (Stand 16.11.2026, Einzelheiten und Zahlen: [docs/NAECHSTE-SCHRITTE.md](docs/NAECHSTE-SCHRITTE.md)):
 
-- **Version 1** (Umwandlung mit FFmpeg + bmx, XML-Anpassung, einfache Prüfung) wurde vom Autor **lokal mit echtem F5-Material**
-  getestet (Windows, XAVC-I HD 50p, `--verify` ohne Abweichung). Referenz für das Ziel: echtes XAVC-L einer Sony FX6
-  (`mxf2raw`-Ausgaben in `docs/analysis`).
-- **Alles aus Runde 2 und den Fix-Runden** – Kopfdaten-Patcher (Identification, Track-IDs, Sound-Deskriptoren, KAG 512),
-  Tonzuordnung und Toninhalts-Vergleich, neue Prüfungen in `--verify`, Fortsetzen/Sperre/Einstellungsdatei, Behandlung nicht
-  analysierbarer Dateien, GUI-Änderungen (Abschlussfenster, Rückfragen), Startskript `.bat` – ist bisher **nur unter Linux mit synthetischem Material** getestet (eine mit bmx erzeugte AVC-Intra-Quelle,
-  `scripts/make_test_card.py`; erfundene UMIDs, 8 Tonspuren, ANC). Dort wurden Umwandlung, Fortsetzen, Abbruch per Strg+C,
-  `--embed-xml always`, nicht gelistete Clips, unlesbare/leere `.MXF`-Dateien und `--verify --deep` durchgespielt; `mxf2raw`
-  und `ffmpeg` lesen die Ausgabe fehlerfrei. `MXFDump` meldet bei KAG 512 gelegentlich (bei 2-s-Clips nie, bei einem von zwei
-  20-s-Clips dreimal) „Warning : Length is zero (following KLVFill key …)“ für Füll-KLVs in der Essenz: bekannte, harmlose Eigenheit
-  von bmx/libMXF (Lücke von genau 20 Byte, gültiges KLV). Das ersetzt **keinen** Test mit Kameradaten.
-- **Review-Stand:** drei Runden paralleler Opus-Reviews (Metadaten/MXF, Ablauf/Robustheit, Oberfläche); die dritte meldete keine
-  groben Fehler mehr. Das sind Code-Reviews, keine Tests mit Kameras oder Sony-Werkzeugen.
-- **Unter Windows ungetestet:** `XDROOT-Converter.bat`, GUI, Strg+C in der Kommandozeile, Sperrdatei, `setup_tools.bat` in der
-  jetzigen Fassung. Mit **echten Kameradateien ungetestet:** der Kopfdaten-Patcher (der Parser wurde nie auf eine echte
-  Sony-MXF angewendet) und die neuen Prüfungen.
-- `scripts/mxf_vergleich.py` vergleicht die Header-Metadaten zweier/dreier MXF-Dateien Satz für Satz
-  (Ergebnis und Grenzen: [docs/MXF-VERGLEICH.md](docs/MXF-VERGLEICH.md)). Echte Sony-Dateien wurden damit noch
-  **nicht** verglichen (im Repository liegen von ihnen nur `mxf2raw`-Ausgaben). Dort steht auch, welche Befehle der Autor lokal
-  ausführen muss; Stand und nächste Schritte: [docs/NAECHSTE-SCHRITTE.md](docs/NAECHSTE-SCHRITTE.md).
-- Andere Bildraten (25p, 29.97p, 59.94p usw.) wurden nur synthetisch getestet, nicht mit echten Kameraclips.
+- **Mit echtem Kameramaterial unter Windows getestet** (XAVC-I HD 50p):
+  - Sony PMW-F5: 19 Clips (18,3 GB) umgewandelt, `--verify --source --deep` ohne Abweichung.
+  - F55-Karte: alle 76 Clips (104 GB) umgewandelt, `--verify --source --deep` ohne Abweichung, alle Begleitdateien verglichen.
+    Ein Clip schlug im ersten Durchgang nach einem Hänger beim Lesen vom Kartenleser fehl, wurde als Fehler gemeldet und im
+    Fortsetzungslauf fehlerfrei umgewandelt.
+  - Parser und Kopfdaten-Patcher lesen echte F5-, F55- und FX6-Dateien fehlerfrei; der Toninhalts-Vergleich funktioniert mit
+    echtem Sony-Ton.
+  - Die Quell-Laufwerke blieben unverändert (Vergleich aller Dateien vor und nach den Tests).
+- **Vergleich mit echtem XAVC-L (Sony FX6):** `scripts/mxf_vergleich.py` mit Quelle, Ziel und FX6-Referenz
+  ([docs/analysis/vergleich_f55_ziel_fx6.md](docs/analysis/vergleich_f55_ziel_fx6.md)). Hersteller-Eintrag, Track-IDs, Spuraufbau
+  und Ton-Deskriptoren stimmen mit der Quelle überein; zur Quelle bleiben 20 Abweichungen, alle durch den Codec-Wechsel.
+  Gegenüber der FX6 bleiben: bmx-Partitionslayout (vier statt zwei Partitionen), einzelne Angaben im `AVCSubDescriptor`
+  (beschreiben den x264-Datenstrom), ein Sony-eigener Unter-Deskriptor, und das eingebettete XML (nur mit `--embed-xml always`).
+- **Robustheit unter Windows getestet:** Strg+C (Exit-Code 130, aufgeräumt), Fortsetzen, hartes Beenden mit Wiederaufnahme,
+  zwei Läufe in dasselbe Ziel (der zweite bricht ab), Fortsetzen nach einem Absturz des Rechners, Nachziehen der Kopfdaten
+  ohne neues Transkodieren, Start über `XDROOT-Converter.bat`.
+- **Import geprüft (vom Autor, von Hand):** Die umgewandelte F55-Karte wird in **DaVinci Resolve** und in **Sony Catalyst
+  Browse** als Karte erkannt; Wiedergabe und Tonspuren sind in Ordnung. Die Timecode-Anzeige in diesen Programmen wurde dabei
+  nicht verglichen (in den Dateien stimmt der Timecode laut `--verify --source` mit der Quelle überein).
+- **Nicht getestet:** andere Schnittprogramme (Avid, Premiere, …) und andere Sony-Werkzeuge, die GUI-Bedienung von Hand in allen
+  Wegen, Clips über 10 GB (WAV > 4 GB) und andere Bildraten als 50p mit echten Kameraclips (25p, 29.97p, 59.94p nur synthetisch).
+- **Temperaturüberwachung:** Logik, Pause und der Weg ohne Administratorrechte sind getestet; echte Messwerte und das Schalten
+  der Lüfter (Lenovo Legion, Administratorrechte) sind am Gerät **noch nicht belegt** (siehe unten).
+- **Synthetische Tests (Linux):** Umwandlung, Fortsetzen, `--embed-xml always`, nicht gelistete Clips, unlesbare `.MXF`-Dateien
+  mit einer mit bmx erzeugten Testkarte (`scripts/make_test_card.py`). `MXFDump` meldet bei KAG 512 gelegentlich „Warning :
+  Length is zero (following KLVFill key …)“: bekannte, harmlose Eigenheit von bmx/libMXF.
+- **Review-Stand:** Jede Runde wurde von Opus-Reviewern geprüft, bis keine groben Fehler mehr gemeldet wurden. Das sind
+  Code-Reviews, keine Tests mit Sony-Werkzeugen.
+
+## Temperaturüberwachung und Schonmodus
+
+Lange Umwandlungen lasten die CPU voll aus. Zwei Hilfen:
+
+- **Schonmodus (jeder Rechner):** „CPU-Kerne begrenzen“ in den Einstellungen bzw. `--threads N`. Weniger Wärme, längere Laufzeit.
+- **Temperaturüberwachung (derzeit nur Lenovo Legion, nur mit Administratorrechten):** Start über
+  `XDROOT-Converter (Administrator).bat`. Die Oberfläche zeigt CPU-Temperatur und Lüfterdrehzahl, fordert ab 85 °C volle Lüfter
+  an und hält die Umwandlung ab 97 °C an, bis die CPU unter 85 °C abgekühlt ist. Kühlt sie nach 20 Minuten nicht ab, wird der
+  Lauf sauber abgebrochen und kann später fortgesetzt werden. Ohne Administratorrechte oder auf anderen Geräten steht dort
+  „Temperatur nicht verfügbar“, und die Umwandlung läuft wie gewohnt.
+- **Vor dem ersten Einsatz:** `Temperatur-Test (Administrator).bat` ausführen. Der Test zeigt, ob Messung und „Lüfter voll“ auf
+  dem Gerät wirken. Die dafür benutzte Lenovo-Kennung ist eine unbestätigte Annahme; ohne messbare Wirkung zeigt das Tool nur
+  „Lüfter voll angefordert“.
+- **Andere Geräte:** In `xdroot_converter/thermal.py` lässt sich ein eigener Anbieter ergänzen (Schnittstelle und Beispiel im
+  Modul). Der Lenovo-Leistungsmodus wird bewusst nie geschaltet.
+- Wird das Programm hart beendet oder stürzt der Rechner ab, während die Lüfter voll laufen, stellt das Tool den vorherigen
+  Zustand wieder her, sobald es das nächste Mal mit Administratorrechten und Temperaturüberwachung läuft.
+  Dafür merkt es sich den Zustand in `%LOCALAPPDATA%\XDROOT-Converter\fan_state.json` (wird nach dem Zurückstellen gelöscht).
+- Mit Administratorrechten sieht das Programm Netzlaufwerke des normalen Benutzers in der Regel nicht.
+
+Kommandozeile: `--thermal auto|off`, `--temp-fan GRAD`, `--temp-pause GRAD`, `--threads N`, `--thermal-test`.
 
 ## Einschränkungen
 
@@ -213,15 +253,17 @@ Details und Messwerte: [docs/SPEC.md](docs/SPEC.md).
   zwar aus der Quelle übernommen, die Datei bleibt aber eine mit bmx erzeugte MXF (z. B. neue Generation-UID,
   bmx-Partitionslayout, Fill-Größen; KAG 512 nur, wenn die Quelle KAG 512 hat). Felder, die `mxf2raw` nicht zeigt und die der Patcher nicht kennt
   (Sony-eigene Sets u. Ä.), werden nicht übernommen.
-- Es wurde **kein Sony-Prüf- oder Importwerkzeug** getestet (z. B. Sony Catalyst).
-- Die **Wiedergabe in Schnittprogrammen** (Avid, Premiere, Resolve, ...) wurde nicht geprüft.
+- Import und Wiedergabe wurden nur in **DaVinci Resolve** und **Sony Catalyst Browse** geprüft (von Hand, eine Karte); andere
+  Schnittprogramme (Avid, Premiere, ...) und Sony-Prüfwerkzeuge nicht.
+- Geschwindigkeit: etwa Echtzeit bei HD 50p mit Preset `medium` auf einem aktuellen Notebook (gemessen: 11:01 min Material in
+  11:47 min). Hardware-Encoder der Grafikkarte werden nicht benutzt; H.264 mit 4:2:2 und 10 Bit bieten nur wenige an.
 - 4K, Interlaced und Ton, der nicht Mono/24 Bit/48 kHz ist, werden nur kopiert, nicht umgewandelt.
 - Clips, deren Tonspuren unterschiedlichen `SequenceOffset` haben, werden nicht umgewandelt (nur kopiert, Hinweis). Lässt sich die
   Zuordnung ffmpeg-Audiostream ↔ MXF-Track nicht eindeutig bestimmen, wird der Clip **nicht umgewandelt**, sondern unverändert
   kopiert (Warnung, kein Raten, wegen der Gefahr vertauschter Tonspuren); ein vorhandener Ziel-Clip führt zum Fehler.
-- Der Toninhalts-Vergleich wurde nur mit synthetischem Ton geprüft, nicht mit echtem Sony-AES3.
-- Andere Bildraten nur synthetisch getestet (siehe oben).
-- Zwei Läufe gleichzeitig in dasselbe Ziel sind gesperrt; die Sperre wurde nur unter Linux getestet.
+- Andere Bildraten als 50p nur synthetisch getestet (siehe oben).
+- Zwei Läufe gleichzeitig in dasselbe Ziel sind gesperrt.
+- `--only` ist ein Testwerkzeug: `MEDIAPRO.XML` im Ziel listet weiter alle Clips der Quelle.
 - Oberfläche und Meldungen sind deutsch.
 
 Rückmeldungen und Tests mit anderen Kameras sind willkommen, siehe [CONTRIBUTING.md](CONTRIBUTING.md).

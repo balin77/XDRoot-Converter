@@ -1202,6 +1202,45 @@ class SonyAdoptionTests(Base):
         self.assert_hint(log, "ContainerDuration laesst sich nicht ganzzahlig")
         self.assert_idempotent(src, tgt)
 
+    def test_sound_absurdly_large_duration_is_omitted_not_struct_error(self):
+        """Kaputtes Ziel: riesige ContainerDuration darf nie struct.error werfen, sondern wird weggelassen (+ HINWEIS)."""
+        for big in (2 ** 62, 2 ** 63 - 1):
+            s, t = sound_pair(with_item(SR, rate(96000)), None)
+            edit_sound(t, lambda i, lt: [x for x in i if x[0] not in (SR, CD)] + [(SR, rate(48000)), (CD, length(big))])
+            src, tgt = self.run_pair(s, t)
+            log = mh.adopt_from_source(tgt, src)                # kein struct.error
+            self.assert_hint(log, "Tonspur 1", "ContainerDuration laesst sich nicht ganzzahlig")
+            self.assertEqual({c for _, c in self.sound_cds(tgt)}, {None}, big)
+            self.assert_idempotent(src, tgt)
+
+    def test_sound_derive_out_of_range_or_unusable_rates_give_nothing(self):
+        """_derive_sound_duration: Bild-ContainerDuration riesig, Bild-Rate bzw. Track-EditRate negativ/Null, Dauer
+        negativ -> nicht ableitbar (None), nie eine andere Ausnahme als HeaderPatchError."""
+        cases = (
+            ("huge picture duration", [(SR, rate(50)), (CD, length(2 ** 62))], None),
+            ("negative picture rate", [(SR, rate(-50)), (CD, length(10))], None),
+            ("zero picture rate", [(SR, rate(0, 1)), (CD, length(10))], None),
+            ("negative picture duration", [(SR, rate(50)), (CD, length(-10))], None),
+        )
+        for name, pic_items, want in cases:
+            s, t = sound_pair(None, with_item(CD, None))
+            edit_class(t, "CDCIEssenceDescriptor", lambda i, items=pic_items: i + items)
+            src, tgt = self.run_pair(s, t)
+            log = mh.adopt_from_source(tgt, src)
+            self.assert_hint(log, "Tonspur 1", "ContainerDuration")
+            self.assertEqual({c for _, c in self.sound_cds(tgt)}, {want}, name)
+            self.assert_idempotent(src, tgt)
+
+    def test_sound_derive_uses_usable_rates_and_rejects_negative_sequence(self):
+        s, t = sound_pair(None, with_item(CD, None))
+        edit_class(t, "Sequence", lambda i: i + [("StructuralComponent.Duration", length(-10))])
+        edit_class(t, "Track", lambda i: i + [("Track.EditRate", rate(-50))])
+        src, tgt = self.run_pair(s, t)
+        log = mh.adopt_from_source(tgt, src)
+        self.assert_hint(log, "Tonspur 1", "ContainerDuration")
+        self.assertEqual({c for _, c in self.sound_cds(tgt)}, {None})
+        self.assert_idempotent(src, tgt)
+
     def test_sound_derive_conflicting_candidates_gives_nothing(self):
         s, t = sound_pair(None, with_item(CD, None))
         edit_class(t, "CDCIEssenceDescriptor", lambda i: i + [(SR, rate(50)), (CD, length(10))])
