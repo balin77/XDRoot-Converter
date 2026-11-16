@@ -1031,5 +1031,409 @@ class OpenHeaderTests(Base):
         self.assertEqual(mh.compare_with_source(tgt, src), [])
 
 
+# ----------------------------------------------------------------------------- Sony-Angleichung (Ton/ANC/Bild)
+SR = "FileDescriptor.SampleRate"
+CD = "FileDescriptor.ContainerDuration"
+PIC = "GenericPictureEssenceDescriptor."
+CODING_A = bytes.fromhex("060e2b34040101 0a04010202013231 04".replace(" ", ""))
+CODING_B = bytes.fromhex("060e2b34040101 0d04010202013160 01".replace(" ", ""))
+
+
+def rate(n, d=1):
+    return struct.pack(">ii", n, d)
+
+
+def length(n):
+    return struct.pack(">q", n)
+
+
+def edit_class(card, cls, fn, rename=None):
+    """Items aller Sets einer Klasse einer Builder-Karte aendern: fn(items) -> items."""
+    out = []
+    for n, items, u, k in card.sets:
+        if n == cls:
+            items = fn(list(items))
+            n = rename or n
+        out.append((n, items, u, k))
+    card.sets = out
+    return card
+
+
+def set_item(name, value):
+    return lambda items: [i for i in items if i[0] != name] + ([(name, value)] if value is not None else [])
+
+
+def add_anc(card, data_tid, duration=None):
+    """ANC-Deskriptor in die Karte aufnehmen und im MultipleDescriptor eintragen."""
+    items = [("FileDescriptor.LinkedTrackID", u32(data_tid)), (SR, rate(50)), ("FileDescriptor.EssenceContainer", EC_LABEL_OTHER)]
+    if duration is not None:
+        items.append((CD, length(duration)))
+    uid = card.add("ANCDataDescriptor", items)
+    for n, its, u, k in card.sets:
+        if n == "MultipleDescriptor":
+            old = dict(its)["MultipleDescriptor.SubDescriptorUIDs"]
+            edit_class(card, "MultipleDescriptor", lambda i: [
+                ("MultipleDescriptor.SubDescriptorUIDs", batch(mh.uid_list(old) + [uid]))])
+            break
+    return uid
+
+
+def descriptors(hm, st, *names):
+    return [d for d in st.file_descriptors() if hm.name(d) in names]
+
+
+PIC_COMMON = [(PIC + "StoredWidth", u32(1920)), (PIC + "StoredHeight", u32(1088)), (PIC + "FrameLayout", b"\x00")]
+SRC_PIC = PIC_COMMON + [
+    (PIC + "SampledWidth", u32(1920)), (PIC + "SampledHeight", u32(1080)), (PIC + "SampledXOffset", u32(0)),
+    (PIC + "SampledYOffset", u32(0)), (PIC + "DisplayWidth", u32(1920)), (PIC + "DisplayHeight", u32(1080)),
+    (PIC + "VideoLineMap", bytes.fromhex("00000002000000040000002a00000000")),
+    (PIC + "SignalStandard", b"\x04"), (PIC + "AspectRatio", rate(16, 9)),
+    (PIC + "ImageAlignmentOffset", u32(0)), (PIC + "ImageEndOffset", u32(0)),
+    ("CDCIEssenceDescriptor.ReversedByteOrder", b"\x00"), ("CDCIEssenceDescriptor.PaddingBits", struct.pack(">h", 0)),
+    ("CDCIEssenceDescriptor.BlackRefLevel", u32(64)), ("CDCIEssenceDescriptor.WhiteReflevel", u32(940)),
+    ("CDCIEssenceDescriptor.ColorRange", u32(897)),
+    ("CDCIEssenceDescriptor.ComponentDepth", u32(10)), (PIC + "PictureEssenceCoding", CODING_A)]
+TGT_PIC = PIC_COMMON + [
+    (PIC + "SampledWidth", u32(1920)), (PIC + "SampledHeight", u32(1088)),
+    (PIC + "VideoLineMap", bytes.fromhex("0000000200000004" + "0000000100000000")),
+    ("CDCIEssenceDescriptor.ComponentDepth", u32(8)), (PIC + "PictureEssenceCoding", CODING_B)]
+
+
+def pic_pair(src_items=SRC_PIC, tgt_items=TGT_PIC):
+    s = make_card(SRC_TRACKS, ident=SONY_IDENT)
+    t = make_card(TGT_TRACKS, ident=BMX_IDENT)
+    edit_class(s, "CDCIEssenceDescriptor", lambda i: i + list(src_items), rename="MPEGVideoDescriptor")
+    edit_class(t, "CDCIEssenceDescriptor", lambda i: i + list(tgt_items))
+    return s, t
+
+
+class SonyAdoptionTests(Base):
+    def run_pair(self, s, t, total=9000):
+        src, tgt = self.pair(s, t, tgt_total=total, src_total=total)
+        return src, tgt
+
+    def assert_idempotent(self, src, tgt):
+        again = mh.adopt_from_source(tgt, src)
+        self.assertEqual([m for m in again if not m.startswith(("WARNUNG:", "HINWEIS:"))], [])
+        self.assertEqual(mh.compare_with_source(tgt, src), [])
+
+    # --- Ton
+    def test_sound_sample_rate_from_source_and_duration_converted(self):
+        s, t = sound_pair(None, None)
+        edit_sound(t, lambda i, lt: [x for x in i if x[0] not in (SR, CD)] + [(SR, rate(50)), (CD, length(100))])
+        src, tgt = self.run_pair(s, t)
+        log = mh.adopt_from_source(tgt, src)
+        self.assertTrue(any("Tonspur 1" in m and "SampleRate" in m for m in log), log)
+        hm, st = structure(tgt)
+        for d in sound_descs(hm, st):
+            self.assertEqual(hm.get(d, SR), rate(48000))
+            self.assertEqual(hm.get(d, CD), length(100 * 48000 // 50))
+        self.assert_idempotent(src, tgt)
+
+    def sound_cds(self, tgt):
+        hm, st = structure(tgt)
+        return [(hm.get(d, SR), hm.get(d, CD)) for d in sound_descs(hm, st)]
+
+    def assert_hint(self, log, *words):
+        self.assertTrue(any(m.startswith("HINWEIS:") and all(w in m for w in words) for m in log), log)
+
+    def test_sound_duration_not_integer_is_omitted_with_hint(self):
+        s, t = sound_pair(with_item(SR, rate(50)), None)       # Quelle 50/1, Ziel 48000/1, Dauer 100
+        src, tgt = self.run_pair(s, t)
+        log = mh.adopt_from_source(tgt, src)                   # kein Abbruch
+        self.assert_hint(log, "Tonspur 1", "ContainerDuration laesst sich nicht ganzzahlig", "weggelassen")
+        self.assertEqual(set(self.sound_cds(tgt)), {(rate(50), None)})
+        self.assert_idempotent(src, tgt)
+
+    def test_sound_duration_ntsc_rate_exact_only_when_derivable(self):
+        # Bild 60000/1001 -> Ton 48000/1: 800,8 Samples je Frame, ganzzahlig nur bei Vielfachen von 5 Frames
+        for frames, want in ((10, 8008), (7, None)):
+            s, t = sound_pair(None, with_item(SR, rate(60000, 1001)))
+            edit_sound(t, with_item(CD, length(frames)))
+            edit_class(t, "CDCIEssenceDescriptor", lambda i: i + [(SR, rate(60000, 1001)), (CD, length(frames))])
+            src, tgt = self.run_pair(s, t)
+            log = mh.adopt_from_source(tgt, src)
+            self.assertEqual({c for _, c in self.sound_cds(tgt)}, {None if want is None else length(want)})
+            if want is None:
+                self.assert_hint(log, "ContainerDuration laesst sich nicht ganzzahlig")
+            self.assert_idempotent(src, tgt)
+
+    def test_sound_duration_not_convertible_but_derivable_from_picture(self):
+        s, t = sound_pair(with_item(SR, rate(50)), None)       # 100 @ 48000 -> 50: nicht ganzzahlig
+        edit_class(t, "CDCIEssenceDescriptor", lambda i: i + [(SR, rate(50)), (CD, length(10))])
+        src, tgt = self.run_pair(s, t)
+        mh.adopt_from_source(tgt, src)
+        self.assertEqual(set(self.sound_cds(tgt)), {(rate(50), length(10))})
+        self.assert_idempotent(src, tgt)
+
+    def test_sound_broken_source_rate_leaves_target_unchanged(self):
+        for bad in (rate(48000, 0), rate(0, 1), rate(-48000, 1), b"\x00\x00\x00\x01"):
+            s, t = sound_pair(with_item(SR, bad), None)
+            edit_sound(t, lambda i, lt: [x for x in i if x[0] not in (SR, CD)] + [(SR, rate(50)), (CD, length(100))])
+            src, tgt = self.run_pair(s, t)
+            log = mh.adopt_from_source(tgt, src)
+            self.assert_hint(log, "Tonspur 1", "SampleRate der Quelle unbrauchbar - Ziel unveraendert")
+            self.assertEqual(set(self.sound_cds(tgt)), {(rate(50), length(100))}, bad)
+            self.assert_idempotent(src, tgt)
+
+    def test_sound_target_rate_missing_or_broken_duration_not_left_in_old_unit(self):
+        for bad in (None, rate(48000, 0), rate(-1, 1)):
+            for pic, want in ((False, None), (True, length(10))):
+                s, t = sound_pair(None, None)
+                edit_sound(t, lambda i, lt: [x for x in i if x[0] not in (SR, CD)]
+                           + ([(SR, bad)] if bad is not None else []) + [(CD, length(100))])
+                if pic:
+                    edit_class(t, "CDCIEssenceDescriptor", lambda i: i + [(SR, rate(48000)), (CD, length(10))])
+                src, tgt = self.run_pair(s, t)
+                log = mh.adopt_from_source(tgt, src)
+                got = self.sound_cds(tgt)
+                self.assertEqual({r for r, _ in got}, {rate(48000)})
+                self.assertEqual({c for _, c in got}, {want}, (bad, pic))
+                if not pic:
+                    self.assert_hint(log, "ContainerDuration laesst sich nicht ganzzahlig")
+                self.assert_idempotent(src, tgt)
+
+    def test_sound_negative_duration_is_not_converted(self):
+        s, t = sound_pair(None, None)
+        edit_sound(t, lambda i, lt: [x for x in i if x[0] not in (SR, CD)] + [(SR, rate(50)), (CD, length(-5))])
+        src, tgt = self.run_pair(s, t)
+        log = mh.adopt_from_source(tgt, src)
+        self.assertEqual({c for _, c in self.sound_cds(tgt)}, {None})
+        self.assert_hint(log, "ContainerDuration laesst sich nicht ganzzahlig")
+        self.assert_idempotent(src, tgt)
+
+    def test_sound_derive_conflicting_candidates_gives_nothing(self):
+        s, t = sound_pair(None, with_item(CD, None))
+        edit_class(t, "CDCIEssenceDescriptor", lambda i: i + [(SR, rate(50)), (CD, length(10))])
+        edit_class(t, "Sequence", lambda i: i + [("StructuralComponent.Duration", length(11))])
+        edit_class(t, "Track", lambda i: i + [("Track.EditRate", rate(50))])
+        src, tgt = self.run_pair(s, t)
+        log = mh.adopt_from_source(tgt, src)
+        self.assert_hint(log, "Tonspur 1", "ContainerDuration", "nicht eindeutig")
+        self.assertEqual({c for _, c in self.sound_cds(tgt)}, {None})
+        self.assert_idempotent(src, tgt)
+
+    def test_sound_duration_removed_when_source_has_none(self):
+        s, t = sound_pair(with_item(CD, None), None)
+        src, tgt = self.run_pair(s, t)
+        log = mh.adopt_from_source(tgt, src)
+        self.assertTrue(any("Tonspur 1" in m and "-ContainerDuration" in m for m in log), log)
+        hm, st = structure(tgt)
+        self.assertEqual({hm.get(d, CD) for d in sound_descs(hm, st)}, {None})
+        self.assert_idempotent(src, tgt)
+
+    def test_sound_duration_kept_when_source_has_it_and_rate_unchanged(self):
+        s, t = sound_pair(with_item(CD, length(555)), with_item(CD, length(777)))
+        src, tgt = self.run_pair(s, t)
+        mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        self.assertEqual({hm.get(d, CD) for d in sound_descs(hm, st)}, {length(777)})
+        self.assertEqual(mh.compare_with_source(tgt, src), [])
+
+    def test_sound_duration_derived_from_picture_or_hint(self):
+        # Ziel ohne ContainerDuration, Quelle mit: aus dem Ziel-Bild-Deskriptor (50/1, 10 Frames) abgeleitet
+        s, t = sound_pair(None, with_item(CD, None))
+        edit_class(t, "CDCIEssenceDescriptor", lambda i: i + [(SR, rate(50)), (CD, length(10))])
+        src, tgt = self.run_pair(s, t)
+        mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        self.assertEqual({hm.get(d, CD) for d in sound_descs(hm, st)}, {length(10 * 960)})
+        self.assert_idempotent(src, tgt)
+        # nicht ableitbar -> HINWEIS, weggelassen, keine Abweichung
+        s, t = sound_pair(None, with_item(CD, None))
+        src, tgt = self.run_pair(s, t)
+        log = mh.adopt_from_source(tgt, src)
+        self.assertTrue(any(m.startswith("HINWEIS:") and "ContainerDuration" in m for m in log), log)
+        hm, st = structure(tgt)
+        self.assertEqual({hm.get(d, CD) for d in sound_descs(hm, st)}, {None})
+        self.assertEqual(mh.compare_with_source(tgt, src), [])
+
+    # --- ANC / MultipleDescriptor
+    def test_data_and_multiple_descriptor_duration_follows_source(self):
+        s, t = sound_pair()
+        add_anc(s, 5)
+        add_anc(t, 3001, duration=1632)
+        edit_class(t, "MultipleDescriptor", lambda i: i + [(CD, length(1632))])
+        src, tgt = self.run_pair(s, t)
+        log = mh.adopt_from_source(tgt, src)
+        self.assertTrue(any(m.startswith("Datenspur 1: ContainerDuration") for m in log), log)
+        self.assertTrue(any(m.startswith("MultipleDescriptor: ContainerDuration") for m in log), log)
+        hm, st = structure(tgt)
+        for d in descriptors(hm, st, "ANCDataDescriptor") + [st.file.descriptor]:
+            self.assertIsNone(hm.get(d, CD))
+        self.assertEqual(hm.get(descriptors(hm, st, "ANCDataDescriptor")[0], SR), rate(50))
+        self.assert_idempotent(src, tgt)
+
+    def test_data_duration_not_invented_and_kept_when_source_has(self):
+        s, t = sound_pair()
+        add_anc(s, 5, duration=40)
+        add_anc(t, 3001)                                   # Ziel ohne
+        src, tgt = self.run_pair(s, t)
+        log = mh.adopt_from_source(tgt, src)
+        self.assertTrue(any(m.startswith("HINWEIS: Datenspur 1") for m in log), log)
+        hm, st = structure(tgt)
+        self.assertIsNone(hm.get(descriptors(hm, st, "ANCDataDescriptor")[0], CD))
+        self.assertEqual(mh.compare_with_source(tgt, src), [])
+        s, t = sound_pair()
+        add_anc(s, 5, duration=40)
+        add_anc(t, 3001, duration=41)                      # beide haben: Zielwert bleibt
+        src, tgt = self.run_pair(s, t)
+        mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        self.assertEqual(hm.get(descriptors(hm, st, "ANCDataDescriptor")[0], CD), length(41))
+
+    # --- Bild
+    def test_picture_items_adopted_but_codec_items_kept(self):
+        s, t = pic_pair()
+        src, tgt = self.run_pair(s, t)
+        before_hm, before_st = structure(tgt)
+        log = mh.adopt_from_source(tgt, src)
+        self.assertTrue(any(m.startswith("Bildspur 1: Bild-Deskriptor an Quelle angeglichen") for m in log), log)
+        hm, st = structure(tgt)
+        (d,) = descriptors(hm, st, "CDCIEssenceDescriptor")
+        want = dict(SRC_PIC)
+        for q in ("SampledHeight", "VideoLineMap", "ImageAlignmentOffset", "ImageEndOffset", "SampledXOffset",
+                  "DisplayHeight", "SignalStandard", "AspectRatio"):
+            self.assertEqual(hm.get(d, PIC + q), want[PIC + q], q)
+        for q in ("ReversedByteOrder", "PaddingBits", "BlackRefLevel", "WhiteReflevel", "ColorRange"):
+            self.assertEqual(hm.get(d, "CDCIEssenceDescriptor." + q), want["CDCIEssenceDescriptor." + q], q)
+        self.assertEqual(hm.get(d, "CDCIEssenceDescriptor.ComponentDepth"), u32(8))      # codec-abhaengig: bleibt
+        self.assertEqual(hm.get(d, PIC + "PictureEssenceCoding"), CODING_B)
+        self.assertEqual(hm.name(d), "CDCIEssenceDescriptor")
+        self.assert_idempotent(src, tgt)
+
+    def test_picture_item_missing_in_source_stays_in_target(self):
+        s, t = pic_pair(src_items=PIC_COMMON)
+        edit_class(t, "CDCIEssenceDescriptor", lambda i: i + [(PIC + "ImageStartOffset", u32(7))])
+        src, tgt = self.run_pair(s, t)
+        mh.adopt_from_source(tgt, src)
+        hm, st = structure(tgt)
+        (d,) = descriptors(hm, st, "CDCIEssenceDescriptor")
+        self.assertEqual(hm.get(d, PIC + "ImageStartOffset"), u32(7))
+
+    def test_picture_precondition_violated_changes_nothing(self):
+        for q, v in ((PIC + "StoredHeight", u32(1080)), (PIC + "StoredWidth", u32(1280)), (PIC + "FrameLayout", b"\x01")):
+            s, t = pic_pair(tgt_items=[(k, (v if k == q else x)) for k, x in TGT_PIC])
+            src, tgt = self.run_pair(s, t)
+            hm0, st0 = structure(tgt)
+            (d0,) = descriptors(hm0, st0, "CDCIEssenceDescriptor")
+            items0 = [i for i in d0.items if i[0] != 0x3006]       # LinkedTrackID wird umnummeriert
+            log = mh.adopt_from_source(tgt, src)
+            self.assertTrue(any(m.startswith("HINWEIS: Bildspur 1") and q.split(".")[1] in m for m in log), (q, log))
+            hm, st = structure(tgt)
+            (d,) = descriptors(hm, st, "CDCIEssenceDescriptor")
+            self.assertEqual([i for i in d.items if i[0] != 0x3006], items0)
+            self.assertFalse([m for m in mh.compare_with_source(tgt, src) if "Bild" in m])
+
+    def test_picture_cdci_items_only_for_cdci_or_mpeg_target_class(self):
+        s, t = pic_pair(tgt_items=PIC_COMMON + [(PIC + "SampledHeight", u32(1088))])
+        edit_class(t, "CDCIEssenceDescriptor", lambda i: i, rename="RGBAEssenceDescriptor")
+        src, tgt = self.run_pair(s, t)
+        log = mh.adopt_from_source(tgt, src)
+        self.assertTrue(any(m.startswith("HINWEIS: Bildspur 1") and "CDCI" in m for m in log), log)
+        hm, st = structure(tgt)
+        (d,) = descriptors(hm, st, "RGBAEssenceDescriptor")
+        self.assertEqual(hm.get(d, PIC + "SampledHeight"), u32(1080))          # generische Items kommen
+        for q in ("PaddingBits", "ReversedByteOrder", "BlackRefLevel", "WhiteReflevel", "ColorRange"):
+            self.assertIsNone(hm.get(d, "CDCIEssenceDescriptor." + q), q)
+        self.assert_idempotent(src, tgt)
+
+    def test_picture_item_tag_collision_in_target_primer(self):
+        name = "CDCIEssenceDescriptor.BlackRefLevel"
+        ul = mh._norm(mh.item_ul(name))
+        static = mh._STATIC_TAG_OF_UL[ul]
+        for src_fake, tgt_fake in (({}, {mh._norm(FAKE_UL): static}), ({ul: 0x8123}, {}),
+                                   ({ul: 0x8123}, {mh._norm(FAKE_UL): static})):
+            s = make_card(SRC_TRACKS, ident=SONY_IDENT, fake_tags=src_fake)
+            t = make_card(TGT_TRACKS, ident=BMX_IDENT, fake_tags=tgt_fake)
+            edit_class(s, "CDCIEssenceDescriptor", lambda i: i + list(SRC_PIC), rename="MPEGVideoDescriptor")
+            edit_class(t, "CDCIEssenceDescriptor", lambda i: i + list(TGT_PIC) + [(FAKE_UL, b"\x01\x02")])
+            src, tgt = self.run_pair(s, t)
+            mh.adopt_from_source(tgt, src)
+            hm, st = structure(tgt)
+            shm, sst = structure(src)
+            (d,) = descriptors(hm, st, "CDCIEssenceDescriptor")
+            self.assertEqual(hm.get(d, name), u32(64))
+            tag = hm.tag_for_ul(ul)
+            self.assertTrue(tag is not None and 0 < tag <= 0xFFFF)
+            if tgt_fake:
+                self.assertGreaterEqual(tag, 0x8000)
+            self.assertEqual(mh._norm(hm.primer[tag]), ul)
+            self.assertEqual(hm.raw_ul_of_tag(tag), shm.raw_ul_of_tag(shm.tag_for_ul(ul)))
+            uls = [hm.ul_of_tag(tg) for tg, _ in d.items]
+            self.assertEqual(len(uls), len(set(uls)), "UL doppelt im Deskriptor")
+            self.assertEqual(len([1 for tg, _ in d.items if tg == tag]), 1)
+            self.assertEqual(hm.get(d, FAKE_UL), b"\x01\x02")                 # fremdes Item bleibt
+            self.assert_idempotent(src, tgt)
+
+    def test_picture_source_without_stored_fields_hint_and_no_change(self):
+        stored = {PIC + "StoredWidth", PIC + "StoredHeight", PIC + "FrameLayout"}
+        s, t = pic_pair(src_items=[i for i in SRC_PIC if i[0] not in stored])
+        src, tgt = self.run_pair(s, t)
+        hm0, st0 = structure(tgt)
+        (d0,) = descriptors(hm0, st0, "CDCIEssenceDescriptor")
+        items0 = [i for i in d0.items if i[0] != 0x3006]
+        log = mh.adopt_from_source(tgt, src)
+        self.assertTrue(any(m.startswith("HINWEIS: Bildspur 1") and "StoredWidth/StoredHeight/FrameLayout" in m
+                            for m in log), log)
+        hm, st = structure(tgt)
+        (d,) = descriptors(hm, st, "CDCIEssenceDescriptor")
+        self.assertEqual([i for i in d.items if i[0] != 0x3006], items0)
+        self.assert_idempotent(src, tgt)
+
+    # --- Ziel ohne Datenspur (--no-anc)
+    def test_target_without_data_track_source_with_anc(self):
+        s, _ = sound_pair()
+        add_anc(s, 5, duration=40)
+        t = make_card([x for x in TGT_TRACKS if x[0] != "data"], ident=BMX_IDENT)
+        src, tgt = self.run_pair(s, t)
+        log = mh.adopt_from_source(tgt, src)
+        self.assertFalse([m for m in log if "Datenspur" in m or "ANC" in m or "MultipleDescriptor" in m], log)
+        hm, st = structure(tgt)
+        self.assertEqual(descriptors(hm, st, "ANCDataDescriptor"), [])
+        self.assertEqual(st.file.kind_tracks("data"), [])
+        self.assert_idempotent(src, tgt)
+
+    # --- Preface.EssenceContainers
+    def test_essence_containers_order_like_source(self):
+        la = bytes.fromhex("060e2b34040101010d01030102106001")
+        lb = bytes.fromhex("060e2b34040101010d01030102060300")
+        lc = bytes.fromhex("060e2b34040101010d010301020e0000")
+        ld = bytes.fromhex("060e2b34040101010d010301027f0100")
+        lx = bytes.fromhex("060e2b34040101010d01030102ee0000")           # nur im Ziel
+        s, t = sound_pair()
+        for card, labels in ((s, [la, lb, lc, ld]), (t, [ld, lx, lc, lb[:7] + b"\x0a" + lb[8:], la])):
+            for n, items, u, k in card.sets:
+                if n == "Preface":
+                    card.sets[card.sets.index((n, items, u, k))] = (
+                        n, list(items) + [("Preface.EssenceContainers", batch(labels))], u, k)
+        src, tgt = self.run_pair(s, t)
+        log = mh.adopt_from_source(tgt, src)
+        self.assertIn("Preface.EssenceContainers: Reihenfolge wie in der Quelle", log)
+        hm, st = structure(tgt)
+        got = mh.uid_list(hm.get(st.preface, "Preface.EssenceContainers"))
+        self.assertEqual([mh._norm(x) for x in got], [mh._norm(x) for x in (la, lb, lc, ld, lx)])
+        self.assertEqual(got[1], lb[:7] + b"\x0a" + lb[8:])               # Zielbytes (Versionsbyte) bleiben
+        self.assert_idempotent(src, tgt)
+
+    # --- alter Zustand
+    def test_target_in_old_state_is_detected_and_pulled_up(self):
+        """Ziel wie vor der Erweiterung (Ton 50/1 + ContainerDuration, ANC/Multiple mit Dauer, altes Bild)."""
+        s, t = pic_pair()
+        add_anc(s, 5)
+        add_anc(t, 3001, duration=1632)
+        edit_class(t, "MultipleDescriptor", lambda i: i + [(CD, length(1632))])
+        edit_sound(s, lambda i, lt: [x for x in i if x[0] != CD])
+        edit_sound(t, lambda i, lt: [x for x in i if x[0] not in (SR, CD)] + [(SR, rate(50)), (CD, length(1632))])
+        src, tgt = self.run_pair(s, t)
+        diff = mh.compare_with_source(tgt, src)
+        self.assertTrue(any("SampleRate" in m for m in diff), diff)
+        self.assertTrue(any("Bild-Deskriptor" in m for m in diff), diff)
+        self.assertTrue(any("ContainerDuration" in m for m in diff), diff)
+        mh.adopt_from_source(tgt, src)
+        self.assertEqual(mh.compare_with_source(tgt, src), [])
+        self.assertEqual(mh.adopt_from_source(tgt, src), [])
+
+
 if __name__ == "__main__":
     unittest.main()

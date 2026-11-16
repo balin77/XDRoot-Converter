@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import struct
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Optional, Union
 
@@ -937,7 +938,8 @@ _SONY_FALLBACK = {
 }
 # Items, die im Ziel-Deskriptor bleiben (nicht aus der Quelle kopiert).  GenerationUID verweist auf die
 # ThisGenerationUID einer Identification und waere mit dem Wert der Quelle im Ziel ein haengender Verweis;
-# hat das Ziel keine, entfaellt das Item.
+# hat das Ziel keine, entfaellt das Item.  SampleRate und ContainerDuration werden in _adopt_sound gesondert
+# behandelt (SampleRate wie Quelle; ContainerDuration nur, wenn die Quelle sie hat, ggf. umgerechnet).
 _SOUND_KEEP = ("InterchangeObject.InstanceUID", "InterchangeObject.GenerationUID", "FileDescriptor.ContainerDuration",
                "FileDescriptor.SampleRate", "FileDescriptor.EssenceContainer")
 _SOUND_REFS = ("GenericDescriptor.SubDescriptors", "GenericDescriptor.Locators")
@@ -1079,7 +1081,7 @@ def _adopt_tracks(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: S
                 what, len(sp.kind_tracks("sound")), len(tp.kind_tracks("sound"))))
     fp_pairs = _pairs_file(ts.file, ss.file, log)
     mp_pairs = _pairs_material(tgt, src, ts, ss, fp_pairs)
-    sound_map = {id(t.set): s for t, s in fp_pairs if t.kind == "sound" and s is not None}
+    sound_map = {id(t.set): s for t, s in fp_pairs if t.kind in _ESSENCE_KINDS and s is not None}
     fp_old = {t.track_id: t for t in ts.file.tracks}
     # --- File Package zuerst, dann Material Package (unzugeordnete MP-Tracks erben ggf. die FP-ID)
     fp_new: dict = {}
@@ -1240,6 +1242,92 @@ def _ec_equal(a: Optional[bytes], b: Optional[bytes]) -> bool:
     return len(a) == 16 and len(b) == 16 and _norm(a) == _norm(b)
 
 
+_SR = "FileDescriptor.SampleRate"
+_CD = "FileDescriptor.ContainerDuration"
+
+
+def _rate(v: Optional[bytes]) -> Optional[Fraction]:
+    if v is None or len(v) != 8:
+        return None
+    n, d = struct.unpack(">ii", v)
+    return Fraction(n, d) if d else None
+
+
+def _usable_rate(v: Optional[bytes]) -> Optional[Fraction]:
+    r = _rate(v)
+    return r if r is not None and r > 0 else None
+
+
+def _length(v: Optional[bytes]) -> Optional[int]:
+    return struct.unpack(">q", v)[0] if v is not None and len(v) == 8 else None
+
+
+def _derive_sound_duration(tgt: HeaderMetadata, ts: Structure, track: TrackView, new_rate: Fraction) -> Optional[int]:
+    """ContainerDuration (in Samples der neuen Rate) aus dem Ziel ableiten: Bild-Deskriptor-ContainerDuration
+    und Sequenzdauer der Ton-Spur.  Nur wenn alle verfuegbaren Quellen denselben ganzzahligen Wert ergeben."""
+    cands: list = []
+    tdesc = ts.descriptor_by_track()
+    for pt in ts.file.kind_tracks("picture"):
+        pd = tdesc.get(id(pt.set))
+        if pd is None:
+            continue
+        cd, pr = _length(tgt.get(pd, _CD)), _rate(tgt.get(pd, _SR))
+        if cd is not None and pr:
+            cands.append(cd * new_rate / pr)
+    if track.sequence is not None:
+        dur = _length(tgt.get(track.sequence, "StructuralComponent.Duration"))
+        er = _rate(tgt.get(track.set, "Track.EditRate"))
+        if dur is not None and er:
+            cands.append(dur * new_rate / er)
+    if not cands or len(set(cands)) != 1 or cands[0].denominator != 1:
+        return None
+    return int(cands[0])
+
+
+def _sound_rate_and_duration(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, n: int, track: TrackView,
+                             td: MxfSet, sd: MxfSet, keep: dict, log: list) -> None:
+    """Setzt in ``keep`` die Werte fuer FileDescriptor.SampleRate (wie Quelle) und ContainerDuration (im Ziel
+    genau dann vorhanden, wenn die Quelle sie hat; bei geaenderter Rate exakt umgerechnet)."""
+    s_sr, t_sr = src.get(sd, _SR), keep[_SR]
+    s_cd, t_cd = src.get(sd, _CD), keep[_CD]
+    new_r, old_r = _usable_rate(s_sr), _usable_rate(t_sr)
+    src_rate_bad = s_sr is not None and new_r is None
+    if src_rate_bad:
+        log.append("HINWEIS: Tonspur %d: SampleRate der Quelle unbrauchbar - Ziel unveraendert" % n)
+    elif s_sr is not None:
+        keep[_SR] = s_sr
+    if s_cd is None:
+        keep[_CD] = None
+        return
+    if src_rate_bad:
+        return                                        # ContainerDuration des Ziels unveraendert
+    if t_cd is not None:
+        if new_r is None or new_r == old_r:
+            return                                    # Rate aendert sich nicht: Zielwert bleibt
+        cd = _length(t_cd)
+        if cd is not None and cd >= 0 and old_r is not None:
+            v = cd * new_r / old_r
+            if v.denominator == 1:
+                keep[_CD] = struct.pack(">q", int(v))
+                return
+        v = _derive_sound_duration(tgt, ts, track, new_r)
+        if v is None:
+            log.append("HINWEIS: Tonspur %d: ContainerDuration laesst sich nicht ganzzahlig auf die Abtastrate der "
+                       "Quelle umrechnen - weggelassen" % n)
+            keep[_CD] = None
+        else:
+            keep[_CD] = struct.pack(">q", v)
+        return
+    rate = new_r or old_r
+    v = _derive_sound_duration(tgt, ts, track, rate) if rate else None
+    if v is None:
+        log.append("HINWEIS: Tonspur %d: ContainerDuration fehlt im Ziel, die Quelle hat eine - nicht eindeutig "
+                   "ableitbar, weggelassen" % n)
+        keep[_CD] = None
+    else:
+        keep[_CD] = struct.pack(">q", v)
+
+
 def _adopt_sound(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: Structure,
                  sound_map: dict, log: list) -> None:
     tdesc = ts.descriptor_by_track()
@@ -1269,6 +1357,7 @@ def _adopt_sound(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: St
             log.append("HINWEIS: Tonspur %d: AvgBps wie Quelle (%s statt %s)" % (
                 n, _sound_value_text(_AVGBPS, sv_a), _sound_value_text(_AVGBPS, tv_a)))
         keep = {q: tgt.get(td, q) for q in _SOUND_KEEP}
+        _sound_rate_and_duration(tgt, src, ts, n, t, td, sd, keep, log)
         s_ec, t_ec = src.get(sd, "FileDescriptor.EssenceContainer"), keep["FileDescriptor.EssenceContainer"]
         same_ec = _ec_equal(s_ec, t_ec)
         if not same_ec:
@@ -1346,6 +1435,107 @@ def _adopt_sound(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: St
                 n, _items_diff(tgt, before, after)))
 
 
+_PIC = "GenericPictureEssenceDescriptor."
+_PICTURE_PRE = (_PIC + "StoredWidth", _PIC + "StoredHeight", _PIC + "FrameLayout")
+_PICTURE_ADOPT = tuple(_PIC + x for x in (
+    "SignalStandard", "SampledWidth", "SampledHeight", "SampledXOffset", "SampledYOffset",
+    "DisplayHeight", "DisplayWidth", "DisplayXOffset", "DisplayYOffset", "AspectRatio", "VideoLineMap",
+    "CaptureGamma", "ImageAlignmentOffset", "ImageStartOffset", "ImageEndOffset")) + tuple(
+    "CDCIEssenceDescriptor." + x for x in ("PaddingBits", "ReversedByteOrder", "BlackRefLevel", "WhiteReflevel",
+                                           "ColorRange"))
+
+
+def _adopt_picture(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: Structure,
+                   essence_map: dict, log: list) -> None:
+    """Codec-unabhaengige Items des Bild-Deskriptors aus der Quelle (nur wenn Stored*/FrameLayout gleich)."""
+    tdesc, sdesc = ts.descriptor_by_track(), ss.descriptor_by_track()
+    for n, t in enumerate(ts.file.kind_tracks("picture"), 1):
+        s = essence_map.get(id(t.set))
+        td, sd = tdesc.get(id(t.set)), (sdesc.get(id(s.set)) if s is not None else None)
+        if td is None or sd is None:
+            log.append("HINWEIS: Bildspur %d: Bild-Deskriptor nicht eindeutig zuordenbar - nicht angeglichen" % n)
+            continue
+        if all(src.get(sd, q) is None for q in _PICTURE_ADOPT):
+            continue                                  # Quelle hat nichts zu uebernehmen
+        diff = [q.split(".")[1] for q in _PICTURE_PRE
+                if tgt.get(td, q) is None or src.get(sd, q) is None or tgt.get(td, q) != src.get(sd, q)]
+        if diff:
+            log.append("HINWEIS: Bildspur %d: %s von Quelle und Ziel verschieden bzw. fehlend - Bild-Deskriptor "
+                       "nicht angeglichen" % (n, "/".join(diff)))
+            continue
+        before = (td.key, list(td.items))
+        done: list = []
+        cdci_ok = set_name(td.key) in ("CDCIEssenceDescriptor", "MPEGVideoDescriptor")
+        skipped: list = []
+        for q in _PICTURE_ADOPT:
+            ul = _ITEM_UL[q]
+            v = src.get(sd, ul)
+            if v is None:
+                continue
+            if q.startswith("CDCIEssenceDescriptor.") and not cdci_ok:
+                skipped.append(q.split(".")[1])
+                continue
+            tag = src.tag_for_ul(ul)
+            ref = src.raw_ul_of_tag(tag) if tag is not None else None
+            tgt.put(td, ref if ref is not None and len(ref) == 16 else q, v, after=list(_PICTURE_PRE) + done)
+            done.append(q)
+        if skipped:
+            log.append("HINWEIS: Bildspur %d: CDCI-Items der Quelle (%s) passen nicht zur Klasse %s des Ziels - "
+                       "nicht uebernommen" % (n, ", ".join(skipped), set_name(td.key)))
+        after = (td.key, list(td.items))
+        if after != before:
+            log.append("Bildspur %d: Bild-Deskriptor an Quelle angeglichen (%s)" % (n, _items_diff(tgt, before, after)))
+
+
+def _adopt_container_durations(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: Structure,
+                               essence_map: dict, log: list) -> None:
+    """Daten-(ANC-)Deskriptoren und MultipleDescriptor: ContainerDuration im Ziel genau dann, wenn die Quelle
+    sie hat (nur entfernen, nichts erfinden)."""
+    tdesc, sdesc = ts.descriptor_by_track(), ss.descriptor_by_track()
+    items: list = []
+    for n, t in enumerate(ts.file.kind_tracks("data"), 1):
+        s = essence_map.get(id(t.set))
+        td, sd = tdesc.get(id(t.set)), (sdesc.get(id(s.set)) if s is not None else None)
+        if td is not None and sd is not None:
+            items.append(("Datenspur %d" % n, td, sd))
+    if ts.file.descriptor is not None and ss.file.descriptor is not None \
+            and tgt.name(ts.file.descriptor) == "MultipleDescriptor" == src.name(ss.file.descriptor):
+        items.append(("MultipleDescriptor", ts.file.descriptor, ss.file.descriptor))
+    for what, td, sd in items:
+        s_cd, t_cd = src.get(sd, _CD), tgt.get(td, _CD)
+        if s_cd is None and t_cd is not None:
+            tgt.drop(td, _CD)
+            log.append("%s: ContainerDuration %s entfernt (Quelle hat keine)" % (what, _length(t_cd)))
+        elif s_cd is not None and t_cd is None:
+            log.append("HINWEIS: %s: ContainerDuration fehlt im Ziel, die Quelle hat eine - nicht ergaenzt" % what)
+
+
+def _adopt_essence_containers(tgt: HeaderMetadata, src: HeaderMetadata, ts: Structure, ss: Structure,
+                              log: list) -> None:
+    """Preface.EssenceContainers: Reihenfolge wie in der Quelle (nur fuer Labels, die beide haben);
+    uebrige Ziel-Labels dahinter.  Die Menge der Labels aendert sich nie."""
+    if ts.preface is None or ss.preface is None:
+        return
+    q = "Preface.EssenceContainers"
+    tv, sv = tgt.get(ts.preface, q), src.get(ss.preface, q)
+    if tv is None or sv is None:
+        return
+    tl, sl = uid_list(tv), uid_list(sv)
+    if len(tv) != 8 + 16 * len(tl) or len(sv) != 8 + 16 * len(sl):
+        return
+    rest = list(tl)
+    ordered: list = []
+    for lab in sl:
+        for i, x in enumerate(rest):
+            if _norm(x) == _norm(lab):
+                ordered.append(rest.pop(i))
+                break
+    ordered += rest
+    if ordered != tl:
+        tgt.put(ts.preface, q, _uid_batch(ordered))
+        log.append("Preface.EssenceContainers: Reihenfolge wie in der Quelle")
+
+
 def _items_diff(hm: HeaderMetadata, before: tuple, after: tuple) -> str:
     def to_map(items):
         m = {}
@@ -1414,6 +1604,10 @@ def adopt_headers(tgt: HeaderMetadata, src: HeaderMetadata) -> list:
     ts = resolve(tgt)
     # sound_map verweist auf Track-Sets des Ziels (Set-Objekte bleiben gleich) -> id() stabil
     _adopt_sound(tgt, src, ts, ss, sound_map, log)
+    ts = resolve(tgt)
+    _adopt_picture(tgt, src, ts, ss, sound_map, log)
+    _adopt_container_durations(tgt, src, ts, ss, sound_map, log)
+    _adopt_essence_containers(tgt, src, ts, ss, log)
     ts = resolve(tgt)
     _adopt_text(tgt, src, ts, ss, log)
     verify_references(tgt)
