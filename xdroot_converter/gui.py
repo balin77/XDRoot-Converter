@@ -151,11 +151,15 @@ def target_is_xdroot(dst: str) -> bool:
 
 
 _TRANSCODE_PREFIXES = ("Starte Transkodierung", "Transkodiere")
+VERIFY_PREFIX = "Abschlussprüfung"
 
 
 def progress_texts(name: str, text: str, total_frac: float, eta_s: Optional[float]) -> tuple[str, str]:
     """(Zeile über dem Clip-Balken, Zeile über dem Gesamt-Balken)."""
     clip = f"{name}  {text}".strip() if (name or text) else ""
+    if (text or "").startswith(VERIFY_PREFIX):  # eigene Phase mit eigener Anzeige
+        rest = f", Restzeit ca. {converter.fmt_duration(eta_s)}" if eta_s and eta_s > 0 else ""
+        return clip, f"Abschlussprüfung {total_frac * 100:.1f} %{rest}"
     if eta_s is None:
         # Restzeit nur schätzbar, sobald transkodiert wird (nicht in Analyse-/Prüf-/Kopierphase)
         rest = ", Restzeit wird berechnet …" if (text or "").startswith(_TRANSCODE_PREFIXES) else ""
@@ -225,6 +229,11 @@ def completion_message(summary) -> tuple[str, str, str]:
 
     failed = [r for r in summary.results if r.status == converter.ST_FAILED]
     copy_errors = list(getattr(summary, "copy_errors", None) or [])
+    vf = getattr(summary, "verify", None)
+    v_started = bool(vf is not None and getattr(vf, "started", False))
+    v_cancelled = v_started and bool(getattr(vf, "cancelled", False))
+    v_problem = bool(v_started and getattr(summary, "verify_problem", False))
+    v_ok = bool(v_started and getattr(vf, "verified_ok", False)) and not (failed or copy_errors)
     counts = (
         f"umgewandelt: {summary.count(converter.ST_CONVERTED)}, "
         f"bereits fertig: {summary.count(converter.ST_SKIPPED_DONE)}, "
@@ -237,26 +246,104 @@ def completion_message(summary) -> tuple[str, str, str]:
         reason = str(getattr(summary, "abort_reason", "") or "")
         if reason:  # Abbruch durch die Temperaturüberwachung (Pause zu lang): eigener, klarer Grund
             parts.append(reason)
-        parts.append("Die Umwandlung wurde abgebrochen. Bereits fertige Clips bleiben erhalten.")
-        parts.append("Die Zielkarte ist unvollständig. Ein erneuter Lauf mit demselben Zielordner setzt fort.")
-    elif failed or copy_errors:
-        kind, title = "warning", "Fertig mit Fehlern"
+        if v_cancelled:
+            parts.append("Die Umwandlung war abgeschlossen. Die Abschlussprüfung wurde abgebrochen, "
+                         "die Prüfung ist unvollständig.")
+            parts.append("Ein erneuter Lauf mit demselben Zielordner führt die Prüfung noch einmal aus "
+                         "(fertige Clips werden übersprungen).")
+        else:
+            parts.append("Die Umwandlung wurde abgebrochen. Bereits fertige Clips bleiben erhalten.")
+            parts.append("Die Zielkarte ist unvollständig. Ein erneuter Lauf mit demselben Zielordner setzt fort.")
+    elif failed or copy_errors or v_problem:
+        v_error = str(getattr(vf, "error", "") or "") if v_started else ""
+        if v_error and not (failed or copy_errors) and not getattr(vf, "deviations", None):
+            kind, title = "warning", "Umwandlung fertig – Prüfung nicht möglich"
+        else:
+            kind, title = "warning", "Fertig mit Fehlern"
         bits = []
         if failed:
             bits.append(f"{len(failed)} Clip(s) sind fehlgeschlagen")
         if copy_errors:
             bits.append(f"{len(copy_errors)} Datei(en) konnten nicht kopiert werden")
+        if v_problem:
+            n_dev = len(getattr(vf, "deviations", None) or [])
+            if n_dev:
+                bits.append(f"die Abschlussprüfung hat {n_dev} Abweichung(en) gefunden")
+            else:
+                bits.append("die Abschlussprüfung war nicht möglich")
         parts.append("Die Umwandlung ist beendet, aber " + " und ".join(bits) + ".")
+        if v_error:
+            parts.append(f"Die Prüfung konnte nicht durchgeführt werden: {v_error} – die Karte ist NICHT geprüft.")
+    elif v_ok:
+        deep = bool(getattr(vf, "deep", True))
+        kind, title = "info", "Fertig – geprüft" if deep else "Fertig – geprüft (schnelle Prüfung)"
+        parts.append(
+            "Die Umwandlung ist beendet und die Zielkarte wurde geprüft"
+            + (" (jeder Clip komplett dekodiert)" if deep else " (schnelle Prüfung, Clips nicht komplett dekodiert)")
+            + f": {vf.checked} Clips, keine Abweichung.")
     else:
         kind, title = "info", "Fertig"
         parts.append("Die Umwandlung ist erfolgreich beendet.")
     parts.append(counts)
+    bad_names: list = []
+    if v_started and not v_cancelled:
+        retried = dict(getattr(vf, "retried", None) or {})
+        bad = list(getattr(vf, "bad_clips", None) or [])
+        if not getattr(vf, "error", ""):
+            parts.append(f"Geprüft: {getattr(vf, 'checked', 0)} Clips, {getattr(vf, 'ok', 0)} ohne Abweichung"
+                         + ("" if getattr(vf, "deep", True) else " (schnelle Prüfung, Clips nicht komplett dekodiert)"))
+        if retried:
+            fixed = [n for n in retried if n not in bad]
+            lines = [f"Wiederholt: {len(retried)} Clip(s) in {getattr(vf, 'rounds', 0)} Runde(n)"
+                     + (f", danach in Ordnung: {len(fixed)}" if fixed else "")
+                     + (f", weiterhin fehlerhaft: {len(bad)}" if bad else "") + ":"]
+            for name, reasons in list(retried.items())[:MAX_LISTED_FAILED]:
+                why = " ".join(str(reasons[0] if reasons else "").split())
+                if len(why) > MAX_REASON_CHARS:
+                    why = why[:MAX_REASON_CHARS].rstrip() + " …"
+                lines.append(f"  • {name}" + (f" – {why}" if why else ""))
+            if len(retried) > MAX_LISTED_FAILED:
+                lines.append(f"  … und {len(retried) - MAX_LISTED_FAILED} weitere, siehe Protokoll")
+            parts.append("\n".join(lines))
+        # EINE gemeinsame Liste der endgültig fehlerhaften Clips (Name + erster Grund)
+        devs = list(getattr(vf, "deviations", None) or [])
+        for name in [r.name for r in failed] + bad:
+            if name not in bad_names:
+                bad_names.append(name)
+        if bad_names:
+            n_rounds = int(getattr(vf, "rounds", 0) or 0)
+            if int(getattr(vf, "retries", 0) or 0) == 0:
+                head = "Fehlerhaft (keine Wiederholung eingestellt):"
+            elif n_rounds:
+                head = f"Nach {n_rounds} Wiederholungsrunde(n) weiterhin fehlerhaft:"
+            else:
+                head = "Fehlerhaft:"
+            lines = [head]
+            by_name = {r.name: r for r in failed}
+            for name in bad_names[:MAX_LISTED_FAILED]:
+                why = next((d for d in devs if name.casefold() in d.casefold()), "")
+                why = " ".join(why.split())
+                if not why and name in by_name:
+                    why = _fail_reason(by_name[name]).lstrip(" –").strip()
+                if len(why) > MAX_REASON_CHARS:
+                    why = why[:MAX_REASON_CHARS].rstrip() + " …"
+                lines.append(f"  • {name}" + (f" – {why}" if why else ""))
+            if len(bad_names) > MAX_LISTED_FAILED:
+                lines.append(f"  … und {len(bad_names) - MAX_LISTED_FAILED} weitere (siehe Protokoll)")
+            parts.append("\n".join(lines))
+        elif v_problem and devs:
+            parts.append("Abweichungen der Prüfung (Einzelheiten im Protokoll):\n  • "
+                         + "\n  • ".join(" ".join(str(d).split())[:130] for d in devs[:5]))
+        if getattr(vf, "seconds", 0):
+            conv_s = float(getattr(summary, "convert_seconds", 0.0) or 0.0)
+            parts.append((f"Dauer: Umwandlung {converter.fmt_duration(conv_s)}, " if conv_s else "Dauer: ")
+                         + f"Abschlussprüfung {converter.fmt_duration(vf.seconds)}")
     pauses = int(getattr(summary, "pauses", 0) or 0)
     if pauses > 0:
         hot = getattr(summary, "max_cpu_c", None)
         parts.append(f"Temperaturpausen: {pauses}, gesamt {_fmt_pause(getattr(summary, 'pause_seconds', 0.0))}"
                      + (f" (höchste CPU-Temperatur {hot:.0f} °C)" if hot else ""))
-    if failed:
+    if failed and not bad_names:  # sonst stehen sie schon in der gemeinsamen Liste oben
         lines = ["Fehlgeschlagene Clips:"]
         for r in failed[:MAX_LISTED_FAILED]:
             lines.append(f"  • {r.name}{_fail_reason(r)}")
@@ -297,12 +384,23 @@ def _fmt_pause(seconds: float) -> str:
 def finish_status(summary) -> str:
     if summary.fatal:
         return "Fehler: " + str(summary.fatal)
+    vf = getattr(summary, "verify", None)
     if summary.cancelled:
         if getattr(summary, "abort_reason", ""):
+            if vf is not None and getattr(vf, "started", False):
+                return "Abgebrochen: CPU kühlt nicht ab, Prüfung unvollständig."
             return "Abgebrochen: CPU kühlt nicht ab."
+        if vf is not None and getattr(vf, "cancelled", False):
+            return "Abgebrochen, Prüfung unvollständig."
         return "Abgebrochen."
     if summary.failed:
         return f"Fertig mit {summary.failed} Fehler(n) – siehe Protokoll."
+    if getattr(summary, "verify_problem", False):
+        n = len(getattr(vf, "deviations", None) or [])
+        return (f"Fertig mit {n} Abweichung(en) in der Prüfung – siehe Protokoll." if n
+                else "Fertig – die Abschlussprüfung war nicht möglich, siehe Protokoll.")
+    if vf is not None and getattr(vf, "verified_ok", False):
+        return "Fertig – geprüft." if getattr(vf, "deep", True) else "Fertig – geprüft (schnell)."
     return "Fertig."
 
 
@@ -373,6 +471,8 @@ class App(_Base):  # type: ignore[misc,valid-type]
         self.var_temp_fan = tk.StringVar(value=f"{thermal.DEFAULT_FAN_ON_C:g}")
         self.var_temp_pause = tk.StringVar(value=f"{thermal.DEFAULT_PAUSE_C:g}")
         self.var_threads = tk.StringVar(value="")
+        self.var_auto_verify = tk.BooleanVar(value=True)
+        self.var_verify_deep = tk.BooleanVar(value=True)
         self._admin_hint_shown = False
         self.var_overview = tk.StringVar(value="Bitte Quellordner wählen.")
         self.var_br_hint = tk.StringVar(value="")
@@ -459,13 +559,20 @@ class App(_Base):  # type: ignore[misc,valid-type]
         e_thr.grid(row=0, column=1, sticky="w", padx=4, pady=1)
         self.lbl_thr_hint = ttk.Label(cf, text=HINT_THREADS, foreground="#555555")
         self.lbl_thr_hint.grid(row=0, column=2, sticky="w", padx=4, pady=1)
+        # Abschlussprüfung (Standard an, gründlich); der zweite Haken hängt vom ersten ab (_update_verify_fields)
+        ck_av = ttk.Checkbutton(fs, text="Nach der Umwandlung prüfen und fehlerhafte Clips wiederholen",
+                                variable=self.var_auto_verify, command=self._update_verify_fields)
+        ck_av.grid(row=6, column=0, columnspan=5, sticky="w", padx=4, pady=1)
+        ck_deep = ttk.Checkbutton(fs, text="gründlich (jeden Clip komplett dekodieren)", variable=self.var_verify_deep)
+        ck_deep.grid(row=7, column=0, columnspan=5, sticky="w", padx=(26, 4), pady=1)
         # Hinweistexte passen ihre Umbruchbreite der Breite des Rahmens an (auch bei Mindestgröße lesbar)
         fs.bind("<Configure>", self._wrap_setting_hints)
         # (Widget, Zustand im freigegebenen Betrieb); die Temperaturfelder steuert _update_thermal_fields
         lock.extend([(e_src, "normal"), (b_src, "normal"), (e_dst, "normal"), (b_dst, "normal"),
                      (sp, "normal"), (cb, "readonly"), (ck, "normal"), (ck_th, "normal"),
-                     (e_thr, "normal")])
+                     (e_thr, "normal"), (ck_av, "normal")])
         self._temp_fields = [e_fan, e_pause]
+        self._verify_fields = [ck_deep]
 
         bf = ttk.Frame(root)
         bf.grid(row=5, column=0, columnspan=3, sticky="w", **pad)
@@ -588,6 +695,18 @@ class App(_Base):  # type: ignore[misc,valid-type]
             except Exception:  # noqa: BLE001
                 pass
         self._update_thermal_fields(enabled)
+        self._update_verify_fields(enabled)
+
+    def _update_verify_fields(self, inputs_enabled: Optional[bool] = None) -> None:
+        """Der Haken „gründlich“ ist nur bedienbar, wenn die Abschlussprüfung an ist (und die Eingaben nicht gesperrt sind)."""
+        if inputs_enabled is None:
+            inputs_enabled = not self._ui_running
+        on = bool(self.var_auto_verify.get()) and inputs_enabled
+        for w in getattr(self, "_verify_fields", []):
+            try:
+                w.configure(state="normal" if on else "disabled")
+            except Exception:  # noqa: BLE001
+                pass
 
     def _update_thermal_fields(self, inputs_enabled: Optional[bool] = None) -> None:
         """Temperaturfelder nur bedienbar, wenn die Überwachung an ist (und die Eingaben nicht gesperrt sind)."""
@@ -746,6 +865,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
             unlisted="skip" if self.var_skip_unlisted.get() else "convert",
             thermal="auto" if self.var_thermal_on.get() else "off",
             temp_fan=temp_fan, temp_pause=temp_pause, threads=threads,
+            auto_verify=bool(self.var_auto_verify.get()), auto_verify_deep=bool(self.var_verify_deep.get()),
         )
         # Übersichts-Analyse beenden; der Worker wartet auf ihr Ende (kein paralleler Scan)
         self._cancel_overview()
@@ -881,7 +1001,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
 
     def _finish(self, summary: "converter.RunSummary") -> None:
         try:
-            ok = not (summary.cancelled or summary.fatal or summary.failed)
+            ok = not (summary.cancelled or summary.fatal or summary.failed or summary.verify_problem)
             if ok:
                 self.pb_clip["value"] = 1000
                 self.pb_total["value"] = 1000
@@ -894,7 +1014,13 @@ class App(_Base):  # type: ignore[misc,valid-type]
                 self.var_total_label.set("")
             else:
                 self.var_clip_label.set("")
-                self.var_total_label.set(progress_texts("", "", self._last_total, 0)[1])
+                vf = getattr(summary, "verify", None)
+                if vf is not None and getattr(vf, "started", False):
+                    # nach Abweichung/Abbruch in der Pruefung nicht den Umwandlungs-Stand ("Gesamt 98.7 %") zeigen
+                    self.var_total_label.set("Abschlussprüfung abgebrochen, Prüfung unvollständig"
+                                             if getattr(vf, "cancelled", False) else "Abschlussprüfung beendet")
+                else:
+                    self.var_total_label.set(progress_texts("", "", self._last_total, 0)[1])
             # Die Zusammenfassung steht bereits im Protokoll (converter.run schreibt sie über log)
             if summary.log_path:
                 self._append(f"Protokoll: {summary.log_path}")

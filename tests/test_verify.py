@@ -305,6 +305,108 @@ class TailDecode(unittest.TestCase):
         out, _ = self._run("frame=25", stderr="[h264] error while decoding MB")
         self.assertIn("Decodierfehler", "\n".join(out))
 
+    def test_xerror_and_nonzero_return_value(self):
+        out, args = self._run("frame=25", rc=183)
+        self.assertIn("-xerror", args)
+        self.assertIn("Rueckgabewert 183", "\n".join(out))
+
+
+class DeepDecode(unittest.TestCase):
+    """G1a: beschaedigte Bilder meldet ffmpeg nur mit -xerror (sonst Warnung, Rueckgabewert 0)."""
+
+    def _run(self, rc=0, stderr="", threads=None):
+        seen = {}
+
+        def fake(args, cancel=None, on_stdout_line=None, **kw):
+            seen["args"] = [str(a) for a in args]
+            on_stdout_line("frame=300")
+            return tools.ProcResult(rc, "frame=300", stderr)
+
+        with mock.patch.object(tools, "find_tool", return_value="ffmpeg"), mock.patch.object(tools, "run_capture", fake):
+            n, errs = verify.deep_decode_check("x.mxf", threads=threads)
+        return n, errs, seen["args"]
+
+    def test_clean_run_has_no_findings_and_uses_xerror(self):
+        n, errs, args = self._run()
+        self.assertEqual((n, errs), (300, []))
+        self.assertIn("-xerror", args)
+        self.assertLess(args.index("-xerror"), args.index("-i"))
+
+    def test_nonzero_return_value_is_a_finding(self):
+        n, errs, _ = self._run(rc=183)
+        self.assertEqual(errs, ["ffmpeg Rueckgabewert 183"])
+
+    def test_stderr_text_is_a_finding(self):
+        n, errs, _ = self._run(rc=183, stderr="corrupt decoded frame in stream 0\nInvalid data found")
+        self.assertIn("corrupt decoded frame", errs[0])
+        self.assertTrue(errs)
+        _, errs, _ = self._run(rc=0, stderr="[h264] error while decoding MB")
+        self.assertTrue(errs)
+
+    def test_threads_passed(self):
+        _, _, args = self._run(threads=8)
+        self.assertEqual(args[args.index("-threads") + 1], "8")
+
+
+class AudioFull(unittest.TestCase):
+    """G1b: vollstaendiger Ton-Vergleich ueber Pruefsummen je Spur."""
+    H = "0123456789abcdef0123456789abcdef"
+
+    def _hash_out(self, hashes):
+        return "".join(f"{i},a,MD5={h}\n" for i, h in enumerate(hashes))
+
+    def _run(self, src, tgt, **kw):
+        calls = []
+
+        def fake(args, cancel=None, **k):
+            args = [str(a) for a in args]
+            calls.append((args, cancel))
+            data = src if args[args.index("-i") + 1] == "S" else tgt
+            if isinstance(data, Exception):
+                return tools.ProcResult(1, "", "Invalid data found")
+            return tools.ProcResult(0, self._hash_out(data), "")
+
+        with mock.patch.object(tools, "find_tool", return_value="ffmpeg"), mock.patch.object(tools, "run_capture", fake):
+            out = verify.check_audio_full("T", "S", **kw)
+        self.calls = calls
+        return out
+
+    def test_identical_is_clean_and_command_is_stream_hash_of_copied_audio(self):
+        tok = tools.CancelToken()
+        h = [self.H, "a" * 32, "b" * 32]
+        self.assertEqual(self._run(h, list(h), cancel=tok, threads=8), [])
+        self.assertEqual(len(self.calls), 2)
+        for args, cancel in self.calls:
+            self.assertIs(cancel, tok)                         # am CancelToken registriert (Abbruch/Temperaturpause)
+            for opt in ("-xerror", "streamhash", "md5"):
+                self.assertIn(opt, args)
+            self.assertEqual(args[args.index("-map") + 1], "0:a")
+            self.assertEqual(args[args.index("-c") + 1], "copy")
+            self.assertEqual(args[args.index("-threads") + 1], "8")
+
+    def test_damaged_track_is_named(self):
+        out = self._run([self.H, "a" * 32, "b" * 32], [self.H, "a" * 32, "c" * 32])
+        self.assertEqual(out, ["Tonspur 3: Inhalt weicht von der Quelle ab (vollständiger Vergleich)"])
+
+    def test_track_count_differs(self):
+        out = self._run([self.H, self.H], [self.H])
+        self.assertIn("1 im Ziel statt 2", out[0])
+
+    def test_source_read_error_is_marked_as_source(self):
+        out = self._run(RuntimeError("x"), [self.H])
+        self.assertTrue(out[0].startswith("Tonspuren-Inhalt nicht pruefbar (Quelle)"), out)
+
+    def test_target_read_error_is_a_clip_finding(self):
+        out = self._run([self.H], RuntimeError("x"))
+        self.assertIn("vollstaendiger Vergleich", out[0])
+        self.assertFalse(out[0].startswith("Tonspuren-Inhalt nicht pruefbar (Quelle)"))
+
+    def test_cancel_propagates(self):
+        with mock.patch.object(tools, "find_tool", return_value="ffmpeg"), \
+                mock.patch.object(tools, "run_capture", side_effect=tools.Cancelled()):
+            with self.assertRaises(tools.Cancelled):
+                verify.check_audio_full("T", "S")
+
 
 # --------------------------------------------------------------------------- Ton-Inhalt
 
@@ -377,7 +479,7 @@ class AudioContent(unittest.TestCase):
     def test_extraction_failure_is_a_problem_and_cancel_propagates(self):
         out = self._run({0: RuntimeError("kaputt")}, {0: []})
         self.assertEqual(len(out), 1)
-        self.assertIn("Tonspuren-Inhalt nicht pruefbar: kaputt", out[0])
+        self.assertIn("Tonspuren-Inhalt nicht pruefbar (Quelle): kaputt", out[0])
         with mock.patch.object(verify, "_extract_audio", side_effect=tools.Cancelled()):
             with self.assertRaises(tools.Cancelled):
                 verify.check_audio_content("T", "S", fps=Fraction(50), duration=100)
@@ -637,6 +739,47 @@ class VerifyCardMocked(unittest.TestCase):
         self.assertTrue(any("JUNK.MXF: MXF nicht lesbar" in p for p in run().problems))  # ohne Quelle: nicht belegbar
         (src_root / "Clip" / "JUNK.MXF").write_bytes(b"\x02" * 100)  # Quelle inzwischen anders -> Abweichung
         self.assertTrue(any("JUNK.MXF: MXF nicht lesbar" in p for p in run(source=str(src_root)).problems))
+
+    def test_deep_with_source_compares_audio_completely_and_quick_uses_windows(self):
+        src_root = self.tmp / "SRC" / "XDROOT"
+        (src_root / "Clip").mkdir(parents=True)
+        (src_root / "MEDIAPRO.XML").write_bytes(_MP_EMPTY)
+        (src_root / "Clip" / "FX6ENG10562.MXF").write_bytes(b"y")
+        (src_root / "Clip" / "FX6ENG10562M01.XML").write_bytes(self.xml)
+        src_info = copy.deepcopy(self.info)
+
+        def run(deep, full=(), window=(), **kw):
+            with mock.patch.object(mxfinfo, "read_mxf_info",
+                                   side_effect=lambda p, cancel=None: src_info if "SRC" in p else self.info), \
+                    mock.patch.object(mxfinfo, "run_ffprobe", return_value=self.probe), \
+                    mock.patch.object(verify, "check_structure", return_value=[]), \
+                    mock.patch.object(verify, "measure_gop", return_value=[24]), \
+                    mock.patch.object(verify, "tail_decode_check", return_value=[]), \
+                    mock.patch.object(verify, "deep_decode_check", return_value=(self.info.duration, [])), \
+                    mock.patch.object(verify, "check_audio_content", return_value=list(window)) as win, \
+                    mock.patch.object(verify, "check_audio_full", return_value=list(full)) as fl, \
+                    mock.patch.object(verify, "check_header", return_value=[]):
+                rep = verify.verify_card(str(self.root), source=str(src_root), deep=deep, threads=8, **kw)
+            return rep, win, fl
+
+        rep, win, fl = run(True, full=["Tonspur 3: Inhalt weicht von der Quelle ab (vollständiger Vergleich)"])
+        win.assert_not_called()
+        self.assertEqual(fl.call_args.kwargs["threads"], 8)
+        self.assertTrue(any(p.endswith("(vollständiger Vergleich)") and "Tonspur 3" in p for p in rep.problems), rep.problems)
+        self.assertEqual(rep.findings[0].kind, "clip")
+        # Quelle nicht lesbar: kind source (keine Neu-Umwandlung hilft)
+        rep, _, _ = run(True, full=["Tonspuren-Inhalt nicht pruefbar (Quelle): kaputt"])
+        self.assertEqual(rep.findings[0].kind, "source")
+        # schnell: weiter Ausschnitt-Pruefung
+        rep, win, fl = run(False)
+        win.assert_called_once()
+        fl.assert_not_called()
+        # Testausgabe + deep: Ziel kuerzer, Pruefsumme nicht vergleichbar -> Ausschnitte + Hinweis
+        (self.tmp / verify.TEST_MARKER).write_text("max_frames=10\n", encoding="utf-8")
+        rep, win, fl = run(True)
+        win.assert_called_once()
+        fl.assert_not_called()
+        self.assertTrue(any("Ton nur in Ausschnitten" in n for n in rep.notes), rep.notes)
 
     def test_structure_problem_reported(self):
         with mock.patch.object(mxfinfo, "read_mxf_info", return_value=self.info), \

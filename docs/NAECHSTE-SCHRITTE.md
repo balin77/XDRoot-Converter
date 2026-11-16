@@ -4,7 +4,8 @@ Stand 16.11.2026: Der Stand nach Runde 2 und den Fix-Runden wurde **lokal unter 
 (Sony PMW-F5 und eine F55-Karte als Quelle, Sony FX6 als XAVC-L-Referenz). Dabei kam ein weiterer Fix an den Kopfdaten dazu
 (Deskriptoren wie echte Sony-Dateien). Die umgewandelte F55-Karte wurde vom Autor in **DaVinci Resolve** und **Sony Catalyst
 Browse** importiert: Karte erkannt, Wiedergabe und Tonspuren in Ordnung; die Timecode-Anzeige wurde dort nicht verglichen.
-Die Temperaturüberwachung (Runde 3) ist neu und nur teilweise getestet.
+Die Temperaturüberwachung (Runde 3) ist neu und nur teilweise getestet. Neu in Runde 4: die **Abschlussprüfung** nach jeder
+Umwandlung mit automatischer Neu-Umwandlung fehlerhafter Clips (siehe unten).
 
 ## Was lokal mit echtem Material geprüft wurde
 
@@ -17,6 +18,8 @@ aller Quellordner (Namen, Größen, Änderungszeiten) vor und nach den Tests zei
 | `--mxf-info` auf je einen echten F5-, F55- und FX6-Clip | fehlerfrei gelesen; Befunde unten |
 | F5-Karte, 19 in `MEDIAPRO.XML` gelistete Clips (18,33 GB, 11:01 min Material) | 19 umgewandelt, 0 Fehler, 4,62 GB, 11:47 min; `--verify --source --deep`: 19 ohne Abweichung |
 | F55-Karte, alle 76 Clips (104,18 GB, 62:39 min Material) | 76 umgewandelt, 26,42 GB; `--verify --source --deep`: 76 ohne Abweichung, 155 Begleitdateien verglichen |
+| Beide Karten erneut mit der **verschärften** Prüfung (Runde 4: Decode mit `-xerror`, Ton je Spur vollständig) | F5: 19 von 19 ohne Abweichung (2:11 min); F55: 76 von 76 ohne Abweichung, 155 Begleitdateien verglichen (gegen eine Kopie der Originalkarte auf Festplatte, die Karte selbst war inzwischen neu bespielt) |
+| Abschlussprüfung mit gezielt beschädigtem Ziel-Clip (Bilddaten bzw. Ton überschrieben) | Schaden gemeldet, Clip in Wiederholungsrunde 1 neu umgewandelt, „Ergebnis: Fertig – geprüft, ohne Abweichung“; beschädigter, nicht ausgewählter Clip: Exit-Code 1, „Fertig mit Fehlern“ |
 | `scripts/mxf_vergleich.py` Quelle / Ziel / FX6-Referenz | Quelle ≠ Ziel: 20 Abweichungen, alle durch den Codec-Wechsel; Bericht: `docs/analysis/vergleich_f55_ziel_fx6.md` |
 | Strg+C in der Kommandozeile | Exit-Code 130 nach 1,4 s, Arbeitsordner und Sperre entfernt, keine verwaisten Prozesse |
 | Fortsetzen nach Strg+C | Clip neu erzeugt, `--verify --source` für den Clip ohne Abweichung |
@@ -68,8 +71,9 @@ Alle im Bericht `docs/analysis/vergleich_f55_ziel_fx6.md` (Spalte `R≠Z`):
 
 1. **Timecode und Metadatenanzeige** in Resolve bzw. Catalyst Browse mit dem Original und einem FX6-Clip vergleichen (Import,
    Wiedergabe und Tonspuren sind geprüft). Weitere Programme (Avid, Premiere) bei Bedarf.
-2. **Oberfläche von Hand:** Lauf mit Abbrechen und Fortsetzen, Abschlussfenster, Rückfragen beim Start, Schließen während
-   eines Laufs (Checkliste in der Rückmeldung des lokalen Tests).
+2. **Oberfläche von Hand:** Lauf mit Abbrechen und Fortsetzen, Abschlussfenster (jetzt mit „Geprüft: N Clips, M ohne
+   Abweichung“), Rückfragen beim Start, Schließen während eines Laufs, die neuen Einstellungen zur Abschlussprüfung
+   (Checkliste in der Rückmeldung des lokalen Tests).
 3. **Temperaturüberwachung:** `Temperatur-Test (Administrator).bat` ausführen und die Ausgabe zurückmelden (siehe unten).
 4. Ein sehr langer Clip (ca. 56 GB, 31 min; WAV-Dateien über 4 GB) wurde **nicht** getestet, weil er nicht mehr auf der Karte
    lag. Der größte getestete Clip hatte 10,1 GB.
@@ -81,6 +85,33 @@ Attrappen), das Anhalten und Fortsetzen von Prozessen unter Windows (mit Hilfspr
 („Temperatur nicht verfügbar“). **Nicht getestet** sind echte Messwerte und das Schalten der Lüfter: Beides braucht
 Administratorrechte, und die Kennung für „Lüfter voll“ ist eine unbestätigte Annahme. Bis `--thermal-test` am Gerät eine
 Wirkung zeigt, gilt die Lüftersteuerung als unbelegt. Der Schonmodus (`--threads N`) funktioniert ohne Messung auf jedem Rechner.
+
+## Abschlussprüfung mit automatischer Wiederholung (Runde 4)
+
+Spezifikation: [SPEC.md](SPEC.md), Abschnitt „Abschlussprüfung mit automatischer Wiederholung“. Nach der Umwandlung wird die
+Zielkarte wie mit `--verify --source --deep` geprüft; Clips mit Abweichung werden neu umgewandelt (Standard 2 Runden), der alte
+Clip wird erst ersetzt, wenn die neue Datei die gründliche Prüfung bestanden hat.
+
+Das erste Review fand zwei grobe Lücken der **Prüfung selbst**, die auch `--verify --deep` betrafen: Ein beschädigtes Bild
+führte bei `ffmpeg` nur zu einer Warnung (jetzt `-xerror`, Rückgabewert ≠ 0 ist ein Befund), und Ton wurde nur in Ausschnitten
+verglichen (jetzt mit `--deep` und `--source` vollständig je Spur per Prüfsumme). Beide Testkarten wurden danach erneut geprüft
+(Tabelle oben). Das zweite Review fand keine groben Fehler mehr. Belegt ist der vollständige Tonvergleich mit F5/F55-Material
+(HD 50p, 8 Mono-Spuren).
+
+Offene Notizen aus dem zweiten Review (keine groben Fehler, jeweils Fehlalarm in die sichere Richtung oder Abweichung von der
+Spezifikation):
+
+- Ein Clip **ganz ohne Tonspur** führt in der gründlichen Prüfung zu „Tonspuren-Inhalt nicht pruefbar (Quelle)“ und damit zu
+  „Fertig mit Fehlern“, obwohl nichts fehlt (nur synthetisch nachgestellt; Sony-Clips haben Ton).
+- Mit der schnellen Abschlussprüfung (`--auto-verify-quick`) wird ein neu umgewandelter Clip ohne komplettes Dekodieren
+  ersetzt; die Spezifikation verlangt die gründliche Prüfung vor jedem Ersetzen.
+- Der vollständige Tonvergleich ordnet die Spuren nach der Reihenfolge im Material Package zu. Mit `--no-sony-header` und einer
+  Quelle mit ungeordnetem Tracks-Array wären Fehlalarme möglich (nur aus dem Code gelesen, bei den Testkarten nicht der Fall).
+- Kopfdaten-Befunde, die beim Lesen der Quelle entstehen, lösen eine (nutzlose) Wiederholung aus.
+- Nicht getestet: die Oberfläche von Hand, die Temperaturpause während der Prüfung, Strg+C im Terminal während der Prüfung
+  (nur über das Abbruch-Objekt), eine wirklich unlesbare Quelle.
+- Der Test `test_thermal.TokenPauseTests.test_paused_time_accumulates` ist zeitabhängig und schlägt unter Windows gelegentlich
+  knapp fehl (0,187 statt ≥ 0,19 s).
 
 ## Bekannte offene Punkte und Annahmen
 

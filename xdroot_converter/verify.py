@@ -11,7 +11,7 @@ import tempfile
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Collection, Optional
 
 from . import card, mxfheader, mxfinfo, tools
 
@@ -580,7 +580,10 @@ def check_audio_content(
             duration = duration or si.duration
         n = max(1, math.ceil(seconds * float(fps or 25)))
         with tempfile.TemporaryDirectory(prefix="xdroot_audiochk_") as td:
-            src = _extract_audio(source, 0, n, td, "s", cancel)
+            try:
+                src = _extract_audio(source, 0, n, td, "s", cancel)
+            except RuntimeError as e:
+                return [f"Tonspuren-Inhalt nicht pruefbar (Quelle): {e}"]
             tgt = _extract_audio(target, 0, n, td, "t", cancel)
             out = _compare_audio(tgt, src)
             if not out and len(src) > 1 and len(set(src)) < len(src) and duration:
@@ -623,7 +626,7 @@ def tail_decode_check(path: str, frames: int, fps: Optional[Fraction], cancel: O
                 pass
 
     res = tools.run_capture(
-        [tools.find_tool("ffmpeg"), "-hide_banner", "-nostdin", "-v", "error", "-nostats",
+        [tools.find_tool("ffmpeg"), "-hide_banner", "-nostdin", "-v", "error", "-xerror", "-nostats",
          "-progress", "pipe:1", "-ss", f"{seek:.6f}", "-i", path, "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"],
         cancel=cancel, on_stdout_line=on_line, keep_lines=200,
     )
@@ -655,7 +658,9 @@ def deep_decode_check(path: str, cancel: Optional[tools.CancelToken] = None,
                 pass
 
     res = tools.run_capture(
-        [tools.find_tool("ffmpeg"), "-hide_banner", "-nostdin", "-v", "error", "-nostats",
+        # -xerror: ffmpeg meldet "corrupt decoded frame" sonst nur als Warnung (Rueckgabewert 0); mit -xerror
+        # bricht es ab und liefert einen Rueckgabewert != 0 (an einem Clip mit zerstoerten Bilddaten belegt)
+        [tools.find_tool("ffmpeg"), "-hide_banner", "-nostdin", "-v", "error", "-xerror", "-nostats",
          "-progress", "pipe:1", *(["-threads", str(int(threads))] if threads else []),
          "-i", path, "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"],
         cancel=cancel,
@@ -665,7 +670,52 @@ def deep_decode_check(path: str, cancel: Optional[tools.CancelToken] = None,
     errs = [l for l in res.stderr.splitlines() if l.strip()]
     if res.returncode != 0 and not errs:
         errs = [f"ffmpeg Rueckgabewert {res.returncode}"]
+    elif res.returncode != 0:
+        errs.append(f"ffmpeg Rueckgabewert {res.returncode}")
     return frames[0], errs
+
+
+def audio_stream_hashes(path, cancel: Optional[tools.CancelToken] = None,
+                        threads: Optional[int] = None) -> list[str]:
+    """MD5 der kompletten (unveraendert kopierten) PCM-Daten je Tonspur: ``ffmpeg -map 0:a -c copy -f streamhash``.
+    Die Reihenfolge der Streams entspricht der von ``mxf2raw`` (an einer echten Kamera-Datei gegen die
+    ``--ess-out``-Dateien Byte fuer Byte belegt); die Pruefsumme haengt nicht von der Paketierung ab.  Wirft RuntimeError."""
+    res = tools.run_capture(
+        [tools.find_tool("ffmpeg"), "-hide_banner", "-nostdin", "-v", "error", "-xerror",
+         *(["-threads", str(int(threads))] if threads else []),
+         "-i", str(path), "-map", "0:a", "-c", "copy", "-f", "streamhash", "-hash", "md5", "-"],
+        cancel=cancel, keep_lines=400,
+    )
+    found = {}
+    for line in res.stdout.splitlines():
+        m = re.fullmatch(r"(\d+),a,MD5=([0-9a-fA-F]{32})", line.strip())
+        if m:
+            found[int(m.group(1))] = m.group(2).lower()
+    errs = [l for l in res.stderr.splitlines() if l.strip()]
+    if res.returncode != 0 or errs or not found:
+        tail = (errs[0] if errs else f"Rueckgabewert {res.returncode}" if res.returncode else "keine Tondaten")[:200]
+        raise RuntimeError(f"ffmpeg (Ton-Pruefsumme) fuer {os.path.basename(str(path))} fehlgeschlagen: {tail}")
+    return [found[k] for k in sorted(found)]
+
+
+def check_audio_full(target, source, cancel: Optional[tools.CancelToken] = None,
+                     threads: Optional[int] = None) -> list[str]:
+    """Vollstaendiger Ton-Vergleich (gruendliche Pruefung): Pruefsumme der gesamten Tondaten JEDER Spur von Ziel und
+    Quelle, Spur fuer Spur.  Findet auch Beschaedigungen ausserhalb der Fenster der schnellen Ausschnitt-Pruefung
+    (``check_audio_content``).  Leere Liste = in Ordnung.  Leseprobleme der Quelle: 'Tonspuren-Inhalt nicht
+    pruefbar (Quelle)' (kind source, keine Neu-Umwandlung hilft)."""
+    try:
+        src = audio_stream_hashes(source, cancel=cancel, threads=threads)
+    except RuntimeError as e:
+        return [f"Tonspuren-Inhalt nicht pruefbar (Quelle): {e}"]
+    try:
+        tgt = audio_stream_hashes(target, cancel=cancel, threads=threads)
+    except RuntimeError as e:
+        return [f"Tonspuren-Inhalt (vollstaendiger Vergleich) nicht lesbar: {e}"]
+    if len(tgt) != len(src):
+        return [f"Tonspuren: {len(tgt)} im Ziel statt {len(src)} (Quelle) (vollständiger Vergleich)"]
+    return [f"Tonspur {i}: Inhalt weicht von der Quelle ab (vollständiger Vergleich)"
+            for i, (t, s) in enumerate(zip(tgt, src), 1) if t != s]
 
 
 def measure_gop(path: str, packets: int = 400, cancel: Optional[tools.CancelToken] = None) -> list[int]:
@@ -683,11 +733,32 @@ def measure_gop(path: str, packets: int = 400, cancel: Optional[tools.CancelToke
 
 
 @dataclass
+class Finding:
+    """Strukturierte Abweichung (parallel zum Text in ``VerifyReport.problems``).
+
+    ``kind``: ``clip`` (Befund an einem Clip, durch Neu-Umwandlung behebbar), ``missing_listed`` (in MEDIAPRO.XML
+    gelistet, Datei fehlt im Ziel), ``source`` (Quelle selbst fehlt/unlesbar - keine Neu-Umwandlung hilft),
+    ``companion`` (Begleitdatei, die byte-gleich sein muesste, fehlt/weicht ab; ``path`` = relativer Pfad),
+    ``xml`` (MEDIAPRO.XML / Clip-XML weicht ab), ``missing_unlisted`` (nicht gelisteter Quell-Clip fehlt im Ziel)."""
+    message: str
+    clip: Optional[str] = None  # 'Clip/NAME.MXF' bei Clip-Befunden, sonst None
+    kind: str = "clip"
+    path: str = ""
+
+
+@dataclass
 class VerifyReport:
     problems: list = field(default_factory=list)
     notes: list = field(default_factory=list)
     clips_checked: int = 0
     clips_ok: int = 0
+    findings: list = field(default_factory=list)  # list[Finding], gleiche Reihenfolge wie ``problems``
+    deliberate: list = field(default_factory=list)  # nicht gelistete Quell-Clips ('Clip/NAME.MXF'), bewusst nicht ausgewaehlt
+    deliberate_note: str = ""  # der dazu in ``notes`` stehende Hinweistext (Textausgabe von --verify unveraendert)
+
+    def add(self, message: str, clip: Optional[str] = None, kind: str = "clip", path: str = "") -> None:
+        self.problems.append(message)
+        self.findings.append(Finding(message, clip, kind, path))
 
     @property
     def ok(self) -> bool:
@@ -791,8 +862,17 @@ def verify_card(
     log: Callable[[str], None] = lambda s: None,
     cancel: Optional[tools.CancelToken] = None,
     threads: Optional[int] = None,
+    clips: Optional[Collection[str]] = None,
+    card_wide: bool = True,
+    progress: Optional[Callable[[int, int, str], None]] = None,
+    stage: Optional[Callable[[str], None]] = None,
 ) -> VerifyReport:
+    """Karte pruefen.  ``clips`` (Dateinamen wie ``A.MXF``) beschraenkt die Einzelpruefung der Clips auf diese
+    (None = alle; Wiederholungsrunde der Abschlusspruefung); ``card_wide=False`` laesst die kartenweiten Punkte
+    (MEDIAPRO.XML-Eintraege aller Clips, Begleitdateien) aus - dann wird nur der Eintrag der geprueften Clips
+    kontrolliert.  ``progress(i, n, rel)`` wird vor jedem Clip gerufen."""
     rep = VerifyReport()
+    wanted = {str(c).casefold() for c in clips} if clips is not None else None
     tgt = card.find_xdroot(target)
     test_frames = _read_test_marker(tgt.parent)
     if test_frames:
@@ -807,19 +887,26 @@ def verify_card(
     gop_ok: list[int] = []
     listed = {m.rel_path.casefold() for m in mp.materials}
     for m in mp.materials:
+        if not card_wide and (wanted is None or m.rel_path.replace("\\", "/").split("/")[-1].casefold() not in wanted):
+            continue
         if not (tgt / m.rel_path).is_file():
-            rep.problems.append(f"{m.rel_path}: in MEDIAPRO.XML gelistet, aber Datei fehlt im Ziel")
+            rep.add(f"{m.rel_path}: in MEDIAPRO.XML gelistet, aber Datei fehlt im Ziel", clip=m.rel_path,
+                    kind="missing_listed")
 
-    for mxf_path in mxfs:
+    if wanted is not None:
+        mxfs = [p for p in mxfs if p.name.casefold() in wanted]
+    for idx, mxf_path in enumerate(mxfs):
         if cancel:
             cancel.check()
         rel = f"Clip/{mxf_path.name}"
         stem = mxf_path.stem
+        if progress is not None:
+            progress(idx + 1, len(mxfs), rel)
         rep.clips_checked += 1
         before = len(rep.problems)
 
-        def prob(msg: str, _rel=rel) -> None:
-            rep.problems.append(f"{_rel}: {msg}")
+        def prob(msg: str, _rel=rel, _kind="clip") -> None:
+            rep.add(f"{_rel}: {msg}", clip=_rel, kind=_kind)
 
         mat = mp.find(rel)
         if mat is None:
@@ -919,6 +1006,8 @@ def verify_card(
                     prob(f"Decode-Test am Clip-Ende: {e}")
             if deep:
                 log(f"  Tiefenpruefung (kompletter Decode): {rel}")
+                if stage is not None:
+                    stage("Clip komplett dekodieren")
                 n, errs = (deep_decode_check(str(mxf_path), cancel=cancel, threads=threads) if threads
                            else deep_decode_check(str(mxf_path), cancel=cancel))
                 if errs:
@@ -930,14 +1019,14 @@ def verify_card(
         if src_root is not None:
             src_mxf = src_root / "Clip" / mxf_path.name
             if not src_mxf.is_file():
-                prob("Quell-Clip nicht gefunden")
+                prob("Quell-Clip nicht gefunden", _kind="source")
             else:
                 try:
                     si = mxfinfo.read_mxf_info(str(src_mxf), cancel=cancel)
                 except tools.Cancelled:
                     raise
                 except Exception as e:  # noqa: BLE001
-                    prob(f"Quell-MXF nicht lesbar: {e}")
+                    prob(f"Quell-MXF nicht lesbar: {e}", _kind="source")
                     si = None
                 if si is not None:
                     exp_frames = min(test_frames, si.duration) if test_frames else si.duration
@@ -976,18 +1065,35 @@ def verify_card(
                                               notes=hint_notes):
                             prob(f"Kopfdaten: {m}")
                         rep.notes += [f"{rel}: {h}" for h in hint_notes]
-                        for m in check_audio_content(mxf_path, src_mxf, cancel=cancel, fps=info.edit_rate,
-                                                     duration=si.duration):
-                            prob(m)
+                        if deep and not test_frames:
+                            # gruendlich: Ton JEDER Spur vollstaendig gegen die Quelle (Pruefsumme der kompletten Daten)
+                            if stage is not None:
+                                stage("Ton vollständig vergleichen")
+                            audio_msgs = check_audio_full(mxf_path, src_mxf, cancel=cancel, threads=threads)
+                        else:
+                            # schnell bzw. Testausgabe (Ziel kuerzer als die Quelle, Pruefsumme nicht vergleichbar):
+                            # Ausschnitt-Pruefung ueber die gemeinsame Laenge
+                            if deep and stage is not None:
+                                stage("Ton (Ausschnitte, Testausgabe)")
+                            audio_msgs = check_audio_content(mxf_path, src_mxf, cancel=cancel, fps=info.edit_rate,
+                                                             duration=si.duration)
+                        _tn = ("Testausgabe: Ton nur in Ausschnitten verglichen (vollständiger Vergleich "
+                               "setzt ein ungekürztes Ziel voraus)")
+                        if deep and test_frames and _tn not in rep.notes:
+                            rep.notes.append(_tn)
+                        for m in audio_msgs:
+                            prob(m, _kind="source" if m.startswith("Tonspuren-Inhalt nicht pruefbar (Quelle)") else "clip")
         if len(rep.problems) == before:
             rep.clips_ok += 1
 
     if gop_ok:
         rep.notes.append(f"GOP-Laenge N={sorted(set(gop_ok))} bei {len(gop_ok)} Clips (Keyframe-Abstaende der ersten 400 Pakete geprueft)")
     # restliche Dateien gegen Quelle
-    if src_root is not None:
+    if src_root is not None and card_wide:
+        if stage is not None:
+            stage("Begleitdateien vergleichen")
         _compare_files(src_root, tgt, mp, src_mp, rep, selection=_selection_record(tgt.parent),
-                       has_settings=(tgt.parent / SETTINGS_NAME).is_file())
+                       has_settings=(tgt.parent / SETTINGS_NAME).is_file(), cancel=cancel)
     return rep
 
 
@@ -1001,8 +1107,18 @@ def _xavcl_codec_of_xml(data: bytes) -> str:
     return c if card.is_xavcl_codec(c) else ""
 
 
+def _companion_kind(rel: str) -> str:
+    """'xml' fuer MEDIAPRO.XML und Clip-XML (werden vom Konverter selbst angepasst, nie blind kopiert), sonst 'companion'."""
+    parts = rel.replace("\\", "/").split("/")
+    if rel.upper() == "MEDIAPRO.XML" or (len(parts) == 2 and parts[0].casefold() == "clip"
+                                         and re.search(r"M\d\d\.XML$", parts[1], re.I)):
+        return "xml"
+    return "companion"
+
+
 def _compare_files(src: Path, tgt: Path, tgt_mp: "card.MediaPro", src_mp: "card.MediaPro", rep: VerifyReport,
-                   selection: Optional[dict] = None, has_settings: bool = False) -> None:
+                   selection: Optional[dict] = None, has_settings: bool = False,
+                   cancel: Optional[tools.CancelToken] = None) -> None:
     import os
 
     converted_xavcl = {m.rel_path.casefold(): m.video_type for m in tgt_mp.materials if card.is_xavcl_codec(m.video_type)}
@@ -1022,6 +1138,8 @@ def _compare_files(src: Path, tgt: Path, tgt_mp: "card.MediaPro", src_mp: "card.
     for root, _d, files in os.walk(src):
         rel_root = Path(root).relative_to(src)
         for fn in files:
+            if cancel:
+                cancel.check()
             rel = (rel_root / fn).as_posix()
             if rel.upper().startswith("CLIP/") and card.is_clip_mxf_name(fn):
                 continue  # Clip-MXF werden einzeln geprueft ('._*.MXF' o. ae. sind Begleitdateien und werden verglichen)
@@ -1033,7 +1151,7 @@ def _compare_files(src: Path, tgt: Path, tgt_mp: "card.MediaPro", src_mp: "card.
                     skipped.append(rel)
                 else:
                     missing.append(rel)
-                    rep.problems.append(f"{rel}: Datei der Quelle fehlt im Ziel")
+                    rep.add(f"{rel}: Datei der Quelle fehlt im Ziel", kind=_companion_kind(rel), path=rel)
                 continue
             sb, tb = (Path(root) / fn).read_bytes(), t.read_bytes()
             if sb == tb:
@@ -1041,7 +1159,7 @@ def _compare_files(src: Path, tgt: Path, tgt_mp: "card.MediaPro", src_mp: "card.
             if rel.upper() == "MEDIAPRO.XML":
                 exp, _ = card.patch_mediapro(sb, converted_xavcl)
                 if exp != tb:
-                    rep.problems.append("MEDIAPRO.XML: weicht ausser bei videoType von der Quelle ab")
+                    rep.add("MEDIAPRO.XML: weicht ausser bei videoType von der Quelle ab", kind="xml", path=rel)
             elif re.search(r"M\d\d\.XML$", fn, re.I) and rel_root.as_posix().casefold() == "clip":
                 stem_m = re.match(r"(.*?)M\d\d\.XML$", fn, re.I)
                 key = f"clip/{stem_m.group(1)}.mxf".casefold() if stem_m else ""
@@ -1049,11 +1167,11 @@ def _compare_files(src: Path, tgt: Path, tgt_mp: "card.MediaPro", src_mp: "card.
                 if new_codec:
                     exp, _ = card.patch_clip_xml(sb, new_codec)
                     if exp != tb:
-                        rep.problems.append(f"{rel}: weicht ausser bei videoCodec von der Quelle ab")
+                        rep.add(f"{rel}: weicht ausser bei videoCodec von der Quelle ab", kind="xml", path=rel)
                 else:
-                    rep.problems.append(f"{rel}: Datei unterscheidet sich von der Quelle")
+                    rep.add(f"{rel}: Datei unterscheidet sich von der Quelle", kind="xml", path=rel)
             else:
-                rep.problems.append(f"{rel}: Datei unterscheidet sich von der Quelle")
+                rep.add(f"{rel}: Datei unterscheidet sich von der Quelle", kind="companion", path=rel)
     if absent_clips:
         # In MEDIAPRO.XML gelistete, im Ziel fehlende Clips meldet verify_card bereits einzeln als Abweichung.  Nicht
         # gelistete fehlende Clips sind eine Abweichung, ausser die Einstellungsdatei belegt, dass sie bewusst nicht
@@ -1070,19 +1188,21 @@ def _compare_files(src: Path, tgt: Path, tgt_mp: "card.MediaPro", src_mp: "card.
             elif skip_unlisted:
                 deliberate.append(rel)
             elif selection is not None:
-                rep.problems.append(f"{rel}: Quell-Clip (nicht in MEDIAPRO.XML gelistet) fehlt im Ziel - laut "
-                                    f"Einstellungsdatei nicht bewusst ausgelassen")
+                rep.add(f"{rel}: Quell-Clip (nicht in MEDIAPRO.XML gelistet) fehlt im Ziel - laut "
+                        f"Einstellungsdatei nicht bewusst ausgelassen", clip=rel, kind="missing_unlisted")
             elif has_settings:
-                rep.problems.append(f"{rel}: Quell-Clip (nicht in MEDIAPRO.XML gelistet) fehlt im Ziel - die "
-                                    f"Einstellungsdatei enthaelt keine Angabe zur Auswahl (bewusst uebersprungen mit "
-                                    f"--only/--unlisted skip?)")
+                rep.add(f"{rel}: Quell-Clip (nicht in MEDIAPRO.XML gelistet) fehlt im Ziel - die "
+                        f"Einstellungsdatei enthaelt keine Angabe zur Auswahl (bewusst uebersprungen mit "
+                        f"--only/--unlisted skip?)", clip=rel, kind="missing_unlisted")
             else:
-                rep.problems.append(f"{rel}: Quell-Clip (nicht in MEDIAPRO.XML gelistet) fehlt im Ziel "
-                                    f"(bewusst uebersprungen mit --only/--unlisted skip?)")
+                rep.add(f"{rel}: Quell-Clip (nicht in MEDIAPRO.XML gelistet) fehlt im Ziel "
+                        f"(bewusst uebersprungen mit --only/--unlisted skip?)", clip=rel, kind="missing_unlisted")
         shown = ", ".join(skipped[:3]) + (" ..." if len(skipped) > 3 else "")
         if deliberate:
-            rep.notes.append(f"{len(deliberate)} Quell-Clip(s) fehlen im Ziel, laut Einstellungsdatei bewusst nicht ausgewaehlt "
-                             f"(--only / --unlisted skip): {', '.join(deliberate[:3])}" + (" ..." if len(deliberate) > 3 else ""))
+            rep.deliberate = list(deliberate)
+            rep.deliberate_note = (f"{len(deliberate)} Quell-Clip(s) fehlen im Ziel, laut Einstellungsdatei bewusst nicht ausgewaehlt "
+                                   f"(--only / --unlisted skip): {', '.join(deliberate[:3])}" + (" ..." if len(deliberate) > 3 else ""))
+            rep.notes.append(rep.deliberate_note)
         if skipped:
             rep.notes.append(f"{len(skipped)} zu fehlenden Clips gehoerende Begleitdatei(en) fehlen ebenfalls: {shown}")
     rep.notes.append(f"{n_files - len(missing) - len(skipped)} Nicht-MXF-Dateien der Quelle verglichen")

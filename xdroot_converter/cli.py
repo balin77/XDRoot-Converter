@@ -7,6 +7,7 @@
 
 Temperaturüberwachung: --thermal auto|off (Standard auto), --temp-fan GRAD, --temp-pause GRAD;
 Schonmodus: --threads N (ffmpeg-Threads begrenzen).
+Abschlussprüfung nach der Umwandlung (Standard an, gründlich): --no-auto-verify, --auto-verify-quick, --retries N.
 """
 
 from __future__ import annotations
@@ -61,6 +62,16 @@ def _positive_int(text: str) -> int:
     return v
 
 
+def _retries_value(text: str) -> int:
+    try:
+        v = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{text}' ist keine ganze Zahl") from None
+    if not (0 <= v <= converter.AUTO_RETRIES_MAX):
+        raise argparse.ArgumentTypeError(f"muss zwischen 0 und {converter.AUTO_RETRIES_MAX} liegen")
+    return v
+
+
 def _temp_value(text: str) -> float:
     """Argumenttyp fuer eine Temperaturschwelle: nur die Zahl.  Die Grenzen (wie in der Oberflaeche) werden erst nach dem
     Parsen mit ``thermal.check_limits`` geprueft, und nur bei eingeschalteter Ueberwachung (--thermal off prueft nichts).
@@ -84,12 +95,16 @@ def _os_message(e: OSError, path) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="xdroot_converter.cli", description="Sony XDROOT: XAVC-Intra -> XAVC-L")
+    ap = argparse.ArgumentParser(
+        prog="xdroot_converter.cli", description="Sony XDROOT: XAVC-Intra -> XAVC-L",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Exit-Codes: 0 fertig (mit Abschlussprüfung: geprüft ohne Abweichung), 1 Fehler oder Abweichung, "
+               "2 falscher Aufruf, 3 Rechte-Erhöhung abgelehnt, 130 abgebrochen (auch Temperatur-Abbruch)")
     ap.add_argument("source", nargs="?", help="Quellordner (XDROOT oder Elternordner)")
     ap.add_argument("target", nargs="?", help="Zielordner (darin entsteht XDROOT)")
     ap.add_argument("--bitrate", type=float, default=50.0, help="Video-Bitrate in Mbit/s (Standard 50)")
     ap.add_argument("--preset", default="medium", help="x264-Preset (Standard medium)")
-    ap.add_argument("--max-frames", type=int, default=None, help="NUR TEST: nur die ersten N Frames je Clip")
+    ap.add_argument("--max-frames", type=int, default=None, help="NUR TEST: nur die ersten N Frames je Clip (ohne Abschlussprüfung)")
     ap.add_argument("--unlisted", choices=["convert", "skip"], default="convert",
                     help="Clips, die nicht in MEDIAPRO.XML stehen: umwandeln (Standard) oder ueberspringen")
     ap.add_argument("--only", action="append", default=[], metavar="TEXT",
@@ -112,6 +127,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Schonmodus: ffmpeg höchstens N Threads (1 bis 256; Decoder und Encoder; auch bei --verify --deep) - weniger "
                          "Wärme, dauert länger (Standard: unbegrenzt). Achtung: x264 mit anderer Kernzahl erzeugt einen "
                          "gleichwertigen, aber NICHT bitgleichen Datenstrom.")
+    ap.add_argument("--no-auto-verify", action="store_true",
+                    help="keine Abschlussprüfung nach der Umwandlung (Standard: die Zielkarte wird automatisch wie mit "
+                         "--verify --source --deep geprüft, fehlerhafte Clips werden neu umgewandelt)")
+    ap.add_argument("--auto-verify-quick", action="store_true",
+                    help="Abschlussprüfung ohne vollständiges Dekodieren jedes Clips (nur das Clip-Ende; schneller, weniger gründlich)")
+    ap.add_argument("--retries", type=_retries_value, default=converter.Options.retries, metavar="N",
+                    help=f"Wiederholungsrunden der Abschlussprüfung für fehlerhafte Clips (0 bis {converter.AUTO_RETRIES_MAX}, "
+                         f"Standard {converter.Options.retries})")
     ap.add_argument("--thermal-test", action="store_true",
                     help="Diagnose: Anbieter, Rechte, 5 Messungen, nach Enter Lüfter 10 s voll und zurück, Urteil in der "
                          "letzten Zeile; die Ausgabe steht auch in thermal_test.txt (braucht Administratorrechte; "
@@ -166,6 +189,25 @@ def main(argv=None) -> int:
             return 2
         return 0
 
+    # Hinweis bei wirkungslosen Kombinationen (kein Fehler)
+    ap_defaults = build_parser().parse_args([])
+    if args.verify:
+        for flag, name in ((args.no_auto_verify, "--no-auto-verify"), (args.auto_verify_quick, "--auto-verify-quick"),
+                           (args.retries != ap_defaults.retries, "--retries")):
+            if flag:
+                print(f"Hinweis: {name} hat zusammen mit --verify keine Wirkung (die Abschlussprüfung gehört zur "
+                      "Umwandlung).", flush=True)
+    else:
+        if args.no_auto_verify:
+            for flag, name in ((args.retries != ap_defaults.retries, "--retries"),
+                               (args.auto_verify_quick, "--auto-verify-quick")):
+                if flag:
+                    print(f"Hinweis: {name} hat zusammen mit --no-auto-verify keine Wirkung (es gibt keine "
+                          "Abschlussprüfung).", flush=True)
+        if args.max_frames and args.retries != ap_defaults.retries:
+            print("Hinweis: --retries hat zusammen mit --max-frames keine Wirkung (Testausgaben haben keine "
+                  "Abschlussprüfung).", flush=True)
+
     if args.verify:
         cancel = tools.CancelToken()
         try:
@@ -202,6 +244,9 @@ def main(argv=None) -> int:
         temp_fan=args.temp_fan,
         temp_pause=args.temp_pause,
         threads=args.threads,
+        auto_verify=not args.no_auto_verify,
+        auto_verify_deep=not args.auto_verify_quick,
+        retries=args.retries,
     )
     cancel = tools.CancelToken()
     hits = [0]
@@ -230,7 +275,8 @@ def main(argv=None) -> int:
     summary = conv.run()
     if summary.cancelled:
         return 130
-    return 1 if (summary.failed or summary.fatal) else 0
+    # Exit-Code 0 nur ohne Fehler und (bei eingeschalteter Abschlussprüfung) bei geprüfter Karte ohne Abweichung
+    return 1 if (summary.failed or summary.fatal or summary.verify_problem) else 0
 
 
 if __name__ == "__main__":

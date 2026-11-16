@@ -485,7 +485,31 @@ werden; die gründliche Prüfung (`--verify --source --deep`) musste ebenfalls v
 - **Fortsetzen:** Ein Fortsetzungslauf, bei dem nichts mehr umzuwandeln ist, führt trotzdem die Abschlussprüfung aus (so lässt
   sich eine vorhandene Zielkarte nachträglich prüfen und reparieren).
 - **Zeitbedarf:** Die gründliche Prüfung kostete im lokalen Test etwa 8 Minuten für 62 Minuten Material (rund 8 % der
-  Umwandlungszeit).
+  Umwandlungszeit), gemessen vor der Verschärfung unten (vollständiger Tonvergleich liest zusätzlich die Quelle).
+
+Ergänzungen nach dem Review (verbindlich):
+
+- **Was „gründlich“ prüft:** Das vollständige Dekodieren läuft mit `ffmpeg -xerror`; jede Decoder-Meldung über beschädigte
+  Bilder ist eine Abweichung (ohne `-xerror` meldet `ffmpeg` beschädigte Bilder nur als Warnung und endet mit Erfolg – im
+  Review an einem gezielt beschädigten Clip nachgewiesen). Der **Ton jeder Spur wird vollständig** gegen die Quelle verglichen
+  (Prüfsumme je Spur), nicht nur in Ausschnitten. Die schnelle Prüfung vergleicht den Ton weiterhin nur in Ausschnitten und
+  dekodiert nur das Clip-Ende; sie heißt in allen Ergebnistexten ausdrücklich „schnelle Prüfung“.
+- **Nicht ausgewählte Clips:** Nur bewusst **fehlende**, nicht ausgewählte Clips sind ein Hinweis. Ein Clip, der im Ziel
+  **liegt** und eine Abweichung hat, ist immer eine Abweichung (kein „geprüft“), auch wenn er im aktuellen Lauf nicht
+  ausgewählt ist; er wird dann nicht wiederholt, der Text sagt, wie man ihn nachholt.
+- **Ersetzen bei Wiederholung:** Eine erzwungen neu erzeugte Datei ersetzt den vorhandenen Ziel-Clip erst, nachdem sie selbst
+  die gründliche Prüfung bestanden hat. Ein Rückfall ohne ANC-Spur oder ohne eingebettetes XML ersetzt keinen Clip, der diese
+  Spur hat. Fehler beim Lesen der **Quelle** lösen keine Wiederholung aus (Abweichung mit Hinweis auf Karte/Kartenleser).
+- **Testausgabe im Ziel:** Liegt im Ziel die Marke einer `--max-frames`-Testausgabe, gibt es keine Wiederholung; die Prüfung
+  meldet das als Problem.
+- **Nicht repariert, nur gemeldet:** Abweichungen in `MEDIAPRO.XML` und `M01.XML` (diese Dateien erzeugt das Tool selbst).
+- **Zahlen:** „geprüft“ und „ohne Abweichung“ werden aus dem Endstand je Clip über alle Runden gebildet.
+- **Ergebniszeile:** Die letzte Zeile der Zusammenfassung ist immer genau eine Zeile `Ergebnis: …`.
+- **Exit-Codes der CLI:** 0 fertig (mit Abschlussprüfung: geprüft ohne Abweichung; auch bei ausgeschalteter Prüfung oder
+  Testausgabe ohne Fehler), 1 Fehler oder Abweichung oder Prüfung nicht möglich, 2 falscher Aufruf, 3 Rechte-Erhöhung
+  abgelehnt, 130 abgebrochen (auch Temperatur-Abbruch).
+- **Intern** ist die Abschlussprüfung aus (`Options.auto_verify = False`); CLI und GUI schalten sie ein. Die Zahl der
+  Wiederholungsrunden ist nur in der CLI einstellbar (GUI: 2).
 
 ### Beleglage (Stand 16.11.2026)
 

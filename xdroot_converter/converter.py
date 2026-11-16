@@ -80,6 +80,13 @@ class Options:
     thermal_interval_s: float = _thermal_mod.DEFAULT_INTERVAL_S  # Messabstand
     thermal_provider: Optional[object] = None  # nur Tests: Fabrik fuer einen Attrappen-Anbieter
     thermal_max_pause_s: float = _thermal_mod.DEFAULT_MAX_PAUSE_S  # laengste Temperaturpause, danach Abbruch (fortsetzbar)
+    # Abschlusspruefung mit automatischer Wiederholung (Runde 4).  Intern ist sie AUS (der Ablauf bleibt fuer die Bibliothek
+    # und die vielen direkten Aufrufe in den Tests exakt wie bisher, analog zu ``thermal``); CLI und GUI schalten sie ein.
+    auto_verify: bool = False
+    auto_verify_deep: bool = True  # jeden Clip komplett dekodieren (False = nur das Clip-Ende, wie --verify ohne --deep)
+    retries: int = 2  # Wiederholungsrunden (0 bis 5)
+
+AUTO_RETRIES_MAX = 5
 
 
 class Reporter:
@@ -116,6 +123,38 @@ class ClipResult:
     target_ok: bool = False  # FEHLER, aber ein vorhandener umgewandelter Ziel-Clip blieb unangetastet erhalten
     foreign: bool = False  # FEHLER, weil im Ziel eine fremde Datei (andere UMID) liegt - wurde nicht ueberschrieben
     listed: bool = True  # Clip steht in MEDIAPRO.XML der Quelle
+    retry_reasons: list = field(default_factory=list)  # Gruende der Wiederholungen durch die Abschlusspruefung (je Runde)
+    retry_failed: bool = False  # die Wiederholung scheiterte; ein vorhandener Ziel-Clip blieb mit seiner Abweichung liegen
+
+
+@dataclass
+class VerifyOutcome:
+    """Ergebnis der Abschlusspruefung (samt Wiederholungsrunden)."""
+    deep: bool = True
+    retries: int = 0  # erlaubte Wiederholungsrunden
+    started: bool = False  # die Pruefung hat begonnen
+    complete: bool = False  # sie lief vollstaendig zu Ende (nicht abgebrochen, kein Fehler)
+    cancelled: bool = False
+    error: str = ""  # Pruefung selbst nicht moeglich (Ausnahme)
+    skipped: str = ""  # Grund, warum keine Pruefung lief (z. B. Testlauf)
+    checked: int = 0  # in der ersten Runde geprueft
+    ok: int = 0  # davon am Ende ohne Abweichung
+    rounds: int = 0  # durchgefuehrte Wiederholungsrunden
+    retried: dict = field(default_factory=dict)  # Clipname -> [Grund je Runde]
+    deviations: list = field(default_factory=list)  # endgueltige Abweichungen (Texte)
+    bad_clips: list = field(default_factory=list)  # Clips mit endgueltiger Abweichung/Fehler
+    notes: list = field(default_factory=list)  # Hinweise (keine Abweichung)
+    seconds: float = 0.0  # Dauer der Abschlusspruefung samt Wiederholungen
+    retry_seconds: float = 0.0  # davon Neu-Umwandlung
+
+    @property
+    def verified_ok(self) -> bool:
+        """Geprueft und ohne Abweichung (nur dann 'Fertig - geprueft')."""
+        return self.started and self.complete and not self.deviations and not self.error
+
+    @property
+    def problem(self) -> bool:
+        return self.started and not self.cancelled and bool(self.deviations or self.error)
 
 
 @dataclass
@@ -132,6 +171,20 @@ class RunSummary:
     max_cpu_c: Optional[float] = None
     thermal_note: str = ""  # z. B. "Temperatur nicht verfuegbar: ..." (leer = keine Besonderheit)
     abort_reason: str = ""  # Abbruch durch die Temperaturueberwachung (Pause zu lang); gesetzt zusammen mit cancelled
+    verify: Optional[VerifyOutcome] = None  # Abschlusspruefung (None = nicht eingeschaltet)
+    convert_seconds: float = 0.0  # Dauer der Umwandlung (ohne Abschlusspruefung); 0 = nicht getrennt gemessen
+    test_run: bool = False  # Testlauf (--max-frames): keine Abschlusspruefung
+
+    @property
+    def verify_problem(self) -> bool:
+        """Die Abschlusspruefung hat Abweichungen gefunden (oder war nicht moeglich)."""
+        return self.verify is not None and self.verify.problem
+
+    @property
+    def verified_ok(self) -> bool:
+        """Lauf ohne Fehler und Abschlusspruefung ohne Abweichung."""
+        return (self.verify is not None and self.verify.verified_ok and not self.cancelled and not self.fatal
+                and not self.failed)
 
     def count(self, status: str) -> int:
         return sum(1 for r in self.results if r.status == status)
@@ -144,12 +197,16 @@ class RunSummary:
     def incomplete_text(self) -> str:
         """Deutliche Warnung, wenn fehlgeschlagene Clips im Ziel fehlen bzw. unbrauchbar sind ('' wenn alles da)."""
         bad = [r for r in self.results if r.status == ST_FAILED]
-        kept = [r.name for r in bad if r.target_ok]
+        kept = [r.name for r in bad if r.target_ok and not r.retry_failed]
+        deviating = [r.name for r in bad if r.target_ok and r.retry_failed and r.dst_size]
         bad = [r for r in bad if not r.target_ok]
         missing = [r.name for r in bad if not r.dst_size]
         foreign = [r.name for r in bad if r.dst_size and r.foreign]
         broken = [r.name for r in bad if r.dst_size and not r.foreign]
         parts = []
+        if deviating:
+            parts.append(f"{len(deviating)} Clip(s) liegen im Ziel, haben aber eine Abweichung (Neu-Umwandlung "
+                         f"gescheitert, der alte Clip blieb unveraendert): {', '.join(deviating)}")
         if kept:
             parts.append(f"{len(kept)} Clip(s) wurden diesmal NICHT verarbeitet, der vorhandene umgewandelte "
                          f"Ziel-Clip blieb unveraendert erhalten: {', '.join(kept)}")
@@ -171,6 +228,74 @@ class RunSummary:
         else:
             tail = f" (in MEDIAPRO.XML stehen aber: {', '.join(in_mp)})"
         return "ACHTUNG: Zielkarte unvollstaendig - " + "; ".join(parts) + tail
+
+    def _verify_lines(self) -> list:
+        v = self.verify
+        if v is None:
+            return []
+        if v.skipped:
+            return [f"Abschlussprüfung: {v.skipped}"]
+        if not v.started:
+            return []
+        mode = "gründlich, jeder Clip komplett dekodiert" if v.deep else "schnell, ohne vollständiges Dekodieren"
+        out = []
+        if v.cancelled:
+            out.append(f"Abschlussprüfung ({mode}): abgebrochen, Prüfung unvollständig")
+        elif v.error:
+            out.append(f"Die Prüfung konnte nicht durchgeführt werden: {v.error} – die Karte ist NICHT geprüft.")
+        elif v.checked == 0 and v.deviations and not v.rounds:
+            out.append("Abschlussprüfung: keine Clips geprüft")
+        else:
+            out.append(f"Abschlussprüfung ({mode}): {v.checked} Clips geprüft, {v.ok} ohne Abweichung"
+                       + (f", {len(v.retried)} Clip(s) wiederholt in {v.rounds} Runde(n)" if v.rounds else "")
+                       + (f", endgültig fehlerhaft: {len(v.bad_clips)}" if v.bad_clips else ""))
+        for name, reasons in v.retried.items():
+            out.append(f"    - wiederholt: {name} ({'; '.join(reasons)})")
+        for d in v.deviations:
+            out.append(f"    ABWEICHUNG: {d}")
+        for n in v.notes:
+            out.append(f"    Hinweis: {n}")
+        if v.started:
+            conv = f"Umwandlung {fmt_duration(self.convert_seconds)}, " if self.convert_seconds else ""
+            out.append(f"Dauer: {conv}Abschlussprüfung {fmt_duration(v.seconds)}"
+                       + (f" (davon Wiederholung der Umwandlung {fmt_duration(v.retry_seconds)})" if v.retry_seconds else ""))
+        return out
+
+    def result_line(self) -> str:
+        """Die EINE eindeutige Ergebniszeile (letzte Zeile von ``text()``)."""
+        v = self.verify
+        if self.fatal:
+            return "Ergebnis: Fehler – " + _first_line(self.fatal, 200)
+        if self.cancelled:
+            if v is not None and v.started:
+                return "Ergebnis: Abgebrochen, Prüfung unvollständig"
+            return "Ergebnis: Abgebrochen – Zielkarte unvollständig"
+        names: list = []
+        for r in self.results:
+            if r.status == ST_FAILED and r.name not in names:
+                names.append(r.name)
+        names += [rel for rel, _m in self.copy_errors if rel not in names]
+        if not names and v is not None and v.started:
+            names = list(v.bad_clips)
+
+        def broken() -> str:
+            shown = ", ".join(names[:10]) + (f" und {len(names) - 10} weitere" if len(names) > 10 else "")
+            return "Ergebnis: Fertig mit Fehlern" + (f" (betroffen: {shown})" if names else "")
+
+        if self.failed:
+            return broken()
+        if v is None or not v.started:
+            if self.test_run or (v is not None and v.skipped):
+                return "Ergebnis: Fertig (nicht geprüft: Testausgabe)"
+            return "Ergebnis: Fertig (nicht geprüft: Abschlussprüfung ausgeschaltet)"
+        if v.error:
+            return "Ergebnis: Umwandlung fertig, Prüfung nicht möglich – Karte nicht geprüft"
+        if v.deviations:
+            return broken()
+        if v.verified_ok:
+            return ("Ergebnis: Fertig – geprüft, ohne Abweichung" if v.deep
+                    else "Ergebnis: Fertig – geprüft (schnelle Prüfung), ohne Abweichung")
+        return broken()
 
     def text(self) -> str:
         lines = ["", "=== Zusammenfassung ==="]
@@ -204,6 +329,7 @@ class RunSummary:
             )
         if self.abort_reason:
             lines.append(self.abort_reason)
+        lines.extend(self._verify_lines())
         for rel, msg in self.copy_errors:
             lines.append(f"FEHLER beim Kopieren von {rel}: {msg}")
         if self.pauses:
@@ -218,7 +344,15 @@ class RunSummary:
             lines.append(inc)
         if self.fatal:
             lines.append("FEHLER: " + self.fatal)
+        lines.append(self.result_line())
         return "\n".join(lines)
+
+
+def _first_line(text: str, limit: int = 160) -> str:
+    """Erste nichtleere Zeile eines (evtl. mehrzeiligen) Textes, gekuerzt."""
+    lines = [l.strip() for l in str(text).splitlines() if l.strip()]
+    t = lines[0] if lines else ""
+    return t if len(t) <= limit else t[:limit].rstrip() + " …"
 
 
 def fmt_size(n: float) -> str:
@@ -642,6 +776,8 @@ class Converter:
         self._thermal_summary: Optional[RunSummary] = None
         self._pause0_clip = 0.0
         self._abort_reason = ""  # gesetzt, wenn die Temperaturueberwachung den Lauf abbricht
+        self._force: set = set()  # Clipnamen (casefold), die erzwungen neu umgewandelt werden (Wiederholung)
+        self._progress_prefix = ""  # Vorsatz der Fortschrittstexte in der Wiederholungsrunde ("Wiederholung Runde 1/2: Clip 1/2 – ")
 
     # ------------------------------------------------------------------ Logging
     def _log(self, level: str, msg: str) -> None:
@@ -934,7 +1070,7 @@ class Converter:
             self._thermal_stop()
 
     def _run(self) -> RunSummary:
-        summary = RunSummary()
+        summary = RunSummary(test_run=bool(self.o.max_frames))
         self._thermal_summary = summary
         t0 = time.time()
         out_root: Optional[Path] = None
@@ -1050,33 +1186,12 @@ class Converter:
                     res.notes.append(plan.skip_reason)
                     summary.results.append(res)
                     continue
-                t_clip = time.time()
-                pause_clip0 = self.cancel.paused_time()
-                dst = out_root / "Clip" / plan.mxf.name
-                try:
-                    self._process_clip(plan, src_root, out_root, tmp_root, res)
-                except tools.Cancelled:
-                    res.status = ST_CANCELLED
-                    res.dst_size = dst.stat().st_size if dst.exists() else 0
-                    summary.results.append(res)
-                    raise
-                except Exception as e:  # noqa: BLE001
-                    res.status = ST_FAILED
-                    res.foreign = isinstance(e, ForeignTarget)
-                    res.notes.append(str(e))
-                    self.error(f"{plan.name}: {e}")
-                res.seconds = time.time() - t_clip
-                res.pause_seconds = max(0.0, self.cancel.paused_time() - pause_clip0)
-                try:
-                    res.dst_size = dst.stat().st_size if dst.exists() else 0
-                except OSError:
-                    res.dst_size = 0
-                summary.results.append(res)
-                self.rep.clip_done(res)
-                self._shutil_clean(tmp_root / plan.stem)
+                self._run_clip(plan, res, summary.results, src_root, out_root, tmp_root)
+            summary.convert_seconds = time.time() - t0
             self._report_resume_diffs()
             clean_run = not any(r.status == ST_FAILED for r in summary.results) and not summary.copy_errors
-            # K2: ein voller Lauf macht aus einer Testausgabe wieder eine normale Ausgabe
+            # K2: ein voller Lauf macht aus einer Testausgabe wieder eine normale Ausgabe (vor der Abschlusspruefung,
+            # damit sie die Dauern nicht an der Testmarke misst)
             if clean_run and not self.o.max_frames and marker.exists():
                 if any(not p.selected and (out_root / "Clip" / p.mxf.name).exists() for p in plans):
                     self.warn("Testmarker TESTAUSGABE.txt bleibt bestehen: nicht ausgewaehlte Clips im Ziel stammen evtl. aus einem Testlauf")
@@ -1086,6 +1201,8 @@ class Converter:
                         self.info("Testmarker TESTAUSGABE.txt entfernt (voller Lauf, alle Clips neu geprueft)")
                     except OSError as e:
                         self.warn(f"Testmarker konnte nicht entfernt werden: {e}")
+            if self.o.auto_verify:
+                self._auto_verify(summary, plans, src_root, out_root, tmp_root)
         except tools.Cancelled:
             summary.cancelled = True
             summary.abort_reason = self._abort_reason
@@ -1121,6 +1238,317 @@ class Converter:
             finally:
                 release_lock(lock_path)  # auch bei KeyboardInterrupt/anderen BaseExceptions freigeben
         return summary
+
+    def _run_clip(self, plan: ClipPlan, res: ClipResult, results: list, src_root: Path, out_root: Path,
+                  tmp_root: Path, replace: Optional[ClipResult] = None) -> ClipResult:
+        """Einen Clip verarbeiten und das Ergebnis in ``results`` eintragen (``replace``: das alte Ergebnis dieses Clips
+        wird ersetzt, z. B. bei der Wiederholung).  Bei Abbruch wird ``tools.Cancelled`` weitergereicht; ein neues Ergebnis
+        steht dann nur ohne ``replace`` in ``results``."""
+        t_clip = time.time()
+        pause_clip0 = self.cancel.paused_time()
+        dst = out_root / "Clip" / plan.mxf.name
+        try:
+            self._process_clip(plan, src_root, out_root, tmp_root, res)
+        except tools.Cancelled:
+            res.status = ST_CANCELLED
+            res.dst_size = dst.stat().st_size if dst.exists() else 0
+            if replace is None:
+                results.append(res)
+            raise
+        except Exception as e:  # noqa: BLE001
+            res.status = ST_FAILED
+            res.foreign = isinstance(e, ForeignTarget)
+            res.notes.append(str(e))
+            self.error(f"{plan.name}: {e}")
+            if replace is not None and not res.foreign:
+                # gescheiterte Wiederholung: ersetzt wird nur nach erfolgreicher Neuerzeugung, ein vorhandener Ziel-Clip
+                # blieb also unveraendert - target_ok aus dem tatsaechlichen Zustand
+                res.retry_failed = True
+                res.target_ok = dst.exists()
+        res.seconds = time.time() - t_clip
+        res.pause_seconds = max(0.0, self.cancel.paused_time() - pause_clip0)
+        try:
+            res.dst_size = dst.stat().st_size if dst.exists() else 0
+        except OSError:
+            res.dst_size = 0
+        if replace is not None and replace in results:
+            results[results.index(replace)] = res
+        else:
+            results.append(res)
+        self.rep.clip_done(res)
+        self._shutil_clean(tmp_root / plan.stem)
+        return res
+
+    # ------------------------------------------------------------------ Abschlusspruefung und Wiederholung
+    def _auto_verify(self, summary: RunSummary, plans: list, src_root: Path, out_root: Path, tmp_root: Path) -> None:
+        """Abschlusspruefung der Zielkarte gegen die Quelle (derselbe Code wie ``--verify --source [--deep]``), danach
+        Wiederholung der fehlerhaften Clips (hoechstens ``retries`` Runden).  Die Sperre des Zielordners bleibt gehalten
+        (laeuft innerhalb von ``_run``); Abbruch wirkt als ``tools.Cancelled``."""
+        retries = max(0, min(AUTO_RETRIES_MAX, int(self.o.retries or 0)))
+        out = VerifyOutcome(deep=bool(self.o.auto_verify_deep), retries=retries)
+        summary.verify = out
+        if self.o.max_frames:
+            out.skipped = "entfällt bei einer Testausgabe (--max-frames)"
+            self.info("Abschlussprüfung " + out.skipped)
+            return
+        out.started = True
+        t_v0 = time.time()
+        if (Path(self.o.target) / verify.TEST_MARKER).exists():
+            # M1: eine stehengebliebene Testmarke (frueherer --max-frames-Lauf) liesse die Pruefung gekuerzte Dauern
+            # erwarten und alle Clips sinnlos neu umwandeln: keine Pruefung, keine Wiederholung
+            msg = (f"Im Ziel liegt eine Testausgabe ({verify.TEST_MARKER}) – Karte nicht geprüft; "
+                   "Zielordner leeren oder neuen Zielordner wählen")
+            out.complete = True
+            out.deviations = [msg]
+            out.seconds = time.time() - t_v0
+            self.warn("Abschlussprüfung: " + msg)
+            return
+        try:
+            self._verify_rounds(summary, out, plans, src_root, out_root, tmp_root, retries)
+            out.complete = True
+        except tools.Cancelled:
+            out.cancelled = True
+            self.warn("Abschlussprüfung abgebrochen, Prüfung unvollständig.")
+            raise
+        except Exception as e:  # noqa: BLE001
+            out.error = f"{type(e).__name__}: {e}"
+            self.error(f"Abschlussprüfung nicht möglich: {out.error}")
+        finally:
+            out.seconds = time.time() - t_v0
+            self._force = set()
+            self._progress_prefix = ""
+
+    def _verify_call(self, src_root: Path, out_root: Path, clips, card_wide: bool, label: str,
+                     checked_names: Optional[set] = None):
+        t_start = time.time()
+        cur: list = [0, 0, ""]  # aktueller Clip: (i, n, Name)
+
+        def progress(i: int, n: int, rel: str) -> None:
+            cur[:] = [i, n, Path(rel).name]
+            if checked_names is not None:
+                checked_names.add(Path(rel).name.casefold())
+            frac = (i - 1) / max(1, n)
+            eta = (time.time() - t_start) / (i - 1) * (n - i + 1) if i > 1 else None
+            self.rep.progress(Path(rel).name, frac, frac, eta, f"Abschlussprüfung{label}: Clip {i}/{n}")
+
+        def stage(text: str) -> None:
+            # Teilschritt (Dekodieren, vollstaendiger Tonvergleich, Begleitdateien): die Anzeige friert nicht ein
+            i, n, name = cur
+            if text.startswith("Begleitdateien") or not i:
+                self.rep.progress("", 1.0 if not i else (i - 1) / max(1, n), 1.0 if not i else (i - 1) / max(1, n), None,
+                                  f"Abschlussprüfung{label}: Begleitdateien ...")
+            else:
+                frac = (i - 1) / max(1, n)
+                self.rep.progress(name, frac, frac, None, f"Abschlussprüfung{label}: Clip {i}/{n} – {text}")
+
+        return verify.verify_card(
+            str(out_root), str(src_root), deep=bool(self.o.auto_verify_deep),
+            log=lambda s: self.detail(str(s).strip()), cancel=self.cancel, threads=self.o.threads,
+            clips=clips, card_wide=card_wide, progress=progress, stage=stage)
+
+    def _verify_rounds(self, summary: RunSummary, out: VerifyOutcome, plans: list, src_root: Path, out_root: Path,
+                       tmp_root: Path, retries: int) -> None:
+        def norm(s: str) -> str:
+            return str(s).replace("\\", "/").casefold()
+
+        by_rel = {norm(p.rel): p for p in plans}
+        by_name = {p.name.casefold(): p for p in plans}
+        checked_names: set = set()  # Clips, die in irgendeiner Runde geprueft wurden (Endstand je Clip, K1)
+        unlisted_deliberate: list = []  # nicht gelistete, bewusst nicht ausgewaehlte Quell-Clips (strukturiert aus verify)
+        verify_notes: list = []  # Hinweise von verify_card: nur Detail im Protokoll
+        foreign_names = {r.name.casefold() for r in summary.results if r.foreign}
+        mode = "gründlich, jeder Clip komplett dekodiert" if out.deep else "schnell, ohne vollständiges Dekodieren"
+        self.info(f"Abschlussprüfung der Zielkarte gegen die Quelle ({mode}; bis zu {retries} Wiederholungsrunde(n)) ...")
+        clip_f: dict = {}  # Clipname (casefold) -> [Finding]  (Einzelpruefung des Clips)
+        card_f: list = []  # kartenweite Befunde (inkl. fehlende Clips, Begleitdateien, XML)
+        notes: list = []
+
+        def plan_of(f) -> Optional[ClipPlan]:
+            return by_rel.get(norm(f.clip or ""))
+
+        def take_notes(rep) -> None:
+            for n in rep.notes:
+                if n != getattr(rep, "deliberate_note", "") and n not in verify_notes:
+                    verify_notes.append(n)
+
+        def absorb(rep, restricted) -> None:
+            """Befunde eines verify_card-Aufrufs uebernehmen.  ``restricted``: Namen (casefold) der in diesem Aufruf
+            einzeln geprueften Clips (None = erste, volle Runde)."""
+            if restricted is None:
+                clip_f.clear()
+                card_f.clear()
+            else:
+                for nm in restricted:
+                    clip_f.pop(nm, None)
+                card_f[:] = [f for f in card_f if not (f.kind == "missing_listed" and f.clip
+                                                       and Path(f.clip).name.casefold() in restricted)]
+            for f in rep.findings:
+                if f.kind in ("clip", "source"):
+                    clip_f.setdefault(Path(f.clip or "").name.casefold(), []).append(f)
+                else:
+                    card_f.append(f)
+            take_notes(rep)
+            if restricted is None:
+                unlisted_deliberate[:] = list(getattr(rep, "deliberate", []) or [])
+
+        def failed_now() -> dict:
+            """Clips, die in der Umwandlung als Fehler endeten und neu versucht werden duerfen: {Name casefold: Grund}."""
+            d = {}
+            for r in summary.results:
+                p = by_name.get(r.name.casefold())
+                if r.status == ST_FAILED and not r.foreign and p is not None and p.convert:
+                    d[r.name.casefold()] = "Fehler in der Umwandlung: " + _first_line(r.notes[-1] if r.notes else "unbekannt")
+            return d
+
+        def retry_candidates() -> dict:
+            """{Name casefold: Grund} aller Clips, die eine Neu-Umwandlung beheben kann."""
+            cand = dict(failed_now())
+            for nm, fl in clip_f.items():
+                p = by_name.get(nm)
+                good = [f for f in fl if f.kind == "clip"]
+                if (p is not None and p.selected and p.convert and good and nm not in cand
+                        and nm not in foreign_names):
+                    cand[nm] = "Abweichung in der Prüfung: " + _first_line(good[0].message)
+            for f in card_f:
+                if f.kind in ("missing_listed", "missing_unlisted"):
+                    p = plan_of(f)
+                    if (p is not None and p.selected and p.convert and p.name.casefold() not in cand
+                            and p.name.casefold() not in foreign_names):
+                        cand[p.name.casefold()] = "Clip fehlt im Ziel"
+            return cand
+
+        # --- Runde 0: alles pruefen
+        rep = self._verify_call(src_root, out_root, None, True, "", checked_names)
+        absorb(rep, None)
+        self.cancel.check()
+
+        recopied: set = set()
+        for rnd in range(1, retries + 1):
+            cand = retry_candidates()
+            comp = [f for f in card_f if f.kind == "companion" and f.path and f.path not in recopied]
+            if not cand and not comp:
+                break
+            out.rounds = rnd
+            self.info(f"Wiederholungsrunde {rnd}/{retries}: {len(cand)} Clip(s) neu umwandeln"
+                      + (f", {len(comp)} Begleitdatei(en) neu kopieren" if comp else ""))
+            t_r = time.time()
+            for f in comp:
+                recopied.add(f.path)
+                if self._recopy_companion(src_root, out_root, f.path):
+                    # K3: erfolgreich neu kopierte Datei ist kein Kopierfehler des Laufs mehr
+                    summary.copy_errors[:] = [(r, m) for r, m in summary.copy_errors if norm(r) != norm(f.path)]
+            redone: list = []
+            todo = [p for p in plans if p.name.casefold() in cand]
+            if todo:
+                self._frames_total = sum(p.frames for p in todo) or 1
+                self._frames_pending = self._frames_total
+                self._frames_done = 0
+                self._work_frames_done = 0
+                self._work_secs_done = 0.0
+                for k, p in enumerate(todo, 1):
+                    self.cancel.check()
+                    self._progress_prefix = f"Wiederholung Runde {rnd}/{retries}: Clip {k}/{len(todo)} – "
+                    reason = cand[p.name.casefold()]
+                    self.info(f"{p.name}: Wiederholung in Runde {rnd} – {reason}")
+                    prev = next((r for r in summary.results if r.name.casefold() == p.name.casefold()), None)
+                    out.retried.setdefault(p.name, []).append(f"Runde {rnd}: {reason}")
+                    self._force = {p.name.casefold()}
+                    res = ClipResult(name=p.name, src_size=p.mxf.stat().st_size, listed=p.material is not None)
+                    res.retry_reasons = list(prev.retry_reasons if prev else []) + [f"Runde {rnd}: {reason}"]
+                    res = self._run_clip(p, res, summary.results, src_root, out_root, tmp_root, replace=prev)
+                    self._force = set()
+                    self._progress_prefix = ""
+                    if res.status != ST_FAILED:
+                        redone.append(p.name)
+            out.retry_seconds += time.time() - t_r
+            # erneut pruefen: nur die neu erzeugten Clips (die Befunde fehlgeschlagener Versuche bleiben stehen)
+            if redone:
+                names = {n.casefold() for n in redone}
+                rep = self._verify_call(src_root, out_root, set(redone), False, " (Wiederholung)", checked_names)
+                absorb(rep, names)
+        if out.rounds:
+            # am Ende einmal die kartenweiten Punkte (MEDIAPRO.XML, Begleitdateien) neu pruefen
+            self.rep.progress("", 1.0, 1.0, None, "Abschlussprüfung (kartenweit): Begleitdateien ...")
+            rep = self._verify_call(src_root, out_root, set(), True, " (kartenweit)")
+            card_f[:] = [f for f in rep.findings if f.kind not in ("clip", "source")]
+            take_notes(rep)
+            unlisted_deliberate[:] = list(getattr(rep, "deliberate", []) or [])
+
+        # --- Ergebnis einordnen.  Nur FEHLENDE, bewusst nicht ausgewaehlte Clips sind kein Fehler; ein vorhandener, nicht
+        # ausgewaehlter Clip mit Abweichung bleibt eine Abweichung (wird aber nicht neu umgewandelt).
+        deviations: list = []
+        bad: list = []
+        deliberate_listed: list = []
+        deliberate_unlisted: list = []
+        for nm, fl in clip_f.items():
+            p = by_name.get(nm)
+            for f in fl:
+                msg = f.message
+                if p is not None and not p.selected:
+                    msg += (f" – nicht ausgewählt – nicht neu umgewandelt; ohne --only bzw. mit --only {p.stem} "
+                            "erneut starten")
+                elif f.kind == "source":
+                    msg += " – Quelle nicht lesbar – Kartenleser/Karte prüfen und erneut starten"
+                deviations.append(msg)
+                if (p.name if p else nm) not in bad:
+                    bad.append(p.name if p else nm)
+        for f in card_f:
+            p = plan_of(f)
+            if f.kind in ("missing_listed", "missing_unlisted") and p is not None and not p.selected:
+                (deliberate_listed if f.kind == "missing_listed" else deliberate_unlisted).append(p.name)
+                continue
+            deviations.append(f.message)
+            if p is not None and p.name not in bad:
+                bad.append(p.name)
+        for r in summary.results:
+            if r.status == ST_FAILED and r.name not in bad:
+                bad.append(r.name)
+        # B6: EINE Zeile zu den bewusst nicht ausgewaehlten Clips (nicht gelistete aus verify strukturiert uebernommen)
+        unl = {Path(x).name.casefold(): Path(x).name for x in unlisted_deliberate}
+        unl.update({n.casefold(): n for n in deliberate_unlisted})
+        parts = []
+        if deliberate_listed:
+            parts.append(f"{len(set(deliberate_listed))} Clips aus MEDIAPRO.XML")
+        if unl:
+            parts.append(f"{len(unl)} nicht gelistete Clips")
+        if parts:
+            notes.append("Nicht ausgewählt (kein Fehler, nicht wiederholt): " + ", ".join(parts))
+        # K1: Zaehlung aus dem Endstand je Clip ueber alle Runden
+        bad_cf = {b.casefold() for b in bad}
+        out.checked = len(checked_names)
+        out.ok = len([n for n in checked_names if n not in bad_cf])
+        out.deviations = deviations
+        out.bad_clips = bad
+        out.notes = notes
+        for n in verify_notes:
+            self.detail("Abschlussprüfung, Hinweis: " + n)
+        for d in deviations:
+            self.warn("Abschlussprüfung, Abweichung: " + d)
+        for n in notes:
+            self.info("Abschlussprüfung, Hinweis: " + n)
+        if not deviations and not bad:
+            self.info(f"Abschlussprüfung: {out.checked} Clips geprüft, alle ohne Abweichung"
+                      + (f" ({len(out.retried)} Clip(s) nach Wiederholung)" if out.retried else ""))
+        else:
+            self.warn(f"Abschlussprüfung: {len(deviations)} Abweichung(en), endgültig fehlerhaft: {', '.join(bad) or '-'}")
+
+    def _recopy_companion(self, src_root: Path, out_root: Path, rel: str) -> bool:
+        """Eine Begleitdatei, die byte-gleich mit der Quelle sein muesste, einmal neu kopieren (nur innerhalb von
+        Quelle/Ziel; MEDIAPRO.XML und Clip-XML schreibt der Ablauf selbst).  True = kopiert."""
+        parts = Path(rel).parts
+        if not parts or ".." in parts or Path(rel).is_absolute():
+            return False
+        src, dst = src_root / rel, out_root / rel
+        try:
+            if not src.is_file():
+                return False
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            card.copy_file_atomic(src, dst)
+            self.info(f"{rel}: Begleitdatei neu kopiert")
+            return True
+        except OSError as e:
+            self.warn(f"{rel}: Begleitdatei konnte nicht neu kopiert werden: {e}")
+            return False
 
     # ------------------------------------------------------------------ Temperaturueberwachung
     def _thermal_start(self) -> None:
@@ -1300,7 +1728,8 @@ class Converter:
             if work_secs > 5 and work_frames > 0:
                 remaining = max(0, self._frames_pending - work_frames)
                 eta = remaining / (work_frames / work_secs)
-        self.rep.progress(plan.name, clip_frac, min(1.0, total), eta, text)
+        self.rep.progress(plan.name, clip_frac, min(1.0, total), eta,
+                          (self._progress_prefix + text) if self._progress_prefix else text)
 
     # ------------------------------------------------------------------ Ein Clip
     def _expected_umid(self, plan: ClipPlan) -> str:
@@ -1447,8 +1876,14 @@ class Converter:
                 self._frames_done += frames
                 return
 
+        # Wiederholung durch die Abschlusspruefung: ein vorhandener Ziel-Clip wird NICHT als fertig uebersprungen, sondern
+        # neu erzeugt; ersetzt wird er (wie immer) erst nach erfolgreicher Neuerzeugung, die Fremd-Pruefung gilt weiter.
+        forced = plan.name.casefold() in self._force
+        if forced and dst.exists():
+            self._check_existing_umid(plan, dst)
+
         # Fortsetzen: fertiger, verifizierter Ziel-Clip vorhanden?
-        if dst.exists():
+        if dst.exists() and not forced:
             self._check_existing_umid(plan, dst)
             self._emit_progress(plan, 0.0, "Pruefe vorhandene Zieldatei ...")
             probs = verify.check_clip(dst, exp, cancel=self.cancel, source=src_arg, source_info=info)
@@ -1562,6 +1997,27 @@ class Converter:
                     break
                 self.warn(f"{plan.name}: Pruefung des Ergebnisses fehlgeschlagen: {last_err} - Versuch {idx + 1}/{len(attempts)}")
                 continue
+            if forced and self.o.auto_verify_deep:
+                # Wiederholung (erzwungene Neuerzeugung): gruendliche Pruefung der NEUEN Datei VOR dem Ersetzen
+                # (komplett dekodieren, Ton jeder Spur vollstaendig gegen die Quelle); sonst bleibt der alte Clip
+                self._emit_progress(plan, 0.98, "Pruefe Ergebnis gruendlich (Dekodieren, Ton) ...", transcoded=frames)
+                dprobs = self._deep_check_new(plan, out_mxf, frames)
+                if dprobs:
+                    last_err = "; ".join(dprobs)
+                    self.warn(f"{plan.name}: gruendliche Pruefung der neu erzeugten Datei fehlgeschlagen: {last_err} "
+                              "- der vorhandene Clip wird nicht ersetzt")
+                    break
+            if forced and dst.exists() and ((expect_anc and anc_f is None) or (embed and xml_f is None)):
+                # kein Rueckfall ohne ANC/eingebettetes XML, wenn der vorhandene Ziel-Clip diese Spur hat
+                old_anc, old_xml = self._old_target_has(dst)
+                lost = [n for n, want, got, had in (("ANC-Spur", expect_anc, anc_f, old_anc),
+                                                     ("eingebettetes XML", embed, xml_f, old_xml))
+                        if want and got is None and had]
+                if lost:
+                    last_err = (f"Neuerzeugung ohne {' und ohne '.join(lost)} - der vorhandene Clip hat sie und "
+                                "bleibt unveraendert")
+                    self.warn(f"{plan.name}: {last_err} - Versuch {idx + 1}/{len(attempts)}")
+                    continue
             if expect_anc and anc_f is None:
                 res.notes.append("ANC-Datenspur (Kamera-Metadaten) konnte nicht uebernommen werden und fehlt im Ziel")
                 self.warn(f"{plan.name}: ANC-Spur fehlt im Ziel (Uebernahme nicht moeglich)")
@@ -1591,6 +2047,28 @@ class Converter:
         self._emit_progress(plan, 1.0, "fertig")
         self._frames_done += frames
         self.info(f"{plan.name}: fertig ({fmt_size(plan.mxf.stat().st_size)} -> {fmt_size(dst.stat().st_size)})")
+
+    def _deep_check_new(self, plan: ClipPlan, mxf: Path, frames: int) -> list:
+        """Gruendliche Pruefung einer neu erzeugten Datei (vor dem Ersetzen): komplett dekodieren (jede Ausgabe von
+        ffmpeg, Rueckgabewert != 0 oder falsche Bildzahl ist ein Befund) und Ton jeder Spur vollstaendig gegen die Quelle."""
+        out: list = []
+        n, errs = verify.deep_decode_check(str(mxf), cancel=self.cancel, threads=self.o.threads)
+        if errs:
+            out.append(f"Decodierfehler: {errs[:3]}")
+        if n != frames:
+            out.append(f"Decode ergab {n} Frames statt {frames}")
+        out += verify.check_audio_full(mxf, plan.mxf, cancel=self.cancel, threads=self.o.threads)
+        return out
+
+    def _old_target_has(self, dst: Path) -> tuple:
+        """(hat ANC-Spur, hat eingebettetes XML) der vorhandenen Ziel-MXF; unlesbar = (False, False)."""
+        try:
+            ti = mxfinfo.read_mxf_info(str(dst), cancel=self.cancel)
+        except tools.Cancelled:
+            raise
+        except Exception:  # noqa: BLE001
+            return False, False
+        return bool(ti.anc_tracks), any(t.get("scheme_id") == verify.NRT_SCHEME_ID for t in ti.text_objects)
 
     def _finish_clip_files(self, plan: ClipPlan, dst_dir: Path) -> None:
         """Nach erfolgreichem Ersetzen/Pruefen der MXF: Clip-XML und MEDIAPRO.XML (in dieser Reihenfolge)."""

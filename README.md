@@ -13,7 +13,8 @@ documentation are in German. Status (November 2026): tested by the author on Win
 from a Sony PMW-F5 card and a complete 76-clip F55 card (XAVC-I HD 50p, 104 GB) were converted and passed
 `--verify --source --deep` without deviations; the MXF headers were compared set by set against a real Sony FX6 XAVC-L
 clip (remaining differences are listed in `docs/NAECHSTE-SCHRITTE.md`). Ctrl+C, resuming, a hard kill, two parallel runs
-and an unplanned machine crash were exercised on Windows. The converted F55 card was imported by the author into DaVinci
+and an unplanned machine crash were exercised on Windows. After every conversion the target card is verified automatically
+against the source (full decode, full per-track audio comparison) and clips with deviations are converted again. The converted F55 card was imported by the author into DaVinci
 Resolve and Sony Catalyst Browse (card recognised, playback and audio tracks fine; timecode display not compared).
 **Not tested:** other NLEs and Sony tools, frame rates other than 50p with camera files, and real temperature readings
 and fan control of the optional temperature monitor (needs administrator rights and a Lenovo Legion). **Please note:** the MXF
@@ -87,12 +88,18 @@ demselben Ziel setzt fort (siehe unten). Am Ende erscheint ein **Abschlussfenste
 fehlgeschlagen) mit einer Zählzeile (umgewandelt, bereits fertig, kopiert, Fehler), dem **Fehlergrund je Clip** und einem Hinweis,
 wenn die Zielkarte dadurch **unvollständig** ist. Beim Schließen während eines Laufs wird nachgefragt.
 
+Nach der Umwandlung läuft automatisch die **Abschlussprüfung**: Die Zielkarte wird gründlich gegen die Quelle geprüft, und
+Clips mit einer Abweichung werden neu umgewandelt (Standard: bis zu zwei Wiederholungsrunden). Das Abschlussfenster nennt
+dann „Geprüft: N Clips, M ohne Abweichung“ sowie wiederholte und weiterhin fehlerhafte Clips mit Grund. In den Einstellungen
+lässt sich die Prüfung abschalten oder auf die schnelle Variante stellen (siehe „Abschlussprüfung“ unten).
+
 ### Kommandozeile
 
 ```
 python -m xdroot_converter.cli <quelle> <ziel> [--bitrate 50] [--preset medium] [--max-frames N]
                                [--unlisted convert|skip] [--only TEXT] [--embed-xml auto|always|never] [--no-anc]
                                [--no-sony-header] [--verbose]
+                               [--no-auto-verify] [--auto-verify-quick] [--retries N]
 python -m xdroot_converter.cli --verify <ziel> [--source <quelle>] [--deep]
 python -m xdroot_converter.cli --mxf-info <datei.MXF>
 python -m xdroot_converter.cli --thermal-test
@@ -113,6 +120,9 @@ Weitere Optionen zu Temperatur und Schonmodus (`--threads`, `--thermal`, `--temp
 | `--no-anc` | ANC-Datenspur (Kamera-Metadaten) nicht übernehmen |
 | `--no-sony-header` | MXF-Kopfdaten **nicht** an die Quelle angleichen (Standard: Identification, Track-IDs usw. werden aus der Quell-MXF übernommen); die Ausgabe trägt dann bmx-Kennungen, und `--verify` ohne `--source` meldet dafür Abweichungen |
 | `--threads N` | Schonmodus: `ffmpeg` nutzt höchstens N Kerne (weniger Wärme, dauert länger); wirkt auch bei `--verify --deep` |
+| `--no-auto-verify` | keine Abschlussprüfung nach der Umwandlung (Standard: Prüfung wie `--verify --source --deep`, fehlerhafte Clips werden neu umgewandelt) |
+| `--auto-verify-quick` | Abschlussprüfung ohne vollständiges Dekodieren und ohne vollständigen Tonvergleich (schneller, weniger gründlich) |
+| `--retries N` | Wiederholungsrunden für fehlerhafte Clips (0 bis 5, Standard 2) |
 | `--thermal auto` / `off` | Temperaturüberwachung (Standard `auto`; ohne nutzbare Messung läuft alles wie gewohnt), siehe unten |
 | `--temp-fan GRAD`, `--temp-pause GRAD` | Schwellen für „Lüfter voll“ (Standard 85 °C, erlaubt 50–110) und Pause (Standard 97 °C, erlaubt 60–120, höher als die Lüfter-Schwelle); zurückgeschaltet wird 10 °C bzw. 12 °C darunter |
 | `--thermal-test` | Diagnose der Temperaturmessung und Lüftersteuerung (braucht Administratorrechte) |
@@ -120,7 +130,11 @@ Weitere Optionen zu Temperatur und Schonmodus (`--threads`, `--thermal`, `--temp
 | `--mxf-info DATEI` | Header-Metadaten einer MXF-Datei ausgeben (Diagnose, liest nur) |
 | `--verify ZIEL` | Ziel-XDROOT (oder Elternordner) prüfen, siehe unten |
 | `--source QUELLE` | mit `--verify`: zusätzlich Vergleich mit der Quelle |
-| `--deep` | mit `--verify`: jeden Clip komplett dekodieren |
+| `--deep` | mit `--verify`: jeden Clip komplett dekodieren (Abbruch beim ersten Decodierfehler) und mit `--source` den Ton jeder Spur vollständig mit der Quelle vergleichen |
+
+**Exit-Codes:** 0 fertig (mit Abschlussprüfung: geprüft, ohne Abweichung), 1 Fehler oder Abweichung, 2 falscher Aufruf,
+3 Rechte-Erhöhung abgelehnt, 130 abgebrochen (auch Temperatur-Abbruch). Die letzte Ausgabezeile eines Laufs beginnt immer mit
+`Ergebnis:`.
 
 ### Dateien im Zielordner, Fortsetzen, Schutzmechanismen
 
@@ -157,7 +171,19 @@ Clip-Ende und die Sony-Kopfdaten. Ohne `--source` werden die Kopfdaten gegen das
 Nicht-MXF-Dateien byte-gleich, **fehlende Dateien sind Abweichungen**; ebenso nicht in `MEDIAPRO.XML` gelistete Quell-Clips, die im
 Ziel fehlen, es sei denn, `auswahl` in `konvertierung_einstellungen.json` belegt `--unlisted skip` bzw. `--only`. Ein nicht
 lesbarer Ziel-Clip ist ohne `--source` immer eine Abweichung; mit `--source` nur ein Hinweis, wenn er byte-gleich mit der Quelle
-ist (die Quelle war schon nicht analysierbar und wurde unverändert kopiert). Mit `--deep` wird jeder Clip komplett dekodiert (dauert).
+ist (die Quelle war schon nicht analysierbar und wurde unverändert kopiert). Mit `--deep` wird jeder Clip komplett dekodiert
+(`ffmpeg -xerror`: ein beschädigtes Bild ist ein Befund, dazu die Bildzahl) und mit `--source` der Ton jeder Spur vollständig
+mit der Quelle verglichen (Prüfsumme je Spur); das dauert.
+
+**Abschlussprüfung** (Standard nach jeder Umwandlung, GUI und Kommandozeile): Nach dem letzten Clip wird die Zielkarte wie mit
+`--verify --source --deep` geprüft. Clips mit einer Abweichung werden neu umgewandelt und erneut geprüft, höchstens `--retries`
+Runden (Standard 2); der vorhandene Ziel-Clip wird erst ersetzt, wenn die neue Datei die gründliche Prüfung bestanden hat.
+Fehlende oder abweichende Begleitdateien werden neu kopiert. Nicht wiederholt, aber als Abweichung gemeldet werden: Clips, die
+im Ziel liegen, in diesem Lauf aber nicht ausgewählt waren (`--only`, `--unlisted skip`), Abweichungen in den XML-Dateien und
+Befunde, deren Ursache die Quelle ist (z. B. Quelle nicht lesbar). Liegt im Ziel eine Testausgabe (`TESTAUSGABE.txt`), wird
+nicht geprüft und das gemeldet; `--max-frames`-Läufe haben keine Abschlussprüfung. „Fertig – geprüft, ohne Abweichung“ (Exit 0)
+gibt es nur, wenn die Prüfung vollständig lief und nichts fand; konnte sie nicht laufen oder wurde sie abgebrochen, sagt das
+Ergebnis das ausdrücklich. Die Prüfung beachtet Abbrechen, Temperaturpause und `--threads`.
 
 ## Was wird umgewandelt, kopiert, angepasst?
 
@@ -201,6 +227,10 @@ Details und Messwerte: [docs/SPEC.md](docs/SPEC.md).
   - F55-Karte: alle 76 Clips (104 GB) umgewandelt, `--verify --source --deep` ohne Abweichung, alle Begleitdateien verglichen.
     Ein Clip schlug im ersten Durchgang nach einem Hänger beim Lesen vom Kartenleser fehl, wurde als Fehler gemeldet und im
     Fortsetzungslauf fehlerfrei umgewandelt.
+  - Beide Karten wurden nach der Verschärfung der Prüfung (Decode mit `-xerror`, Ton je Spur vollständig verglichen) erneut
+    geprüft: 19 von 19 und 76 von 76 Clips ohne Abweichung (die F55-Ausgabe gegen eine Kopie der Originalkarte).
+  - **Abschlussprüfung:** Ein gezielt beschädigter Ziel-Clip (Bilddaten bzw. Ton überschrieben) wird gefunden, automatisch neu
+    umgewandelt und danach ohne Abweichung geprüft; ein beschädigter, im Lauf nicht ausgewählter Clip führt zu Exit-Code 1.
   - Parser und Kopfdaten-Patcher lesen echte F5-, F55- und FX6-Dateien fehlerfrei; der Toninhalts-Vergleich funktioniert mit
     echtem Sony-Ton.
   - Die Quell-Laufwerke blieben unverändert (Vergleich aller Dateien vor und nach den Tests).
