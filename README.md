@@ -16,7 +16,7 @@ clip (remaining differences are listed in `docs/NAECHSTE-SCHRITTE.md`). Ctrl+C, 
 and an unplanned machine crash were exercised on Windows. After every conversion the target card is verified automatically
 against the source (full decode, full per-track audio comparison) and clips with deviations are converted again. The converted F55 card was imported by the author into DaVinci
 Resolve and Sony Catalyst Browse (card recognised, playback and audio tracks fine; timecode display not compared).
-**Not tested:** other NLEs and Sony tools, frame rates other than 50p with camera files, and real temperature readings
+**Not tested:** other NLEs and Sony tools, frame rates other than 50p with camera files, and (beyond a single diagnostic run on one Legion model) real temperature readings
 and fan control of the optional temperature monitor (needs administrator rights and a Lenovo Legion). **Please note:** the MXF
 headers of the output carry the **Sony identifiers of the source camera** (company/product/version
 copied from the source file, Sony track IDs 2, 3, ...), but the files were **created by this tool, not by a
@@ -236,6 +236,8 @@ Details und Messwerte: [docs/SPEC.md](docs/SPEC.md).
     Fortsetzungslauf fehlerfrei umgewandelt.
   - Beide Karten wurden nach der Verschärfung der Prüfung (Decode mit `-xerror`, Ton je Spur vollständig verglichen) erneut
     geprüft: 19 von 19 und 76 von 76 Clips ohne Abweichung (die F55-Ausgabe gegen eine Kopie der Originalkarte).
+  - Eine weitere F55-Karte (6 Clips, 67,9 GB) mit einem **52,7-GB-Clip** (31:42 min, WAV-Dateien über 4 GB) lief in der GUI
+    durch; die automatische Abschlussprüfung meldete 6 von 6 Clips ohne Abweichung.
   - **Abschlussprüfung:** Ein gezielt beschädigter Ziel-Clip (Bilddaten bzw. Ton überschrieben) wird gefunden, automatisch neu
     umgewandelt und danach ohne Abweichung geprüft; ein beschädigter, im Lauf nicht ausgewählter Clip führt zu Exit-Code 1.
   - Parser und Kopfdaten-Patcher lesen echte F5-, F55- und FX6-Dateien fehlerfrei; der Toninhalts-Vergleich funktioniert mit
@@ -253,9 +255,12 @@ Details und Messwerte: [docs/SPEC.md](docs/SPEC.md).
   Browse** als Karte erkannt; Wiedergabe und Tonspuren sind in Ordnung. Die Timecode-Anzeige in diesen Programmen wurde dabei
   nicht verglichen (in den Dateien stimmt der Timecode laut `--verify --source` mit der Quelle überein).
 - **Nicht getestet:** andere Schnittprogramme (Avid, Premiere, …) und andere Sony-Werkzeuge, die GUI-Bedienung von Hand in allen
-  Wegen, Clips über 10 GB (WAV > 4 GB) und andere Bildraten als 50p mit echten Kameraclips (25p, 29.97p, 59.94p nur synthetisch).
-- **Temperaturüberwachung:** Logik, Pause und der Weg ohne Administratorrechte sind getestet; echte Messwerte und das Schalten
-  der Lüfter (Lenovo Legion, Administratorrechte) sind am Gerät **noch nicht belegt** (siehe unten).
+  Wegen und andere Bildraten als 50p mit echten Kameraclips (25p, 29.97p, 59.94p nur synthetisch).
+- **Temperaturüberwachung:** Logik, Pause und der Weg ohne Administratorrechte sind getestet. Auf einem **Lenovo Legion Pro 7
+  16IRX8H** zeigte `--thermal-test` mit Administratorrechten: Temperatur (75–86 °C, schwankend) und Lüfterdrehzahl sind über
+  `GetFeatureValue` lesbar, „Lüfter voll“ wirkt (3600 → 7300 U/min) und wird zurückgestellt. Die älteren Abfragen
+  (`GetCPUTemp`, `GetFan1Speed`) und die Windows-Thermalzonen liefern auf diesem Modell nichts. Andere Modelle: unbelegt.
+  Noch nicht beobachtet: ein ganzer Lauf mit Überwachung, die Pause bei echter Überhitzung.
 - **Synthetische Tests (Linux):** Umwandlung, Fortsetzen, `--embed-xml always`, nicht gelistete Clips, unlesbare `.MXF`-Dateien
   mit einer mit bmx erzeugten Testkarte (`scripts/make_test_card.py`). `MXFDump` meldet bei KAG 512 gelegentlich „Warning :
   Length is zero (following KLVFill key …)“: bekannte, harmlose Eigenheit von bmx/libMXF.
@@ -273,8 +278,10 @@ Lange Umwandlungen lasten die CPU voll aus. Zwei Hilfen:
   Lauf sauber abgebrochen und kann später fortgesetzt werden. Ohne Administratorrechte oder auf anderen Geräten steht dort
   „Temperatur nicht verfügbar“, und die Umwandlung läuft wie gewohnt.
 - **Vor dem ersten Einsatz:** `Temperatur-Test (Administrator).bat` ausführen. Der Test zeigt, ob Messung und „Lüfter voll“ auf
-  dem Gerät wirken. Die dafür benutzte Lenovo-Kennung ist eine unbestätigte Annahme; ohne messbare Wirkung zeigt das Tool nur
-  „Lüfter voll angefordert“.
+  dem Gerät wirken. Das Tool probiert mehrere nur lesende Temperaturquellen der Reihe nach (Lenovo `GetCPUTemp`, Lenovo
+  `GetFeatureValue`, ACPI-Thermalzone, Windows-Leistungszähler) und nimmt die erste mit plausiblem Wert; grobe Quellen
+  (Thermalzonen) werden in der Anzeige als solche gekennzeichnet. Die Lenovo-Kennungen stammen aus einem Open-Source-Projekt
+  und sind nur auf dem oben genannten Modell bestätigt; ohne messbare Wirkung zeigt das Tool nur „Lüfter voll angefordert“.
 - **Andere Geräte:** In `xdroot_converter/thermal.py` lässt sich ein eigener Anbieter ergänzen (Schnittstelle und Beispiel im
   Modul). Der Lenovo-Leistungsmodus wird bewusst nie geschaltet.
 - Wird das Programm hart beendet oder stürzt der Rechner ab, während die Lüfter voll laufen, stellt das Tool den vorherigen

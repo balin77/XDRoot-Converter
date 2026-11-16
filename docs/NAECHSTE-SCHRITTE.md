@@ -19,6 +19,7 @@ aller Quellordner (Namen, Größen, Änderungszeiten) vor und nach den Tests zei
 | F5-Karte, 19 in `MEDIAPRO.XML` gelistete Clips (18,33 GB, 11:01 min Material) | 19 umgewandelt, 0 Fehler, 4,62 GB, 11:47 min; `--verify --source --deep`: 19 ohne Abweichung |
 | F55-Karte, alle 76 Clips (104,18 GB, 62:39 min Material) | 76 umgewandelt, 26,42 GB; `--verify --source --deep`: 76 ohne Abweichung, 155 Begleitdateien verglichen |
 | Beide Karten erneut mit der **verschärften** Prüfung (Runde 4: Decode mit `-xerror`, Ton je Spur vollständig) | F5: 19 von 19 ohne Abweichung (2:11 min); F55: 76 von 76 ohne Abweichung, 155 Begleitdateien verglichen (gegen eine Kopie der Originalkarte auf Festplatte, die Karte selbst war inzwischen neu bespielt) |
+| Erster Lauf des Autors in der GUI (16.11.2026): weitere F55-Karte, 6 Clips, 67,90 GB, darunter **ein Clip mit 52,68 GB** (95 082 Bilder, 31:42 min, WAV-Dateien über 4 GB) | 6 umgewandelt, 17,17 GB, 0 Fehler, 1:39 h; Abschlussprüfung (gründlich, 5:07 min): 6 von 6 ohne Abweichung. Der Rechner ging während des langen Clips in den Energiesparmodus und lief nach dem Aufwachen weiter; das Ergebnis war trotzdem fehlerfrei. Daraus entstand „Energiesparmodus verhindern“ |
 | Abschlussprüfung mit gezielt beschädigtem Ziel-Clip (Bilddaten bzw. Ton überschrieben) | Schaden gemeldet, Clip in Wiederholungsrunde 1 neu umgewandelt, „Ergebnis: Fertig – geprüft, ohne Abweichung“; beschädigter, nicht ausgewählter Clip: Exit-Code 1, „Fertig mit Fehlern“ |
 | `scripts/mxf_vergleich.py` Quelle / Ziel / FX6-Referenz | Quelle ≠ Ziel: 20 Abweichungen, alle durch den Codec-Wechsel; Bericht: `docs/analysis/vergleich_f55_ziel_fx6.md` |
 | Strg+C in der Kommandozeile | Exit-Code 130 nach 1,4 s, Arbeitsordner und Sperre entfernt, keine verwaisten Prozesse |
@@ -74,17 +75,46 @@ Alle im Bericht `docs/analysis/vergleich_f55_ziel_fx6.md` (Spalte `R≠Z`):
 2. **Oberfläche von Hand:** Lauf mit Abbrechen und Fortsetzen, Abschlussfenster (jetzt mit „Geprüft: N Clips, M ohne
    Abweichung“), Rückfragen beim Start, Schließen während eines Laufs, die neuen Einstellungen zur Abschlussprüfung
    (Checkliste in der Rückmeldung des lokalen Tests).
-3. **Temperaturüberwachung:** `Temperatur-Test (Administrator).bat` ausführen und die Ausgabe zurückmelden (siehe unten).
-4. Ein sehr langer Clip (ca. 56 GB, 31 min; WAV-Dateien über 4 GB) wurde **nicht** getestet, weil er nicht mehr auf der Karte
-   lag. Der größte getestete Clip hatte 10,1 GB.
+3. **Temperaturüberwachung:** Der Gerätetest ist bestanden (siehe unten). Offen: einen ganzen Lauf mit Überwachung beobachten
+   (Anzeige, Schalten der Lüfter bei 85 °C).
+4. Ein sehr langer Clip ist inzwischen getestet (siehe Tabelle oben: 52,68 GB, 31:42 min). Offen sind noch längere Clips und
+   Karten mit mehreren sehr langen Clips.
 
 ## Temperaturüberwachung und Schonmodus (Runde 3)
 
 Spezifikation: [SPEC.md](SPEC.md), Abschnitt „Temperaturüberwachung und Schonmodus“. Getestet sind die Logik (Unit-Tests mit
 Attrappen), das Anhalten und Fortsetzen von Prozessen unter Windows (mit Hilfsprozessen) und der Weg ohne Administratorrechte
-(„Temperatur nicht verfügbar“). **Nicht getestet** sind echte Messwerte und das Schalten der Lüfter: Beides braucht
-Administratorrechte, und die Kennung für „Lüfter voll“ ist eine unbestätigte Annahme. Bis `--thermal-test` am Gerät eine
-Wirkung zeigt, gilt die Lüftersteuerung als unbelegt. Der Schonmodus (`--threads N`) funktioniert ohne Messung auf jedem Rechner.
+(„Temperatur nicht verfügbar“). Der Schonmodus (`--threads N`) funktioniert ohne Messung auf jedem Rechner.
+
+**Gerätetest 16.11.2026 (Lenovo Legion Pro 7 16IRX8H, Administratorrechte, `--thermal-test`):**
+
+| Quelle | Ergebnis |
+|---|---|
+| `LENOVO_GAMEZONE_DATA.GetCPUTemp` | antwortet, liefert aber 0 (unbrauchbar) |
+| `LENOVO_OTHER_METHOD.GetFeatureValue(0x05040000)` | 80, 86, 79, 76, 75 °C in Folge: plausibel und schwankend, wird als Temperaturquelle gewählt |
+| `MSAcpi_ThermalZoneTemperature` | „Nicht unterstützt“ |
+| Leistungszähler Thermalzone | keine Zone gemeldet |
+| `GetFan1Speed` / `GetFan2Speed` / `GetFanMaxSpeed` | Fehler „Ungültiges Objekt“ |
+| `GetFeatureValue(0x04030001 / 0x04030002)` | 3500 / 3600 U/min |
+| `SetFeatureValue(0x04020000, 1)` („Lüfter voll“) | wirkt: 7200 / 7300 U/min; zurückgestellt und zurückgelesen (0). Die Drehzahl direkt nach dem Zurückstellen war noch 7100 (sofort gemessen) |
+| `GetSmartFanMode` | 255 (nur gelesen, wird nie geschaltet) |
+
+Der erste Test desselben Tages scheiterte an `GetCPUTemp` = 0; daraus entstand die Quellenkette (SPEC, „Temperaturquellen“).
+**Noch nicht beobachtet:** ein ganzer Umwandlungslauf mit laufender Überwachung, das automatische Schalten bei 85 °C im Lauf,
+die Pause bei echter Überhitzung, andere Legion-Modelle.
+
+Offene Notizen aus dem letzten Review der Temperaturüberwachung und des Energiesparschutzes (keine groben Fehler; der Zustand
+ist in allen Fällen sicher, d. h. `ffmpeg` läuft weiter und die Lüfter werden zurückgestellt):
+
+- Drehzahl- und Temperaturquelle teilen sich das Kontingent von drei Neustarts des Hilfsprozesses. Nach mehreren Hängern der
+  Drehzahlquelle kann deshalb die ganze Überwachung für den Rest des Laufs ausfallen.
+- Ein einzelner Fehler der Art „Quelle meldet nichts“ (z. B. leere Thermalzonen-Antwort) führt sofort zum Ausfall der
+  Überwachung; nur Fehlermeldungen des Hilfsprozesses werden dreimal toleriert.
+- Die Statuszeile nennt die Lenovo-Quelle `GetFeatureValue` weiterhin „Quelle unbestätigt“, obwohl sie auf dem getesteten Modell
+  bestätigt ist; zwei Pausen-Protokollzeilen nennen die Quelle nicht.
+- Einzelne Meldungen des Anbieters können verloren gehen, wenn die letzte Messung scheitert.
+- Unter Linux/macOS schreibt jeder Lauf eine Warnzeile, dass der Energiesparmodus nicht verhindert werden kann.
+- Nicht belegt: dass Windows bei einem stundenlangen Lauf wirklich nicht einschläft (nur der Rückgabewert des Aufrufs ist getestet).
 
 ## Abschlussprüfung mit automatischer Wiederholung (Runde 4)
 
