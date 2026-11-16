@@ -124,7 +124,7 @@ Weitere Optionen zu Temperatur und Schonmodus (`--threads`, `--thermal`, `--temp
 | `--auto-verify-quick` | Abschlussprüfung ohne vollständiges Dekodieren und ohne vollständigen Tonvergleich (schneller, weniger gründlich) |
 | `--retries N` | Wiederholungsrunden für fehlerhafte Clips (0 bis 5, Standard 2) |
 | `--thermal auto` / `off` | Temperaturüberwachung (Standard `auto`; ohne nutzbare Messung läuft alles wie gewohnt), siehe unten |
-| `--temp-fan GRAD`, `--temp-pause GRAD` | Schwellen für „Lüfter voll“ (Standard 85 °C, erlaubt 50–110) und Pause (Standard 97 °C, erlaubt 60–120, höher als die Lüfter-Schwelle); zurückgeschaltet wird 10 °C bzw. 12 °C darunter |
+| `--temp-fan GRAD`, `--temp-pause GRAD` | Schwellen für „Lüfter voll“ (Standard 85 °C, erlaubt 50–110; die Lüfter bleiben dann bis Laufende voll) und für Drosseln/Pause (Standard 97 °C, erlaubt 60–120, höher als die Lüfter-Schwelle): ab dieser Temperatur wird zuerst die Last gedrosselt, die Pause ist nur die letzte Stufe (oder 5 °C darüber); weiter geht es 12 °C darunter |
 | `--thermal-test` | Diagnose der Temperaturmessung und Lüftersteuerung (braucht Administratorrechte) |
 | `--verbose` | auch Einzelheiten ausgeben (z. B. jede Änderung der MXF-Kopfdaten); sie stehen immer in `konvertierung.log` |
 | `--mxf-info DATEI` | Header-Metadaten einer MXF-Datei ausgeben (Diagnose, liest nur) |
@@ -273,10 +273,23 @@ Lange Umwandlungen lasten die CPU voll aus. Zwei Hilfen:
 
 - **Schonmodus (jeder Rechner):** „CPU-Kerne begrenzen“ in den Einstellungen bzw. `--threads N`. Weniger Wärme, längere Laufzeit.
 - **Temperaturüberwachung (derzeit nur Lenovo Legion, nur mit Administratorrechten):** Start über
-  `XDROOT-Converter (Administrator).bat`. Die Oberfläche zeigt CPU-Temperatur und Lüfterdrehzahl, fordert ab 85 °C volle Lüfter
-  an und hält die Umwandlung ab 97 °C an, bis die CPU unter 85 °C abgekühlt ist. Kühlt sie nach 20 Minuten nicht ab, wird der
-  Lauf sauber abgebrochen und kann später fortgesetzt werden. Ohne Administratorrechte oder auf anderen Geräten steht dort
-  „Temperatur nicht verfügbar“, und die Umwandlung läuft wie gewohnt.
+  `XDROOT-Converter (Administrator).bat`. Die Oberfläche zeigt CPU-Temperatur und Lüfterdrehzahl und fordert ab 85 °C volle Lüfter
+  an; **die Lüfter bleiben dann bis zum Ende des Laufs voll** (kein Hin und Her) und werden erst am Laufende zurückgestellt.
+  Ab 97 °C wird **zuerst die Last gedrosselt**: `ffmpeg` darf nur noch 75 %, 50 %, 35 % und zuletzt 25 % der logischen Kerne
+  benutzen (mindestens 2; nach einem Schritt nach unten frühestens nach 30 s der nächste, nach einem Lockern darf sofort wieder gedrosselt werden; die Anzeige nennt z. B. „gedrosselt auf 24 von 32 Kernen“).
+  Neu gestartete Hilfsprogramme laufen die ersten 3 Sekunden ungedrosselt, damit `ffmpeg`/x264 ihre Threadzahl wie ohne
+  Drosselung wählen; die Drosselung soll den Datenstrom nicht beeinflussen (Beleg mit echtem Material steht aus). Die ersten
+  3 Sekunden zählen nur Laufzeit, keine Pausenzeit.
+  Bleibt die CPU auch auf der niedrigsten Stufe an der Schwelle, oder liegt sie 5 °C darüber (beim Standardwert 102 °C, über
+  der Abschaltgrenze vieler CPUs, daher praktisch nie erreicht), wird die Umwandlung als letzte Stufe angehalten, bis die CPU
+  unter 85 °C abgekühlt ist; danach geht es eine Stufe tiefer weiter. Bleibt sie mindestens 8 °C unter der Schwelle (60 s am Stück), wird
+  stufenweise wieder gelockert; eine Stufe, die kurz nach dem Lockern wieder zu heiß wurde, wird 15 Minuten lang nicht mehr versucht. Kühlt die
+  CPU nach 20 Minuten Pause nicht ab, wird der Lauf sauber abgebrochen und kann später fortgesetzt werden. Das Drosseln
+  ändert nur die Kernzuteilung der vom Tool gestarteten Hilfsprogramme (`ffmpeg`, `ffprobe`, `raw2bmx`, `mxf2raw`; Prozess-Affinität,
+  endet mit dem Prozess) und soll das Ergebnis nicht beeinflussen (Beleg mit echtem Material steht aus); ist es
+  nicht möglich (z. B. mehr als 64 Kerne), wird wie früher sofort pausiert. Die Zusammenfassung nennt die gedrosselte und die
+  pausierte Zeit. Ohne Administratorrechte oder auf anderen Geräten steht dort „Temperatur nicht verfügbar“, und die
+  Umwandlung läuft wie gewohnt (ohne Messung wird nie gedrosselt).
 - **Vor dem ersten Einsatz:** `Temperatur-Test (Administrator).bat` ausführen. Der Test zeigt, ob Messung und „Lüfter voll“ auf
   dem Gerät wirken. Das Tool probiert mehrere nur lesende Temperaturquellen der Reihe nach (Lenovo `GetCPUTemp`, Lenovo
   `GetFeatureValue`, ACPI-Thermalzone, Windows-Leistungszähler) und nimmt die erste mit plausiblem Wert; grobe Quellen

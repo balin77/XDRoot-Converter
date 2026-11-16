@@ -396,7 +396,8 @@ notfalls pausieren. Nichts davon darf die Umwandlung behindern, wenn die Hardwar
     und ein kurzes Beispiel sind im Modul dokumentiert).
   - **Regler** (hardwareunabhängig, mit Attrappen-Anbieter testbar): Schwellen mit Hysterese.
     Standard: Lüfter voll ab **85 °C**, zurück unter **75 °C**; Pause ab **97 °C**, weiter unter **85 °C**. Alle Schwellen
-    einstellbar. Mehrere Messungen in Folge entscheiden (kein Schalten wegen eines einzelnen Ausreißers).
+    einstellbar. *(Durch Runde 5 ersetzt: Die Lüfter bleiben nach „voll“ bis zum Laufende, es gibt keine Rückschalt-Schwelle
+    für sie mehr, und ab der Pausen-Schwelle wird zuerst gedrosselt; siehe „Lüfter halten und Last drosseln statt pendeln“.)* Mehrere Messungen in Folge entscheiden (kein Schalten wegen eines einzelnen Ausreißers).
 - **Verfügbarkeit:** Ist kein Anbieter nutzbar (anderes Gerät, keine Adminrechte, PowerShell fehlt, Messung unplausibel
   ≤ 0 °C oder > 125 °C), zeigt die Oberfläche „Temperatur nicht verfügbar“ mit dem Grund, und die Umwandlung läuft unverändert.
   Fällt der Anbieter während des Laufs aus, gilt dasselbe; ein Fehler der Überwachung ist **nie** ein Fehler der Umwandlung.
@@ -440,7 +441,8 @@ Ergänzungen nach den Reviews (verbindlich):
   **Lauf sauber abgebrochen** (fortsetzbar) mit eigenem Grund; das ist sicherer als unter Übertemperatur weiterzurechnen.
 - **Schwellen:** Einstellbar sind „Lüfter voll ab“ (50–110 °C) und „Pause ab“ (60–120 °C, größer als die Lüfter-Schwelle); die
   Rückschalt-Schwellen sind abgeleitet (−10 °C bzw. −12 °C). Zum Einschalten zählen 2, zum Zurückschalten 3 Messungen in Folge
-  (Messabstand 5 s).
+  (Messabstand 5 s). *(Für die Lüfter durch Runde 5 ersetzt: keine Rückschalt-Schwelle, „voll“ bleibt bis Laufende; für die Pause
+  gilt −12 °C weiter.)*
 - **Intern** ist die Überwachung aus (`Options.thermal = "off"`); CLI und GUI schalten sie ein (`auto`).
 - **`--threads`:** x264 erzeugt mit anderer Kernzahl einen gleichwertigen, aber nicht bitgleichen Datenstrom. Für das Fortsetzen
   ist das unerheblich, weil jeder Clip für sich steht. Gilt auch für `--verify --deep`.
@@ -522,6 +524,63 @@ Ausweichquelle; ohne Drehzahl bleibt es bei „Lüfter voll angefordert (keine W
 **Diagnose (`--thermal-test`):** Schritt 1 gibt alle Kandidaten roh aus (Rohwert, umgerechnet, plausibel ja/nein, Fehlertext),
 dazu `GetSmartFanMode` und den Zustand `GetFeatureValue(0x04020000)` (nur gelesen), dann die gewählte Quelle. Ist keine Quelle
 plausibel, steht die Liste trotzdem in `thermal_test.txt`; es wird nichts geschaltet.
+
+#### Lüfter halten und Last drosseln statt pendeln (Runde 5, Ergänzung nach dem ersten echten Lauf 16.11.2026)
+
+**Befund am Gerät:** Die CPU springt unter voller Last in wenigen Sekunden auf 97–98 °C. Dadurch fielen „Lüfter voll“ und Pause
+zusammen; in der Pause kühlte die CPU auf ca. 70 °C, die Lüfter wurden zurückgestellt, `ffmpeg` lief weiter, und nach kurzer Zeit
+begann alles von vorn (Pendeln zwischen Pause und Volllast, Lüfter 5900 ↔ 7100 U/min). Die bisherigen Regeln zum Zurückschalten
+und zur sofortigen Pause werden deshalb ersetzt:
+
+1. **Lüfter halten:** Hat der Regler in einem Lauf einmal „Lüfter voll“ geschaltet, bleibt es bis zum **Ende des Laufs** dabei
+   (auch während Pausen, Wrappen, Kopieren und der Abschlussprüfung). Zurückgestellt wird nur am Laufende (jeder Endpfad:
+   fertig, Fehler, Abbruch, Hitze-Abbruch, Ausfall der Messung) – wie bisher über den gemerkten vorherigen Zustand. Die
+   Rückschalt-Schwelle für den Lüfter entfällt.
+2. **Last drosseln vor Pause (Stufen):** Statt `ffmpeg` sofort anzuhalten, begrenzt der Regler die Zahl der logischen Kerne, die
+   die laufenden Hilfsprogramme benutzen dürfen (Windows: Prozess-Affinität; die Thread-Zahl von x264 wird nicht verändert, die
+   Drosselung soll den Datenstrom nicht beeinflussen – Beleg mit echtem Material steht aus). Stufen in Prozent der verfügbaren logischen Kerne: 100 → 75 → 50 → 35 → 25
+   (mindestens 2 Kerne).
+   - **Stufe runter** (weniger Kerne): Temperatur an der Pausen-Schwelle oder darüber, 2 Messungen in Folge; danach frühestens
+     nach 30 s die nächste Stufe (die Wirkung braucht Zeit).
+   - **Stufe hoch** (mehr Kerne): Temperatur mindestens 8 °C unter der Pausen-Schwelle, 60 s am Stück; je Schritt eine Stufe.
+     Nach einem Hochschalten, das innerhalb von 2 min wieder zum Runterschalten (oder zur Pause) führte, wird diese höhere
+     Stufe **15 min lang** (`THROTTLE_FLOOR_EXPIRE_S`, nur die Zeit zählt, nicht der Clip-Wechsel) nicht mehr versucht; danach
+     darf sie wieder versucht werden, fällt sie erneut binnen 2 min zurück, gilt die Sperre wieder 15 min (kein Pendeln, aber
+     auch kein Festnageln auf 25 % für einen ganzen mehrstündigen Lauf). Die 30-s-Sperre gilt nur nach Schritten nach UNTEN;
+     nach einem Hochschalten darf sofort wieder heruntergeschaltet werden, sobald 2 Messungen an der Schwelle liegen.
+   - **Nach jeder Pause** (Notfall oder letzte Stufe) wird eine Stufe tiefer fortgesetzt, sofern es eine gibt; die Sperrzeit
+     läuft ab dem Fortsetzen neu.
+   - **Fehler beim Setzen:** Ein einzelner Fehlschlag (z. B. Prozess gerade beendet) wird mit der nächsten Messung erneut
+     versucht und führt in dieser Messung nicht zur Pause (ausser Notfall); ein gerade beendeter Prozess zählt nicht als
+     Fehlschlag. Erst „nicht unterstützt“ oder 3 gescheiterte Stufenwechsel in Folge (eigener Zähler, wird nur durch den Erfolg
+     eines Schritts zurückgesetzt; ebenso 3 gescheiterte Nachzieh-Aufrufe) schalten die Drosselung für den Rest des Laufs ab
+     (Stufe sofort auf 100 % zurück, in derselben Messung Pause wie bisher, eine Warnung). Scheitert das Aufheben auf 100 %
+     bei einem Prozess, wird es einmal sofort wiederholt (sonst Warnzeile) und mit jeder Messung nachgezogen, solange noch ein
+     Prozess gedrosselt ist. Die Startverzögerung (3 s) zählt nur Laufzeit: Pausenzeit wird nicht angerechnet. Eine gescheiterte Stufe bleibt nie im Token hängen.
+   - Die Stufe gilt für den ganzen Lauf weiter: neu gestartete Hilfsprogramme (nächster Clip, Prüfung) bekommen sie **nach
+     einer Startverzögerung von 3 s** (nicht beim Registrieren): `ffmpeg`/x264 leiten ihre Threadzahl aus der Affinität beim
+     Start ab und sollen sie wie ohne Drosselung bei voller Affinität wählen; erst danach wird eingeschränkt, damit die
+     Drosselung den Datenstrom nicht beeinflusst. Der Regler zieht die Stufe bei jeder Messung (alle 5 s), solange gedrosselt
+     wird, über `apply_throttle()` nach; je Prozess wird die zuletzt gesetzte Stufe gemerkt (kein wiederholtes Setzen). Ist
+     beim Start eines Prozesses eine Pause aktiv, gilt das Pausenverhalten unverändert. Eine feste Threadzahl wird bewusst
+     NICHT vorgegeben (eine Messung am 16.11.2026 zeigte, dass explizite Werte den Automatikfall nicht reproduzieren).
+   - Kerne werden so gewählt, dass zuerst gleichmäßig über alle Kerne ausgedünnt wird (keine Annahme über P-/E-Kerne); die
+     Auswahl ist deterministisch und testbar.
+3. **Pause nur noch als letzte Stufe:** `ffmpeg` wird erst angehalten, wenn auf der niedrigsten Stufe die Temperatur weiter an
+   der Pausen-Schwelle liegt (2 Messungen, frühestens 30 s nach dem letzten Stufenwechsel) **oder** wenn die Temperatur die
+   Pausen-Schwelle um 5 °C oder mehr überschreitet (Notfall, sofort nach 2 Messungen, unabhängig von der Stufe; beim
+   Standard 97 °C liegt dieser Wert mit 102 °C über der Abschaltgrenze vieler CPUs und wird dann praktisch nie erreicht –
+   den Schutz bietet die Stufenfolge) **oder** wenn
+   sich die Affinität nicht setzen lässt (dann verhält sich der Regler wie bisher). Fortsetzen und maximale Pausendauer
+   (20 min, dann sauberer, fortsetzbarer Abbruch) bleiben unverändert.
+4. **Anzeige und Protokoll:** Statuszeile z. B. „CPU 93 °C · Lüfter 7100/7100 U/min · Lüfter voll · gedrosselt auf 24 von 32
+   Kernen“. Jeder Stufenwechsel ist eine Protokollzeile („Last gedrosselt: 24 von 32 Kernen (97 °C)“, „Drosselung gelockert:
+   32 von 32 Kernen (88 °C)“). Die Zusammenfassung nennt, wie lange gedrosselt und wie lange pausiert wurde.
+5. **Grenzen:** Auf Systemen ohne Affinität (oder mehr als 64 logischen Kernen / mehreren Prozessorgruppen) entfällt die
+   Drosselung; es gilt Punkt 3 letzter Fall. Der Schonmodus `--threads N` bleibt davon unabhängig. Ohne nutzbare
+   Temperaturmessung wird nie gedrosselt.
+6. Die Affinität wird nur für die vom Tool gestarteten Hilfsprogramme gesetzt (`ffmpeg`, `ffprobe`, `raw2bmx`, `mxf2raw`;
+   nicht für das Tool selbst, nicht für andere Programme) und endet mit dem Prozess; es bleibt nichts am System verstellt.
 
 ### Abschlussprüfung mit automatischer Wiederholung (Runde 4, Spezifikation)
 

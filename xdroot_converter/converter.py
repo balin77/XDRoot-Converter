@@ -75,8 +75,8 @@ class Options:
     # Schonmodus / Temperaturueberwachung (Runde 3).  Der Standard hier ist "off" (Ablauf exakt wie bisher); CLI und GUI
     # schalten auf "auto" (Messung, wenn ein Anbieter nutzbar ist, sonst unveraendert).
     thermal: str = "off"  # 'auto' | 'off'
-    temp_fan: float = _thermal_mod.DEFAULT_FAN_ON_C  # Luefter voll ab (Grad C); zurueck unter temp_fan - 10
-    temp_pause: float = _thermal_mod.DEFAULT_PAUSE_C  # Pause ab (Grad C); weiter unter temp_pause - 12
+    temp_fan: float = _thermal_mod.DEFAULT_FAN_ON_C  # Luefter voll ab (Grad C); bleibt bis zum Laufende
+    temp_pause: float = _thermal_mod.DEFAULT_PAUSE_C  # ab hier erst drosseln, Pause als letzte Stufe; weiter unter temp_pause - 12
     threads: Optional[int] = None  # ffmpeg -threads fuer Decoder und Encoder (None = unbegrenzt)
     thermal_interval_s: float = _thermal_mod.DEFAULT_INTERVAL_S  # Messabstand
     thermal_provider: Optional[object] = None  # nur Tests: Fabrik fuer einen Attrappen-Anbieter
@@ -169,6 +169,8 @@ class RunSummary:
     copy_errors: list = field(default_factory=list)  # [(relativer Pfad, Meldung)] beim Kopieren der Struktur
     pauses: int = 0  # Temperaturpausen (ffmpeg angehalten)
     pause_seconds: float = 0.0
+    throttle_steps: int = 0  # Stufenwechsel der Lastdrosselung nach unten (Prozess-Affinitaet)
+    throttle_seconds: float = 0.0  # Zeit gedrosselt (ohne die Zeit in der Pause)
     max_cpu_c: Optional[float] = None
     thermal_note: str = ""  # z. B. "Temperatur nicht verfuegbar: ..." (leer = keine Besonderheit)
     abort_reason: str = ""  # Abbruch durch die Temperaturueberwachung (Pause zu lang); gesetzt zusammen mit cancelled
@@ -333,6 +335,9 @@ class RunSummary:
         lines.extend(self._verify_lines())
         for rel, msg in self.copy_errors:
             lines.append(f"FEHLER beim Kopieren von {rel}: {msg}")
+        if self.throttle_steps or self.throttle_seconds >= 1:
+            lines.append(f"Last gedrosselt: gesamt {fmt_duration(self.throttle_seconds)}"
+                         + (f" ({self.throttle_steps} Stufenwechsel)" if self.throttle_steps else ""))
         if self.pauses:
             lines.append(f"Temperaturpausen: {self.pauses}, gesamt {fmt_duration(self.pause_seconds)}"
                          + (f" (höchste gemessene CPU-Temperatur {self.max_cpu_c:.0f} °C)" if self.max_cpu_c else ""))
@@ -1619,6 +1624,7 @@ class Converter:
             sm = self._thermal_summary
             if sm is not None:
                 sm.pauses, sm.pause_seconds, sm.max_cpu_c = st.pauses, st.pause_seconds, st.max_cpu_c
+                sm.throttle_steps, sm.throttle_seconds = st.throttle_steps, st.throttle_seconds
                 if st.unavailable_reason:
                     sm.thermal_note = f"Temperatur nicht verfügbar/ausgefallen: {st.unavailable_reason}"
         except Exception:  # noqa: BLE001

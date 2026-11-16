@@ -669,8 +669,11 @@ class PauseLimitRunTests(RunTestBase):
             wait_for(lambda: c.cancel.cancelled, 20)
             c.cancel.check()
 
+        # Runde 5: ohne setzbare Affinität gilt das alte Verhalten "sofort pausieren" (sonst käme erst die Drosselung mit
+        # 30 s Sperre, und der Test hinge davon ab, ob der Prozess schon registriert ist)
         with mock.patch.object(tools, "suspend_process", lambda p: True), \
                 mock.patch.object(tools, "resume_process", lambda p: True), \
+                mock.patch.object(tools, "available_cpus", lambda: None), \
                 mock.patch.object(converter.Converter, "_transcode", tr):
             s = conv.run()
         return s, rep, conv, statuses

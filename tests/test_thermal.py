@@ -155,15 +155,19 @@ def run_ticks(ctl, n):
 class ConfigTests(unittest.TestCase):
     def test_defaults_match_spec(self):
         c = thermal.ThermalConfig()
-        self.assertEqual((c.fan_on_c, c.fan_off_c, c.pause_c, c.resume_c), (85, 75, 97, 85))
+        # Runde 5: Die Rückschalt-Schwelle der Lüfter (fan_off_c) entfällt, "Lüfter voll" bleibt bis zum Laufende
+        self.assertEqual((c.fan_on_c, c.pause_c, c.resume_c), (85, 97, 85))
+        self.assertFalse(hasattr(c, "fan_off_c"))
         c.validate()
 
     def test_from_limits_derives_hysteresis(self):
         c = thermal.ThermalConfig.from_limits(80, 95)
-        self.assertEqual((c.fan_on_c, c.fan_off_c, c.pause_c, c.resume_c), (80, 70, 95, 83))
+        self.assertEqual((c.fan_on_c, c.pause_c, c.resume_c), (80, 95, 83))
 
     def test_invalid_limits(self):
-        for fan, pause in ((97, 97), (99, 90), (0, 90), (85, 130), (5, 90)):
+        # (5, 90) entfällt: abgelehnt wurde es nur, weil die frühere Rückschwelle 5-10 < 0 unplausibel war; der erlaubte
+        # Bereich 50-110 °C wird von check_limits (CLI/GUI) geprüft, siehe test_thermal_fixes.
+        for fan, pause in ((97, 97), (99, 90), (0, 90), (85, 130)):
             with self.assertRaises(ValueError, msg=(fan, pause)):
                 thermal.ThermalConfig.from_limits(fan, pause)
 
@@ -183,17 +187,17 @@ class ConfigTests(unittest.TestCase):
 
 # --------------------------------------------------------------------------- Regler
 class ControllerTests(unittest.TestCase):
-    def test_fan_hysteresis_and_confirmation(self):
-        # 2 Messungen in Folge >= 85 -> voll; 80 liegt zwischen den Schwellen (bleibt voll); 3x < 75 -> zurueck
-        ctl, prov, log, notes, _ = make_ctl([80, 86, 86, 80, 80, 74, 74, 74, 74])
+    def test_fan_hold_and_confirmation(self):
+        # Runde 5: 2 Messungen in Folge >= 85 -> voll; danach BLEIBT es voll (kein Zurückschalten mehr bei Abkühlung),
+        # zurückgestellt wird erst am Laufende (finish).  (Früher: 3x < 75 -> "fan_restore" mitten im Lauf.)
+        ctl, prov, log, notes, _ = make_ctl([80, 86, 86, 80, 80, 74, 74, 74, 74, 60, 60])
         run_ticks(ctl, 3)
         self.assertEqual(ops(log), ["fan_full"])
         self.assertTrue(ctl.fan_full)
-        run_ticks(ctl, 2)
-        self.assertEqual(ops(log), ["fan_full"])  # Hysterese: 80 schaltet nicht zurueck
-        run_ticks(ctl, 2)
-        self.assertEqual(ops(log), ["fan_full"])  # erst 2x unter 75
-        run_ticks(ctl, 1)
+        run_ticks(ctl, 8)
+        self.assertEqual(ops(log), ["fan_full"])  # auch nach langer Abkühlung kein Zurückschalten
+        self.assertTrue(ctl.fan_full)
+        ctl.finish()
         self.assertEqual(ops(log), ["fan_full", "fan_restore"])
         self.assertFalse(ctl.fan_full)
 
@@ -1330,8 +1334,11 @@ class RunIntegrationTests(RunTestBase):
                 return orig(conv, plan, fps, frames, v_path, wavs)
             return tr
 
+        # Runde 5: ohne setzbare Affinität (hier: nicht unterstützt) gilt das alte Verhalten "sofort pausieren"; sonst würde der
+        # Regler erst drosseln (30 s Sperre) und der Test hinge vom Zeitpunkt der Prozess-Registrierung ab.
         with mock.patch.object(tools, "suspend_process", lambda p: True), \
-                mock.patch.object(tools, "resume_process", lambda p: True):
+                mock.patch.object(tools, "resume_process", lambda p: True), \
+                mock.patch.object(tools, "available_cpus", lambda: None):
             s, rep, _ = self.run_thermal(prov, make)
         self.assertTrue(seen["paused"] and seen["resumed"])
         self.assertEqual((s.count(converter.ST_CONVERTED), s.failed), (2, 0))

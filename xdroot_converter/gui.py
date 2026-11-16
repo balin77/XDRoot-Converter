@@ -40,7 +40,9 @@ HIDDEN_LEVELS = ("detail",)
 TEMP_FAN_MIN, TEMP_FAN_MAX = thermal.TEMP_FAN_MIN, thermal.TEMP_FAN_MAX  # gleiche Grenzen wie die CLI
 TEMP_PAUSE_MIN, TEMP_PAUSE_MAX = thermal.TEMP_PAUSE_MIN, thermal.TEMP_PAUSE_MAX
 THREADS_MAX = 256
-HINT_THERMAL = "Nur als Administrator und auf Lenovo Legion; sonst läuft alles unverändert."
+HINT_THERMAL = ("Nur als Administrator und auf Lenovo Legion; sonst läuft alles unverändert. Die Lüfter bleiben nach dem "
+                "Einschalten bis zum Ende voll; ab der Pausen-Temperatur wird zuerst die Last gedrosselt (weniger Kerne), "
+                "die Pause ist nur die letzte Stufe.")
 HINT_THREADS = "leer = alle Kerne; weniger = kühler, aber langsamer"
 LOG_MIN_PX = 80  # so viel Protokoll bleibt bei Mindesthöhe (auch mit geöffneten Einstellungen) sichtbar
 HINT_ADMIN = ("Hinweis: Für die Temperaturanzeige und die Lüftersteuerung braucht das Programm Administratorrechte. "
@@ -338,6 +340,9 @@ def completion_message(summary) -> tuple[str, str, str]:
             conv_s = float(getattr(summary, "convert_seconds", 0.0) or 0.0)
             parts.append((f"Dauer: Umwandlung {converter.fmt_duration(conv_s)}, " if conv_s else "Dauer: ")
                          + f"Abschlussprüfung {converter.fmt_duration(vf.seconds)}")
+    thr_s = float(getattr(summary, "throttle_seconds", 0.0) or 0.0)
+    if int(getattr(summary, "throttle_steps", 0) or 0) > 0 or thr_s >= 1:
+        parts.append(f"Last gedrosselt: gesamt {_fmt_pause(thr_s)}")
     pauses = int(getattr(summary, "pauses", 0) or 0)
     if pauses > 0:
         hot = getattr(summary, "max_cpu_c", None)

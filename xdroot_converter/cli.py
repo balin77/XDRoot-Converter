@@ -117,12 +117,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--verbose", action="store_true",
                     help="auch Einzelheiten ausgeben (z. B. jede Aenderung der MXF-Kopfdaten); sie stehen immer in konvertierung.log")
     ap.add_argument("--thermal", choices=["auto", "off"], default="auto",
-                    help="Temperaturüberwachung (Messung, Lüfter voll, Pause); auto = nur wenn ein Anbieter nutzbar ist "
+                    help="Temperaturüberwachung (Messung, Lüfter voll, Last drosseln, Pause); auto = nur wenn ein Anbieter nutzbar ist "
                          "(Standard), sonst läuft alles unverändert")
     ap.add_argument("--temp-fan", type=_temp_value, default=thermal.DEFAULT_FAN_ON_C, metavar="GRAD",
-                    help=f"Lüfter voll ab dieser CPU-Temperatur (Standard {thermal.DEFAULT_FAN_ON_C:g}{NB}°C; zurück 10{NB}°C darunter; erlaubt {thermal.TEMP_FAN_MIN:.0f} bis {thermal.TEMP_FAN_MAX:.0f}{NB}°C)")
+                    help=f"Lüfter voll ab dieser CPU-Temperatur (Standard {thermal.DEFAULT_FAN_ON_C:g}{NB}°C; bleibt bis zum Laufende voll; erlaubt {thermal.TEMP_FAN_MIN:.0f} bis {thermal.TEMP_FAN_MAX:.0f}{NB}°C)")
     ap.add_argument("--temp-pause", type=_temp_value, default=thermal.DEFAULT_PAUSE_C, metavar="GRAD",
-                    help=f"ffmpeg anhalten ab dieser CPU-Temperatur (Standard {thermal.DEFAULT_PAUSE_C:g}{NB}°C; weiter 12{NB}°C darunter; erlaubt {thermal.TEMP_PAUSE_MIN:.0f} bis {thermal.TEMP_PAUSE_MAX:.0f}{NB}°C)")
+                    help=f"ab dieser CPU-Temperatur zuerst Last drosseln (weniger Kerne), ffmpeg anhalten nur als letzte Stufe bzw. 5{NB}°C darüber (Standard {thermal.DEFAULT_PAUSE_C:g}{NB}°C; weiter 12{NB}°C darunter; erlaubt {thermal.TEMP_PAUSE_MIN:.0f} bis {thermal.TEMP_PAUSE_MAX:.0f}{NB}°C)")
     ap.add_argument("--threads", type=_positive_int, default=None, metavar="N",
                     help="Schonmodus: ffmpeg höchstens N Threads (1 bis 256; Decoder und Encoder; auch bei --verify --deep) - weniger "
                          "Wärme, dauert länger (Standard: unbegrenzt). Achtung: x264 mit anderer Kernzahl erzeugt einen "

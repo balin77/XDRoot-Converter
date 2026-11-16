@@ -7,7 +7,10 @@ Aufbau (siehe docs/SPEC.md, Abschnitt "Temperaturüberwachung und Schonmodus"):
   braucht Administratorrechte und läuft über EINEN dauerhaft laufenden, versteckten PowerShell-Hilfsprozess
   (``PowerShellHelper``): Befehle zeilenweise über stdin, Antworten zeilenweise über stdout, je Antwort ein Zeitlimit.
 * **Regler** (``ThermalController``, hardwareunabhängig): Schwellen mit Hysterese, mehrere Messungen in Folge
-  entscheiden.  Pausiert über einen ``pause_ctl`` (``tools.CancelToken``: ``pause()``/``resume()``).
+  entscheiden.  Pausiert über einen ``pause_ctl`` (``tools.CancelToken``: ``pause()``/``resume()``) und drosselt die
+  Last vor der Pause in Stufen über ``pause_ctl.set_throttle(anteil) -> bool`` (optional ``throttle_cores(anteil) ->
+  (benutzte, verfügbare)``); fehlt ``set_throttle`` oder liefert es False, gibt es nur die Pause (Runde 5).
+  "Lüfter voll" bleibt, einmal geschaltet, bis zum Laufende.
 * **Sitzung** (``ThermalSession``): Verfügbarkeitsprüfung + eigener Messthread; wird vom Ablauf benutzt.
 
 Ein Fehler der Überwachung ist NIE ein Fehler der Umwandlung: Der Anbieter gilt dann als ausgefallen, ein
@@ -54,8 +57,17 @@ from . import tools
 TEMP_MAX_PLAUSIBLE_C = 125.0  # Messung <= 0 oder > 125 Grad gilt als unplausibel
 DEFAULT_FAN_ON_C = 85.0
 DEFAULT_PAUSE_C = 97.0
-FAN_HYSTERESIS_C = 10.0  # Lüfter zurück unter (Lüfter-voll-Schwelle - 10), Standard 85 -> 75
 PAUSE_HYSTERESIS_C = 12.0  # weiter unter (Pausen-Schwelle - 12), Standard 97 -> 85
+# Runde 5 (siehe SPEC "Lüfter halten und Last drosseln statt pendeln"): "Lüfter voll" bleibt bis zum Laufende (keine
+# Rückschalt-Schwelle mehr); vor der Pause wird die Last in Stufen gedrosselt (Prozess-Affinität).
+THROTTLE_STEPS = (100, 75, 50, 35, 25)  # Prozent der verfügbaren logischen Kerne (die Kernzahl wählt tools.select_cpus)
+THROTTLE_LOCK_S = 30.0  # nach einem Stufenwechsel frühestens nach 30 s der nächste Schritt runter bzw. die Pause
+THROTTLE_UP_MARGIN_C = 8.0  # Stufe hoch nur, wenn die Temperatur mindestens so weit unter der Pausen-Schwelle liegt ...
+THROTTLE_UP_HOLD_S = 60.0  # ... und das 60 s am Stück
+THROTTLE_FAIL_LIMIT = 3  # so viele Fehlschläge von set_throttle in Folge schalten die Drosselung für den Lauf ab
+THROTTLE_FLOOR_EXPIRE_S = 900.0  # die Pendel-Sperre einer Stufe verfällt nach 15 min (nur die Zeit zählt, nicht der Clip-Wechsel)
+THROTTLE_PENDEL_S = 120.0  # wird eine Stufe nach dem Hochschalten binnen 2 min wieder verlassen, wird sie nicht mehr versucht
+EMERGENCY_MARGIN_C = 5.0  # Notfall: Pausen-Schwelle + 5 °C -> sofort pausieren (nach confirm_up Messungen), egal welche Stufe
 DEFAULT_INTERVAL_S = 5.0
 HELPER_STARTUP_TIMEOUT_S = 30.0  # PowerShell-Start + erste WMI-Abfrage
 HELPER_TIMEOUT_S = 10.0  # Zeitlimit je Messung; danach wird der Hilfsprozess beendet (und neu gestartet, bis zu 3 Neustarts je Lauf)
@@ -185,11 +197,10 @@ def plausible(temp_c) -> bool:
 @dataclass
 class ThermalConfig:
     fan_on_c: float = DEFAULT_FAN_ON_C
-    fan_off_c: float = DEFAULT_FAN_ON_C - FAN_HYSTERESIS_C
     pause_c: float = DEFAULT_PAUSE_C
     resume_c: float = DEFAULT_PAUSE_C - PAUSE_HYSTERESIS_C
-    confirm_up: int = 2  # Messungen in Folge über der Schwelle, bevor Lüfter voll/Pause
-    confirm_down: int = 3  # Messungen in Folge unter der Rückschwelle, bevor zurück/weiter
+    confirm_up: int = 2  # Messungen in Folge über der Schwelle, bevor Lüfter voll/drosseln/Pause
+    confirm_down: int = 3  # Messungen in Folge unter der Rückschwelle der Pause, bevor es weitergeht
     bad_limit: int = 3  # unplausible Messungen in Folge -> Anbieter gilt als ausgefallen
     max_pause_s: float = DEFAULT_MAX_PAUSE_S  # längste Pause; danach Abbruch des Laufs (fortsetzbar)
     pause_log_s: float = PAUSE_LOG_INTERVAL_S  # Protokollzeile während einer Pause
@@ -197,19 +208,16 @@ class ThermalConfig:
 
     @classmethod
     def from_limits(cls, fan_on_c: float = DEFAULT_FAN_ON_C, pause_c: float = DEFAULT_PAUSE_C, **kw) -> "ThermalConfig":
-        """Rückschwellen aus den beiden einstellbaren Schwellen ableiten (Standard 85/75 und 97/85)."""
-        cfg = cls(fan_on_c=float(fan_on_c), fan_off_c=float(fan_on_c) - FAN_HYSTERESIS_C,
-                  pause_c=float(pause_c), resume_c=float(pause_c) - PAUSE_HYSTERESIS_C, **kw)
+        """Rückschwelle der Pause aus den beiden einstellbaren Schwellen ableiten (Standard 97 -> 85)."""
+        cfg = cls(fan_on_c=float(fan_on_c), pause_c=float(pause_c), resume_c=float(pause_c) - PAUSE_HYSTERESIS_C, **kw)
         cfg.validate()
         return cfg
 
     def validate(self) -> None:
-        for n in ("fan_on_c", "fan_off_c", "pause_c", "resume_c"):
+        for n in ("fan_on_c", "pause_c", "resume_c"):
             v = getattr(self, n)
             if not plausible(v):
                 raise ValueError(f"Temperaturschwelle {v} °C ist unplausibel (erlaubt: über 0 bis {TEMP_MAX_PLAUSIBLE_C:.0f}).")
-        if not self.fan_off_c < self.fan_on_c:
-            raise ValueError("Die Rückschwelle der Lüfter muss unter der Einschaltschwelle liegen.")
         if not self.resume_c < self.pause_c:
             raise ValueError("Die Rückschwelle der Pause muss unter der Pausenschwelle liegen.")
         if not self.fan_on_c < self.pause_c:
@@ -306,19 +314,21 @@ def source_name(source: str = "") -> str:
 
 
 def format_status(m: Messung, fan_full: bool = False, paused: bool = False, cfg: Optional[ThermalConfig] = None,
-                  fan_effect: str = "confirmed", fan_reason: str = "") -> str:
+                  fan_effect: str = "confirmed", fan_reason: str = "", throttle: str = "") -> str:
     """Statuszeile der Oberfläche, z. B. 'CPU 87 °C · Lüfter 4800/5100 U/min · Lüfter voll'.
 
     ``fan_effect`` (nur bei ``fan_full``): confirmed = Drehzahl gestiegen -> 'Lüfter voll'; pending/unknown = 'Lüfter voll
     angefordert' (Wirkung noch nicht geprüft bzw. keine Drehzahl lesbar); none = '... (keine Wirkung messbar)'.
-    ``fan_reason``: Grund, warum die Lüftersteuerung nicht verfügbar ist (wird angehängt)."""
+    ``fan_reason``: Grund, warum die Lüftersteuerung nicht verfügbar ist (wird angehängt).
+    ``throttle``: Text der Lastdrosselung (``format_throttle``), z. B. 'gedrosselt auf 24 von 32 Kernen'; leer = nicht gedrosselt."""
     cfg = cfg or ThermalConfig()
     t = m.cpu_temp_c
     src = getattr(m, "source", "")
     if paused:
+        tail = f" · {throttle}" if throttle else ""
         if src in COARSE_SOURCES or src == "feature":
-            return f"Pause wegen Temperatur – {source_name(src)} {t:.0f} °C, weiter unter {cfg.resume_c:.0f} °C"
-        return f"Pause wegen Temperatur ({t:.0f} °C), weiter unter {cfg.resume_c:.0f} °C"
+            return f"Pause wegen Temperatur – {source_name(src)} {t:.0f} °C, weiter unter {cfg.resume_c:.0f} °C{tail}"
+        return f"Pause wegen Temperatur ({t:.0f} °C), weiter unter {cfg.resume_c:.0f} °C{tail}"
     if src in COARSE_SOURCES:
         parts = [f"Thermalzone {t:.0f} °C (grob, nicht CPU)"]
     elif src == "feature":
@@ -338,7 +348,16 @@ def format_status(m: Messung, fan_full: bool = False, paused: bool = False, cfg:
             parts.append("Lüfter voll angefordert")
     elif fan_reason:
         parts.append(fan_reason if fan_reason.startswith("Lüftersteuerung") else f"Lüftersteuerung nicht verfügbar ({fan_reason})")
+    if throttle:
+        parts.append(throttle)
     return " · ".join(parts)
+
+
+def format_throttle(percent: float, cores: Optional[tuple] = None, short: bool = False) -> str:
+    """Text zur Drosselstufe.  ``cores`` = (benutzte, verfügbare) Kerne, falls bekannt.  Statuszeile: 'gedrosselt auf 24 von
+    32 Kernen' (``short``: nur '24 von 32 Kernen', für die Protokollzeilen); ohne Kernzahl '75 % der Kerne'."""
+    what = f"{cores[0]} von {cores[1]} Kernen" if cores else f"{percent:.0f} % der Kerne"
+    return what if short else f"gedrosselt auf {what}"
 
 
 def is_admin() -> bool:
@@ -1667,6 +1686,8 @@ class ThermalStats:
     pause_seconds: float = 0.0
     max_cpu_c: Optional[float] = None
     fan_full_count: int = 0
+    throttle_steps: int = 0  # Stufenwechsel nach unten (weniger Kerne) im Lauf
+    throttle_seconds: float = 0.0  # Zeit unter 100 % (ohne die Zeit in der Pause, die steht in pause_seconds)
     unavailable_reason: str = ""  # nicht verfügbar (von Anfang an oder ausgefallen)
     fan_note: str = ""
     abort_reason: str = ""  # Pause zu lang: Lauf wurde abgebrochen
@@ -1677,7 +1698,12 @@ class ThermalController:
 
     ``tick()`` = eine Messung + Entscheidung.  ``finish()`` stellt IMMER her: angehaltene Prozesse fortsetzen,
     Lüfterzustand zurück, Anbieter schliessen (idempotent, wirft nie).
-    ``pause_ctl``: Objekt mit ``pause() -> bool`` und ``resume()``.  ``notify(level, text)`` für das Protokoll,
+    ``pause_ctl``: Objekt mit ``pause() -> bool`` und ``resume()``, optional ``set_throttle(anteil) -> bool`` (Anteil der
+    Kerne 0..1; False = nicht setzbar -> nur Pause wie bisher) und ``throttle_cores(anteil) -> (benutzte, verfügbare)|None``.
+    Ebenfalls optional: ``apply_throttle() -> bool`` (Stufe auf Prozesse nachziehen, die die Startverzögerung hinter sich haben;
+    optional Attribut ``last_apply = (versucht, geklappt)``) und ``throttled_count() -> int`` (noch gedrosselte Prozesse,
+    damit ein teilweise gescheitertes Aufheben wiederholt wird); der Regler ruft sie bei jeder Messung.
+    ``notify(level, text)`` für das Protokoll,
     ``status(text, state)`` für die Statuszeile (state: ok | fan | pause | unavailable).
     ``on_abort(grund)``: wird aufgerufen, wenn eine Pause länger als ``cfg.max_pause_s`` dauert (der Aufrufer bricht
     den Lauf dann sauber ab, fortsetzbar)."""
@@ -1708,7 +1734,21 @@ class ThermalController:
         self._const_changed = False  # seit dem Öffnen der Quelle schon einmal eine Änderung des Werts gesehen?
         self._const_warned = False  # Warnzeile "denselben Wert" höchstens einmal je Lauf
         self._src = ""  # Schlüssel der Quelle der letzten Messung (für Beschriftungen)
-        self._up_fan = self._down_fan = self._up_pause = self._down_pause = 0
+        self._up_fan = self._up_pause = self._down_pause = 0
+        self._emerg = 0  # Messungen in Folge >= Pausen-Schwelle + EMERGENCY_MARGIN_C
+        # Drosselung (Runde 5)
+        self._level = 0  # Index in THROTTLE_STEPS (0 = 100 %)
+        self._level_t: Optional[float] = None  # Zeitpunkt des letzten Stufenwechsels (None = noch keiner)
+        self._cool_since: Optional[float] = None  # seit wann die Temperatur durchgehend <= Pausen-Schwelle - 8 liegt
+        self._floor = 0  # niedrigster Stufenindex, auf den wieder hochgeschaltet werden darf (Pendel-Sperre)
+        self._last_up: Optional[tuple] = None  # (Stufenindex, Zeit) des letzten Hochschaltens
+        self._thr_ok = True  # False: Affinität nicht setzbar -> Pause wie bisher
+        self._thr_warned = False
+        self._step_fail = 0  # gescheiterte Stufenwechsel (set_throttle) in Folge; nur bei Erfolg eines Schritts zurückgesetzt
+        self._apply_fail = 0  # gescheiterte Nachzieh-Aufrufe (apply_throttle) in Folge; nur zurückgesetzt, wenn etwas klappte
+        self._floor_t = 0.0  # Zeitpunkt der letzten Erhöhung der Pendel-Sperre (sie verfällt nach THROTTLE_FLOOR_EXPIRE_S)
+        self._lift_warned = False
+        self._thr_mark = 0.0  # Zeitpunkt der letzten Zeitbuchung (stats.throttle_seconds)
         self._pause_t0 = 0.0
         self._pause_log_t = 0.0
         self._pause_fail_logged = False
@@ -1756,8 +1796,9 @@ class ThermalController:
         self.fan_reason = "" if self.fan_ok else str(note)
         self._drain()
         self._n("info", f"Temperaturüberwachung aktiv ({getattr(self.provider, 'name', '?')}); "
-                        f"Lüfter voll ab {self.cfg.fan_on_c:g} °C (zurück unter {self.cfg.fan_off_c:g}), "
-                        f"Pause ab {self.cfg.pause_c:g} °C (weiter unter {self.cfg.resume_c:g}).")
+                        f"Lüfter voll ab {self.cfg.fan_on_c:g} °C (bleibt bis zum Laufende), "
+                        f"ab {self.cfg.pause_c:g} °C wird die Last gedrosselt, Pause als letzte Stufe "
+                        f"(weiter unter {self.cfg.resume_c:g}).")
         src = getattr(self.provider, "temp_source_label", "")
         if isinstance(src, str) and src:
             if getattr(self.provider, "temp_source", "") in COARSE_SOURCES:
@@ -1841,52 +1882,246 @@ class ThermalController:
             if self.stats.max_cpu_c is None or t > self.stats.max_cpu_c:
                 self.stats.max_cpu_c = float(t)
 
-            # --- Pause (Hysterese + Bestätigung)
+            # --- Last drosseln / Pause (Reihenfolge: Notfall, Stufe runter bzw. Pause als letzte Stufe, Stufe hoch)
+            now = self._clock()
+            self._acc_throttle(now)
             if not self.paused:
                 self._up_pause = self._up_pause + 1 if t >= c.pause_c else 0
-                if self._up_pause >= c.confirm_up:
-                    self._do_pause(t)
+                self._emerg = self._emerg + 1 if t >= c.pause_c + EMERGENCY_MARGIN_C else 0
+                self._control_load(t, now)
             else:
                 self._down_pause = self._down_pause + 1 if t < c.resume_c else 0
                 if self._down_pause >= c.confirm_down:
                     self._do_resume(t)
                 elif self._pause_progress(t):
                     return
+            self._apply_pending_throttle()
 
-            # --- Lüfter voll (Hysterese + Bestätigung); während der Pause immer voll
-            if self.fan_ok:
-                if not self.fan_full:
-                    self._up_fan = self._up_fan + 1 if t >= c.fan_on_c else 0
-                    if self._up_fan >= c.confirm_up or self.paused:
-                        self._set_fan(True, t)
-                else:
-                    self._down_fan = self._down_fan + 1 if t < c.fan_off_c else 0
-                    if self._down_fan >= c.confirm_down and not self.paused:
-                        self._set_fan(False, t)
+            # --- Lüfter voll (Bestätigung); während der Pause immer voll.  Einmal voll bleibt es bis zum Laufende
+            # (Zurückstellen nur in finish()/_fail()), damit Lüfter und Pause nicht pendeln.
+            if self.fan_ok and not self.fan_full:
+                self._up_fan = self._up_fan + 1 if t >= c.fan_on_c else 0
+                if self._up_fan >= c.confirm_up or self.paused:
+                    self._set_fan(True, t)
             self._check_fan_effect(m)
-            self._s(format_status(m, self.fan_full, self.paused, c, self._fx or "pending", self.fan_reason),
+            self._s(format_status(m, self.fan_full, self.paused, c, self._fx or "pending", self.fan_reason,
+                                  self._throttle_text()),
                     "pause" if self.paused else ("fan" if self.fan_full else "ok"))
 
+    # ---- Last drosseln
+    def _throttle_fn(self):
+        fn = getattr(self.pause_ctl, "set_throttle", None)
+        return fn if (self._thr_ok and callable(fn)) else None
+
+    def _cores(self, idx: int) -> Optional[tuple]:
+        """(benutzte, verfügbare) Kerne der Stufe, wenn der pause_ctl sie nennen kann."""
+        fn = getattr(self.pause_ctl, "throttle_cores", None)
+        if not callable(fn):
+            return None
+        try:
+            r = fn(THROTTLE_STEPS[idx] / 100.0)
+            return (int(r[0]), int(r[1])) if r else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _next_level(self, idx: int) -> Optional[int]:
+        """Nächste Stufe mit WENIGER Kernen als ``idx`` (Stufen mit gleicher Kernzahl, z. B. bei 4 Kernen, werden
+        übersprungen); None = ``idx`` ist die niedrigste wirksame Stufe."""
+        here = self._cores(idx)
+        for j in range(idx + 1, len(THROTTLE_STEPS)):
+            nxt = self._cores(j)
+            if here is None or nxt is None or nxt[0] < here[0]:
+                return j
+        return None
+
+    def _throttle_text(self) -> str:
+        if self._level <= 0:
+            return ""
+        return format_throttle(THROTTLE_STEPS[self._level], self._cores(self._level))
+
+    def _acc_throttle(self, now: float) -> None:
+        """Zeit unter 100 % (ohne Pause) buchen; vor jeder Zustandsänderung aufrufen."""
+        if self._level > 0 and not self.paused:
+            self.stats.throttle_seconds += max(0.0, now - self._thr_mark)
+        self._thr_mark = now
+
+    def _control_load(self, t: float, now: float) -> None:
+        c = self.cfg
+        fn = self._throttle_fn()
+        if self._emerg >= c.confirm_up:  # Notfall: Pausen-Schwelle + 5 °C, egal welche Stufe
+            self._do_pause(t, emergency=True)
+            return
+        if self._up_pause >= c.confirm_up:  # an der Pausen-Schwelle oder darüber
+            self._cool_since = None
+            if fn is None:  # Affinität nicht setzbar (oder nicht vorhanden): wie bisher sofort pausieren
+                self._do_pause(t)
+                return
+            if self._level_t is not None and now - self._level_t < THROTTLE_LOCK_S:
+                return  # die Wirkung der letzten Stufe braucht Zeit
+            nxt = self._next_level(self._level)
+            if nxt is not None:
+                if not self._set_level(nxt, t, now) and not self._thr_ok:
+                    self._do_pause(t)  # Drosselung endgültig aus (nicht unterstützt / 3 Fehler): pausieren wie bisher
+                # (einzelner Fehler: in DIESER Messung keine Pause, der nächste Versuch kommt mit der nächsten Messung)
+            else:  # niedrigste Stufe, und es bleibt heiß: Pause als letzte Stufe
+                self._do_pause(t)
+            return
+        # Pendel-Sperre verfällt: nach THROTTLE_FLOOR_EXPIRE_S darf die zuletzt gesperrte Stufe wieder versucht werden
+        if self._floor > 0 and now - self._floor_t >= THROTTLE_FLOOR_EXPIRE_S:
+            self._floor -= 1
+            self._floor_t = now
+            self._n("info", "Pendel-Sperre einer Drosselstufe abgelaufen: die Stufe wird wieder versucht.")
+        # nicht heiß: nach 60 s am Stück mindestens 8 °C unter der Schwelle eine Stufe hoch
+        if (fn is not None and self._level > 0 and self._level - 1 >= self._floor
+                and t <= c.pause_c - THROTTLE_UP_MARGIN_C):
+            if self._cool_since is None:
+                self._cool_since = now
+            elif now - self._cool_since >= THROTTLE_UP_HOLD_S:
+                self._cool_since = now  # je Schritt eine Stufe, die nächste nach weiteren 60 s
+                self._set_level(self._level - 1, t, now)
+        else:
+            self._cool_since = None
+
+    def _set_level(self, idx: int, t: float, now: float) -> bool:
+        """Stufe wechseln (runter oder hoch).  Bei Misserfolg False: ein einzelner Fehler wird mit der nächsten Messung
+        erneut versucht (die Stufe bleibt unverändert); ist die Affinität nicht unterstützt (``throttle_cores`` nennt
+        None) oder scheitert das Setzen ``THROTTLE_FAIL_LIMIT``-mal in Folge, ist die Drosselung für den Rest des Laufs
+        aus (``_thr_ok = False``, unbedingt ``set_throttle(1.0)``) und es gilt das alte Pausenverhalten."""
+        fn = self._throttle_fn()
+        ok = False
+        if fn is not None:
+            try:
+                ok = bool(fn(THROTTLE_STEPS[idx] / 100.0))
+            except Exception:  # noqa: BLE001
+                ok = False
+        if not ok:
+            self._step_fail += 1
+            tc = getattr(self.pause_ctl, "throttle_cores", None)
+            unsupported = callable(tc) and self._cores(idx) is None
+            if idx == 0:
+                # Aufheben gescheitert: der Token steht trotzdem auf 100 % (Rest wird mit apply_throttle nachgezogen);
+                # Anzeige und Token bleiben konsistent, also kein "gedrosselt" mehr.
+                self._level = 0
+            if unsupported or self._step_fail >= THROTTLE_FAIL_LIMIT:
+                self._disable_throttle()
+            return False
+        self._step_fail = 0
+        down = idx > self._level
+        if down:
+            self.stats.throttle_steps += 1
+            self._note_fallback(now)
+        # Sperrzeit (30 s) nur nach Schritten nach UNTEN: nach dem Hochschalten darf sofort wieder runtergeschaltet werden
+        self._level, self._level_t = idx, (now if down else None)
+        txt = format_throttle(THROTTLE_STEPS[idx], self._cores(idx), short=True)
+        if down:
+            self._n("warn", f"Last gedrosselt: {txt} ({t:.0f} °C)")
+        else:
+            self._last_up = (idx, now)
+            self._n("info", f"Drosselung gelockert: {txt} ({t:.0f} °C)")
+        return True
+
+    def _disable_throttle(self) -> None:
+        """Drosselung für den Rest des Laufs aus: unbedingt zurück auf 100 %, altes Pausenverhalten, eine Warnung."""
+        self._thr_ok = False
+        self._level_t = None
+        self._lift_throttle()
+        if not self._thr_warned:
+            self._thr_warned = True
+            self._n("warn", "Die Last lässt sich auf diesem System nicht drosseln (Prozess-Affinität nicht setzbar); "
+                            "bei Übertemperatur wird wie bisher sofort pausiert.")
+
+    def _apply_pending_throttle(self) -> None:
+        """Bei jeder Messung, solange gedrosselt wird: die Stufe auf Prozesse nachziehen, die erst kürzlich gestartet
+        wurden (sie laufen die ersten Sekunden mit voller Affinität, damit ffmpeg/x264 ihre Threadzahl wie ohne Drosselung
+        wählen).  Optional (``pause_ctl.apply_throttle``); einzelne Fehler werden wie bei ``_set_level`` toleriert."""
+        fn = getattr(self.pause_ctl, "apply_throttle", None)
+        if not callable(fn):
+            return
+        residual = 0
+        cnt = getattr(self.pause_ctl, "throttled_count", None)
+        if callable(cnt):
+            try:
+                residual = int(cnt())
+            except Exception:  # noqa: BLE001
+                residual = 0
+        if self._level <= 0 and residual <= 0:
+            return
+        try:
+            ok = bool(fn())
+        except Exception:  # noqa: BLE001
+            ok = False
+        if self._level <= 0 or not self._thr_ok:
+            return  # nur Reste aufheben (Stufe 0 bzw. Drosselung aus): kein Fehlerzähler, nächster Versuch mit der nächsten Messung
+        if not ok:
+            self._apply_fail += 1
+            if self._apply_fail >= THROTTLE_FAIL_LIMIT:
+                self._disable_throttle()
+            return
+        la = getattr(self.pause_ctl, "last_apply", None)
+        if la is None or (isinstance(la, tuple) and len(la) == 2 and la[0] > 0 and la[1] > 0):
+            self._apply_fail = 0  # es wurde wirklich etwas gesetzt (bzw. Attrappe ohne Auskunft)
+        # sonst: nichts zu tun -> kein Erfolg, der Zähler bleibt
+
+    def _note_fallback(self, now: float) -> None:
+        """Pendel-Sperre: Wurde eine Stufe erst vor kurzem (binnen THROTTLE_PENDEL_S) hochgeschaltet und führt die
+        Temperatur schon wieder zum Runterschalten bzw. zur Pause, wird diese höhere Stufe nicht mehr versucht."""
+        lu = self._last_up
+        if lu is not None and lu[0] == self._level and now - lu[1] <= THROTTLE_PENDEL_S:
+            self._floor = max(self._floor, lu[0] + 1)
+            self._floor_t = now
+            self._n("info", f"Wieder zu heiß kurz nach dem Lockern: {format_throttle(THROTTLE_STEPS[lu[0]], self._cores(lu[0]), short=True)} "
+                            f"wird {fmt_span(THROTTLE_FLOOR_EXPIRE_S)} lang nicht mehr versucht.")
+        self._last_up = None
+
+    def _lift_throttle(self) -> None:
+        """Drosselung aufheben (best effort, wirft nie).  UNBEDINGT ``set_throttle(1.0)`` (auch wenn der Regler selbst bei
+        Stufe 0 steht: ein gescheiterter Schritt darf im pause_ctl keine Stufe hinterlassen).  Am Laufende nicht nötig (die
+        Affinität endet mit dem Prozess), aber bei Ausfall der Messung, während die Umwandlung weiterläuft."""
+        fn = getattr(self.pause_ctl, "set_throttle", None)
+        self._level = 0
+        if callable(fn):
+            ok = False
+            for _ in range(2):  # bei Fehlschlag einmal sofort wiederholen
+                try:
+                    ok = bool(fn(1.0))
+                except Exception:  # noqa: BLE001
+                    ok = False
+                if ok:
+                    break
+            if not ok and not self._lift_warned:
+                self._lift_warned = True
+                self._n("warn", "Drosselung konnte nicht bei allen Prozessen aufgehoben werden.")
+
     # ---- Pause
-    def _do_pause(self, t: float) -> None:
+    def _do_pause(self, t: float, emergency: bool = False) -> None:
         ctl = self.pause_ctl
         ok = False
         if ctl is not None:
             ok = bool(ctl.pause())
         if not ok:
             self._up_pause = 0
+            self._emerg = 0
             err = getattr(ctl, "pause_error", "") if ctl is not None else ""
             if err and not self._pause_fail_logged:
                 self._pause_fail_logged = True  # nur einmal melden, solange es nicht klappt
                 self._n("warn", f"Pause wegen Temperatur ({t:.0f} °C) nicht möglich: {err}.")
             return
         self._pause_fail_logged = False
+        now = self._clock()
+        self._note_fallback(now)
+        self._acc_throttle(now)  # Drosselzeit bis hierher buchen, danach zählt die Pausenzeit
         self.paused = True
-        self._pause_t0 = self._pause_log_t = self._clock()
+        self._pause_t0 = self._pause_log_t = now
         self._down_pause = 0
+        self._cool_since = None
         self.stats.pauses += 1
+        why = ""
+        if emergency:
+            why = f" Notfall: Schwelle um {EMERGENCY_MARGIN_C:g} °C überschritten."
+        elif self._throttle_fn() is not None:
+            why = " Letzte Stufe: auch die niedrigste Drosselstufe reicht nicht."
         self._n("warn", f"Pause wegen Temperatur ({t:.0f} °C, Schwelle {self.cfg.pause_c:g}): ffmpeg angehalten, "
-                        f"weiter unter {self.cfg.resume_c:g} °C.")
+                        f"weiter unter {self.cfg.resume_c:g} °C.{why}")
 
     def _pause_progress(self, t: float) -> bool:
         """Während einer Pause: alle 2 Minuten eine Protokollzeile; nach der Höchstdauer Lauf abbrechen.
@@ -1918,12 +2153,21 @@ class ThermalController:
     def _do_resume(self, t: float) -> None:
         self._end_pause()
         self._n("info", f"Pause beendet ({t:.0f} °C): ffmpeg läuft weiter.")
+        # Nach JEDER Pause eine Stufe tiefer weiterrechnen (sofern es eine gibt); die Sperrzeit läuft ab jetzt neu
+        if self._throttle_fn() is not None:
+            nxt = self._next_level(self._level)
+            if nxt is not None:
+                self._set_level(nxt, t, self._clock())
+            else:
+                self._level_t = self._clock()
 
     def _end_pause(self) -> None:
         if not self.paused:
             return
+        self._acc_throttle(self._clock())  # (noch pausiert: nur die Zeitmarke nachziehen)
         self.paused = False
-        self._up_pause = self._down_pause = 0
+        self._up_pause = self._down_pause = self._emerg = 0
+        self._cool_since = None
         self.stats.pause_seconds += max(0.0, self._clock() - self._pause_t0)
         try:
             if self.pause_ctl is not None:
@@ -1943,9 +2187,10 @@ class ThermalController:
         return v if v > 0 else None
 
     def _set_fan(self, on: bool, t: float) -> None:
+        """Nur ``on=True`` wird im Lauf benutzt (Lüfter halten); das Zurückstellen macht ``_restore_fan`` am Laufende."""
         if on == self.fan_full:
             return
-        self._up_fan = self._down_fan = 0
+        self._up_fan = 0
         if on:
             self._fan_touched = True  # ab jetzt muss wiederhergestellt werden - auch wenn der Aufruf mittendrin scheitert
         before = self._top_rpm(self.last)  # Drehzahl VOR dem Schalten
@@ -2034,6 +2279,8 @@ class ThermalController:
             self.failed = reason
             self.stats.unavailable_reason = reason
             self._end_pause()
+            self._acc_throttle(self._clock())
+            self._lift_throttle()  # Messung weg: nie weiter drosseln, die Umwandlung läuft mit voller Leistung
             self._restore_fan()
         if detail:
             self._n("detail", f"Temperaturüberwachung: Einzelheiten zum Ausfall: {detail}")
@@ -2053,6 +2300,8 @@ class ThermalController:
                     return
                 self._finished = True
                 self._end_pause()
+                self._acc_throttle(self._clock())
+                self._lift_throttle()  # (am Laufende ohnehin wirkungslos, aber nie eine Drosselung zurücklassen)
                 self._restore_fan()
         except Exception:  # noqa: BLE001
             pass
