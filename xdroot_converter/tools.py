@@ -301,7 +301,11 @@ class CancelToken:
                     self._throttled = True
                 if self._event.is_set():
                     return True
-                tried, ok = self._apply_pending(cpus)
+                try:
+                    tried, ok = self._apply_pending(cpus)
+                except Exception:  # noqa: BLE001
+                    self._throttle, self._throttled = prev  # nie eine halbe Stufe zuruecklassen
+                    return False
                 if tried and not ok:
                     if fraction < 1.0:  # Totalausfall: Stufe zuruecknehmen (beim Aufheben auf 100 % gilt 100 % trotzdem)
                         self._throttle, self._throttled = prev
@@ -326,6 +330,8 @@ class CancelToken:
                 continue
             if frac >= 1.0 and have is None:
                 continue  # nie gedrosselt: Affinitaet nicht anfassen
+            if frac < 1.0 and self._paused and p in self._suspended:
+                continue  # angehaltene Prozesse werden nicht gedrosselt (sie haben keine Laufzeit); Aufheben ginge auch so
             if now - self._reg_t.get(p, now) < THROTTLE_START_DELAY_S:
                 continue
             if self._apply_throttle(p, cpus):
@@ -381,7 +387,7 @@ class CancelToken:
         """Summe aller Pausenzeiten in Sekunden (eine laufende Pause zaehlt mit).  Zeitueberwachungen ziehen
         diese Zeit ab, damit ein angehaltener Prozess nie als haengend gilt."""
         with self._lock:
-            extra = time.monotonic() - self._paused_since if self._paused else 0.0
+            extra = self._clock() - self._paused_since if self._paused else 0.0
             return self._paused_total + extra
 
     def check(self) -> None:
@@ -429,8 +435,8 @@ class CancelToken:
                     self.pause_error = f"{failed} Prozess(e) konnten nicht angehalten werden (NtSuspendProcess/SIGSTOP fehlgeschlagen)"
                 return False
             self._paused = True
-            self._paused_since = time.monotonic()
-            self._pause_clock0 = self._clock()
+            self._paused_since = self._clock()
+            self._pause_clock0 = self._paused_since
             self._suspended.extend(done)
         return True
 
@@ -440,7 +446,7 @@ class CancelToken:
             if not self._paused:
                 return False
             self._paused = False
-            self._paused_total += time.monotonic() - self._paused_since
+            self._paused_total += self._clock() - self._paused_since
             procs, self._suspended = self._suspended, []
             now = self._clock()
             for p in procs:

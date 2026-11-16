@@ -2006,6 +2006,7 @@ class ThermalController:
                 self._disable_throttle()
             return False
         self._step_fail = 0
+        self._apply_fail = 0
         down = idx > self._level
         if down:
             self.stats.throttle_steps += 1
@@ -2030,6 +2031,16 @@ class ThermalController:
             self._n("warn", "Die Last lässt sich auf diesem System nicht drosseln (Prozess-Affinität nicht setzbar); "
                             "bei Übertemperatur wird wie bisher sofort pausiert.")
 
+    def _residual(self) -> int:
+        """Zahl der noch gedrosselten Prozesse laut ``pause_ctl.throttled_count()`` (0, wenn nicht vorhanden/Fehler)."""
+        cnt = getattr(self.pause_ctl, "throttled_count", None)
+        if callable(cnt):
+            try:
+                return int(cnt())
+            except Exception:  # noqa: BLE001
+                return 0
+        return 0
+
     def _apply_pending_throttle(self) -> None:
         """Bei jeder Messung, solange gedrosselt wird: die Stufe auf Prozesse nachziehen, die erst kürzlich gestartet
         wurden (sie laufen die ersten Sekunden mit voller Affinität, damit ffmpeg/x264 ihre Threadzahl wie ohne Drosselung
@@ -2037,14 +2048,9 @@ class ThermalController:
         fn = getattr(self.pause_ctl, "apply_throttle", None)
         if not callable(fn):
             return
-        residual = 0
-        cnt = getattr(self.pause_ctl, "throttled_count", None)
-        if callable(cnt):
-            try:
-                residual = int(cnt())
-            except Exception:  # noqa: BLE001
-                residual = 0
+        residual = self._residual()
         if self._level <= 0 and residual <= 0:
+            self._apply_fail = 0  # Stufe 0 ohne gedrosselte Prozesse: nichts offen
             return
         try:
             ok = bool(fn())
@@ -2081,9 +2087,9 @@ class ThermalController:
         self._level = 0
         if callable(fn):
             ok = False
-            for _ in range(2):  # bei Fehlschlag einmal sofort wiederholen
+            for _ in range(2):  # bei Fehlschlag (auch Teilerfolg: es sind noch Prozesse gedrosselt) einmal sofort wiederholen
                 try:
-                    ok = bool(fn(1.0))
+                    ok = bool(fn(1.0)) and self._residual() == 0
                 except Exception:  # noqa: BLE001
                     ok = False
                 if ok:
@@ -2108,9 +2114,9 @@ class ThermalController:
             return
         self._pause_fail_logged = False
         now = self._clock()
+        self.paused = True  # sofort: der Token hat schon angehalten
         self._note_fallback(now)
-        self._acc_throttle(now)  # Drosselzeit bis hierher buchen, danach zählt die Pausenzeit
-        self.paused = True
+        self._acc_throttle(now)  # Drosselzeit bis hierher buchen (pausiert: nur die Zeitmarke), danach zählt die Pausenzeit
         self._pause_t0 = self._pause_log_t = now
         self._down_pause = 0
         self._cool_since = None
@@ -2159,7 +2165,9 @@ class ThermalController:
             if nxt is not None:
                 self._set_level(nxt, t, self._clock())
             else:
-                self._level_t = self._clock()
+                # keine tiefere Stufe mehr: keine Sperre (Drosseln hilft hier nicht), bei erneuter Schwelle sofort wieder pausieren;
+                # die 30-s-Sperre gilt nur, wenn tatsächlich eine Stufe gewechselt wurde
+                self._level_t = None
 
     def _end_pause(self) -> None:
         if not self.paused:
@@ -2195,10 +2203,7 @@ class ThermalController:
             self._fan_touched = True  # ab jetzt muss wiederhergestellt werden - auch wenn der Aufruf mittendrin scheitert
         before = self._top_rpm(self.last)  # Drehzahl VOR dem Schalten
         try:
-            if on:
-                self.provider.fan_full()
-            else:
-                self.provider.fan_restore()
+            self.provider.fan_full()
         except Exception as e:  # noqa: BLE001
             self.fan_ok = False
             if isinstance(e, FanControlBusy):
@@ -2212,8 +2217,8 @@ class ThermalController:
             self._restore_fan()
             return
         self._drain()
-        self.fan_full = on
-        if on:
+        self.fan_full = True
+        if True:  # (``on`` ist immer True, siehe Docstring)
             self.stats.fan_full_count += 1
             near = before is not None and fans_near_max(before, self.last.fan_max_rpm if self.last else None)
             self._fx = "nearmax" if near else ("pending" if before is not None else "unknown")
@@ -2225,10 +2230,6 @@ class ThermalController:
                 self._n("info", f"Lüfter voll angefordert ({t:.0f} °C); Drehzahlen nicht lesbar, Wirkung nicht prüfbar.")
             else:
                 self._n("info", f"Lüfter voll angefordert ({t:.0f} °C); Wirkung wird an der Drehzahl geprüft.")
-        else:
-            self._fan_touched = False
-            self._fx = ""
-            self._n("info", f"Lüfter zurück auf vorherigen Zustand ({t:.0f} °C).")
 
     def _check_fan_effect(self, m: Messung) -> None:
         """Beobachtet nach dem Schalten die Drehzahl (Regel: siehe ``fan_effect_confirmed``).  'Lüfter voll' wird nur

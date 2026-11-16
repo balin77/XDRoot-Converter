@@ -605,8 +605,11 @@ class TokenTests(unittest.TestCase):
             tok.register(p2)  # während der Pause gestartet: sofort angehalten (wie bisher), gedrosselt erst nach der Verzögerung
             self.clk[0] += 5
             tok.apply_throttle()
-            self.assertEqual(self.applied[-1][0], p2)
+            self.assertNotIn(p2, [q for q, _c in self.applied])  # angehaltene Prozesse werden nicht gedrosselt
             self.assertTrue(tok.resume())
+            self.clk[0] += 3
+            tok.apply_throttle()
+            self.assertEqual(self.applied[-1][0], p2)
 
     def test_controller_with_real_token_applies_level_to_new_process_after_delay(self):
         tok = self.token()
@@ -970,10 +973,12 @@ class ResumeAndLockTests(unittest.TestCase):
         self.assertTrue(r.c.paused)
         r.run(60, 15)
         self.assertEqual(r.ctl.calls, [0.75, 0.5, 0.35, 0.25])
-        r.run(98, 20)  # < 30 s nach dem Fortsetzen: keine neue Pause
-        self.assertFalse(r.c.paused)
-        r.run(98, 15)
+        # keine tiefere Stufe mehr -> KEINE Sperre nach der Pause: bei erneut 2 Messungen an der Schwelle sofort wieder pausieren
+        r.tick(98)
+        self.assertFalse(r.c.paused)  # (1 Messung)
+        r.tick(98)
         self.assertTrue(r.c.paused)
+        self.assertEqual(r.c.stats.pauses, 2)
 
     def test_lock_applies_only_after_down_steps(self):
         r = Rig()
@@ -1108,6 +1113,102 @@ class ResidualLiftTests(unittest.TestCase):
         r.run(80, 65)  # Hochschalten auf 100 % scheitert einmal
         self.assertNotIn("gedrosselt", r.statuses[-1][0])  # kein "gedrosselt", wenn der Token schon auf 1.0 steht
         self.assertEqual(r.c._level, 0)
+
+
+class PartialLiftCtl(Ctl):
+    """set_throttle(1.0) liefert True (Teilerfolg), aber ``throttled_count`` meldet danach noch gedrosselte Prozesse."""
+
+    def __init__(self, residuals):
+        super().__init__()
+        self.res_seq = list(residuals)  # Rest nach dem 1., 2., ... Aufheben
+        self.residual = 0
+
+    def set_throttle(self, fraction):
+        self.calls.append(fraction)
+        if fraction >= 1.0:
+            self.residual = self.res_seq.pop(0) if self.res_seq else 0
+        return True
+
+    def throttled_count(self):
+        return self.residual
+
+
+class PartialLiftTests(unittest.TestCase):
+    def test_partial_lift_repeated_once_then_warns(self):
+        r = Rig(ctl=PartialLiftCtl([1, 1]))
+        r.run(98, 10)
+        r.c.finish()
+        self.assertEqual(r.ctl.calls, [0.75, 1.0, 1.0])
+        self.assertIn("nicht bei allen Prozessen aufgehoben", r.text("warn"))
+
+    def test_partial_lift_repeat_succeeds_without_warning(self):
+        r = Rig(ctl=PartialLiftCtl([1, 0]))
+        r.run(98, 10)
+        r.c.finish()
+        self.assertEqual(r.ctl.calls, [0.75, 1.0, 1.0])
+        self.assertNotIn("nicht bei allen Prozessen aufgehoben", r.text("warn"))
+
+
+class PauseDuringApplyTests(unittest.TestCase):
+    def test_no_throttle_in_the_middle_of_a_pause(self):
+        clk = [100.0]
+        applied = []
+        tok = tools.CancelToken(clock=lambda: clk[0])
+        p = mock.Mock()
+        p.poll.return_value = None
+        with mock.patch.object(tools, "available_cpus", lambda: list(range(32))), \
+                mock.patch.object(tools, "set_process_affinity", lambda q, c: applied.append(q) or True), \
+                mock.patch.object(tools, "suspend_process", lambda q: True), \
+                mock.patch.object(tools, "resume_process", lambda q: True):
+            tok.register(p)
+            clk[0] += 1.0  # 1 s gelaufen
+            tok.set_throttle(0.5)
+            self.assertTrue(tok.pause())
+            for _ in range(6):  # lange Pause mit mehreren Nachzieh-Aufrufen (Regler-Takt)
+                clk[0] += 10.0
+                self.assertTrue(tok.apply_throttle())
+            self.assertEqual(applied, [])
+            tok.resume()
+            tok.apply_throttle()
+            self.assertEqual(applied, [])  # erst nach insgesamt 3 s Laufzeit
+            clk[0] += 1.9
+            tok.apply_throttle()
+            self.assertEqual(applied, [])
+            clk[0] += 0.1
+            tok.apply_throttle()
+            self.assertEqual(applied, [p])
+
+    def test_lifting_is_allowed_for_suspended_processes(self):
+        clk = [100.0]
+        applied = []
+        tok = tools.CancelToken(clock=lambda: clk[0])
+        p = mock.Mock()
+        p.poll.return_value = None
+        with mock.patch.object(tools, "available_cpus", lambda: list(range(32))), \
+                mock.patch.object(tools, "set_process_affinity", lambda q, c: applied.append(len(c)) or True), \
+                mock.patch.object(tools, "suspend_process", lambda q: True), \
+                mock.patch.object(tools, "resume_process", lambda q: True):
+            tok.register(p)
+            clk[0] += 10.0
+            tok.set_throttle(0.5)
+            tok.pause()
+            tok.set_throttle(1.0)
+            self.assertEqual(applied, [16, 32])
+
+    def test_exception_while_applying_restores_previous_stage(self):
+        tok = tools.CancelToken(clock=lambda: 100.0)
+        p = mock.Mock()
+        p.poll.return_value = None
+
+        def boom(q, c):
+            raise RuntimeError("x")
+
+        with mock.patch.object(tools, "available_cpus", lambda: list(range(32))), \
+                mock.patch.object(tools, "set_process_affinity", boom):
+            tok.register(p)
+            tok._reg_t[p] = 0.0
+            self.assertFalse(tok.set_throttle(0.5))
+            self.assertEqual(tok.throttle, 1.0)
 
 
 class StartDelayRuntimeTests(unittest.TestCase):

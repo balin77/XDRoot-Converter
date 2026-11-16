@@ -549,18 +549,22 @@ und zur sofortigen Pause werden deshalb ersetzt:
      auch kein Festnageln auf 25 % für einen ganzen mehrstündigen Lauf). Die 30-s-Sperre gilt nur nach Schritten nach UNTEN;
      nach einem Hochschalten darf sofort wieder heruntergeschaltet werden, sobald 2 Messungen an der Schwelle liegen.
    - **Nach jeder Pause** (Notfall oder letzte Stufe) wird eine Stufe tiefer fortgesetzt, sofern es eine gibt; die Sperrzeit
-     läuft ab dem Fortsetzen neu.
+     läuft dann ab dem Fortsetzen neu. Gibt es keine tiefere Stufe mehr, gibt es auch keine Sperre: sobald wieder 2 Messungen an
+     der Schwelle liegen, wird sofort erneut pausiert (die 30-s-Sperre gilt nur, wenn tatsächlich eine Stufe gewechselt wurde).
    - **Fehler beim Setzen:** Ein einzelner Fehlschlag (z. B. Prozess gerade beendet) wird mit der nächsten Messung erneut
      versucht und führt in dieser Messung nicht zur Pause (ausser Notfall); ein gerade beendeter Prozess zählt nicht als
      Fehlschlag. Erst „nicht unterstützt“ oder 3 gescheiterte Stufenwechsel in Folge (eigener Zähler, wird nur durch den Erfolg
      eines Schritts zurückgesetzt; ebenso 3 gescheiterte Nachzieh-Aufrufe) schalten die Drosselung für den Rest des Laufs ab
-     (Stufe sofort auf 100 % zurück, in derselben Messung Pause wie bisher, eine Warnung). Scheitert das Aufheben auf 100 %
+     (Stufe sofort auf 100 % zurück, eine Warnung). Bei gescheiterten Stufenwechseln folgt die Pause wie bisher in derselben
+     Messung; nach dem Abschalten wegen Nachzieh-Fehlern gilt die normale Regel (Pause nach 2 Messungen an der Schwelle). Scheitert das Aufheben auf 100 %
      bei einem Prozess, wird es einmal sofort wiederholt (sonst Warnzeile) und mit jeder Messung nachgezogen, solange noch ein
      Prozess gedrosselt ist. Die Startverzögerung (3 s) zählt nur Laufzeit: Pausenzeit wird nicht angerechnet. Eine gescheiterte Stufe bleibt nie im Token hängen.
    - Die Stufe gilt für den ganzen Lauf weiter: neu gestartete Hilfsprogramme (nächster Clip, Prüfung) bekommen sie **nach
-     einer Startverzögerung von 3 s** (nicht beim Registrieren): `ffmpeg`/x264 leiten ihre Threadzahl aus der Affinität beim
-     Start ab und sollen sie wie ohne Drosselung bei voller Affinität wählen; erst danach wird eingeschränkt, damit die
-     Drosselung den Datenstrom nicht beeinflusst. Der Regler zieht die Stufe bei jeder Messung (alle 5 s), solange gedrosselt
+     einer Startverzögerung von mindestens 3 s Laufzeit** (nicht beim Registrieren; je nach Takt der nächsten Messung also etwa
+     3–8 s; Pausenzeit zählt nicht, angehaltene Prozesse werden nicht gedrosselt): `ffmpeg`/x264 leiten ihre Threadzahl aus der
+     Affinität beim Start ab und sollen sie wie ohne Drosselung bei voller Affinität wählen; erst danach wird eingeschränkt. Die
+     Drosselung soll den Datenstrom nicht beeinflussen (Beleg steht aus). Grenze (unbelegt): Läuft eine Quelle sehr langsam an,
+     könnte der Encoder erst nach dieser Zeit starten und seine Threadzahl schon bei gedrosselter Affinität wählen. Der Regler zieht die Stufe bei jeder Messung (alle 5 s), solange gedrosselt
      wird, über `apply_throttle()` nach; je Prozess wird die zuletzt gesetzte Stufe gemerkt (kein wiederholtes Setzen). Ist
      beim Start eines Prozesses eine Pause aktiv, gilt das Pausenverhalten unverändert. Eine feste Threadzahl wird bewusst
      NICHT vorgegeben (eine Messung am 16.11.2026 zeigte, dass explizite Werte den Automatikfall nicht reproduzieren).

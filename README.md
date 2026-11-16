@@ -277,9 +277,9 @@ Lange Umwandlungen lasten die CPU voll aus. Zwei Hilfen:
   an; **die Lüfter bleiben dann bis zum Ende des Laufs voll** (kein Hin und Her) und werden erst am Laufende zurückgestellt.
   Ab 97 °C wird **zuerst die Last gedrosselt**: `ffmpeg` darf nur noch 75 %, 50 %, 35 % und zuletzt 25 % der logischen Kerne
   benutzen (mindestens 2; nach einem Schritt nach unten frühestens nach 30 s der nächste, nach einem Lockern darf sofort wieder gedrosselt werden; die Anzeige nennt z. B. „gedrosselt auf 24 von 32 Kernen“).
-  Neu gestartete Hilfsprogramme laufen die ersten 3 Sekunden ungedrosselt, damit `ffmpeg`/x264 ihre Threadzahl wie ohne
-  Drosselung wählen; die Drosselung soll den Datenstrom nicht beeinflussen (Beleg mit echtem Material steht aus). Die ersten
-  3 Sekunden zählen nur Laufzeit, keine Pausenzeit.
+  Neu gestartete Hilfsprogramme laufen mindestens 3 s Laufzeit ungedrosselt (bis zur nächsten Messung, also etwa 3–8 s), damit `ffmpeg`/x264 ihre Threadzahl wie ohne
+  Drosselung wählen; die Drosselung soll den Datenstrom nicht beeinflussen (Beleg mit echtem Material steht aus). Pausenzeit
+  zählt nicht zur Verzögerung. Grenze (unbelegt): Läuft eine Quelle sehr langsam an, könnte der Encoder später starten.
   Bleibt die CPU auch auf der niedrigsten Stufe an der Schwelle, oder liegt sie 5 °C darüber (beim Standardwert 102 °C, über
   der Abschaltgrenze vieler CPUs, daher praktisch nie erreicht), wird die Umwandlung als letzte Stufe angehalten, bis die CPU
   unter 85 °C abgekühlt ist; danach geht es eine Stufe tiefer weiter. Bleibt sie mindestens 8 °C unter der Schwelle (60 s am Stück), wird

@@ -489,18 +489,21 @@ class TokenPauseTests(unittest.TestCase):
         self.assertFalse(token.pause())
 
     def test_paused_time_accumulates(self):
-        token = tools.CancelToken()
+        # Eingespeiste Uhr statt time.sleep: die echte Uhr (Windows-Takt ca. 15,6 ms) machte den Test flaky (0,188 s statt >= 0,19 s)
+        now = [50.0]
+        token = tools.CancelToken(clock=lambda: now[0])
         self.assertEqual(token.paused_time(), 0.0)
         with mock.patch.object(tools, "suspend_process", lambda p: True), \
                 mock.patch.object(tools, "resume_process", lambda p: True):
             token.register(mock.Mock())
             self.assertTrue(token.pause())
-            time.sleep(0.2)
-            self.assertGreaterEqual(token.paused_time(), 0.19)  # laufende Pause zaehlt mit
+            now[0] += 0.2
+            self.assertAlmostEqual(token.paused_time(), 0.2)  # laufende Pause zaehlt mit
             token.resume()
         t = token.paused_time()
-        time.sleep(0.1)
-        self.assertAlmostEqual(token.paused_time(), t, places=2)
+        now[0] += 0.1
+        self.assertAlmostEqual(token.paused_time(), t, places=2)  # nach dem Fortsetzen waechst sie nicht mehr
+        self.assertAlmostEqual(t, 0.2)
 
     def test_run_capture_timeout_ignores_paused_time(self):
         """Zeitueberwachung: ein pausierter Prozess ist nicht 'haengend'."""

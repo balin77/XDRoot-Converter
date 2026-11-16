@@ -103,6 +103,17 @@ Der erste Test desselben Tages scheiterte an `GetCPUTemp` = 0; daraus entstand d
 **Noch nicht beobachtet:** ein ganzer Umwandlungslauf mit laufender Überwachung, das automatische Schalten bei 85 °C im Lauf,
 die Pause bei echter Überhitzung, andere Legion-Modelle.
 
+**Erster ganzer Lauf mit Überwachung (16.11.2026) und Runde 5:** Messung, „Lüfter voll“ (5900 → 7100 U/min), Pause und
+Fortsetzen arbeiteten im echten Lauf. Die CPU erreichte unter Last aber in Sekunden 97–98 °C, so dass der Lauf zwischen Pause und
+Volllast pendelte und die Lüfter hoch- und runterschalteten. Daraus entstand Runde 5 (SPEC, „Lüfter halten und Last drosseln
+statt pendeln“): Lüfter bleiben bis zum Laufende voll, die Last wird in Stufen über die Prozess-Affinität gedrosselt, Pause nur
+noch als letzte Stufe. Vier Opus-Reviews, zuletzt ohne grobe Fehler. **Am Gerät noch nicht belegt:** ob das Drosseln die
+Temperatur dieser CPU wirklich senkt (in der Simulation mit angenommenen Werten pendelt sich der Regler auf 24 von 32 Kernen
+ein), und ob der H.264-Datenstrom trotz Drosselung derselbe bleibt wie ohne (neue Prozesse laufen deshalb die ersten Sekunden
+ungedrosselt; ein Vergleich mit echtem Material steht aus). Offene Notizen dazu: Der Wechsel zwischen Pause und niedrigster Stufe
+hat keinen Endzustand, wenn Drosseln nicht hilft (der Lauf kommt aber voran); ein theoretischer Ausnahmepfad beim Aufheben der
+Drosselung könnte die alte Stufe stehen lassen; in `_set_fan` steht noch ein kosmetischer `if True:`-Block.
+
 Offene Notizen aus dem letzten Review der Temperaturüberwachung und des Energiesparschutzes (keine groben Fehler; der Zustand
 ist in allen Fällen sicher, d. h. `ffmpeg` läuft weiter und die Lüfter werden zurückgestellt):
 
