@@ -216,5 +216,47 @@ class ProgressTextTests(unittest.TestCase):
         self.assertIn("50.0 %", t)
 
 
+class ProgressLayoutTests(unittest.TestCase):
+    """Beschriftung und Fortschrittsbalken dürfen sich bei hoher DPI-Skalierung nicht überlappen (ohne Display übersprungen)."""
+
+    def _check(self, scaling):
+        try:
+            app = gui.App()
+        except Exception as e:  # noqa: BLE001  (kein Display)
+            self.skipTest(f"keine GUI möglich: {e}")
+        orig = app.tk.call("tk", "scaling")  # prozessweit: muss zurückgesetzt werden, sonst verfälscht es spätere GUI-Tests
+        try:
+            app.attributes("-alpha", 0.0)  # unsichtbar, aber mit echter Fenstergröße (Geometrie wie im Betrieb)
+            if scaling:
+                app.tk.call("tk", "scaling", scaling)
+            app.var_clip_label.set("Clip C0001 – " + "lange Beschriftung " * 8)
+            app.var_total_label.set("Gesamt 42 % – noch etwa 1 h 20 min")
+            app.update_idletasks()
+            app.update()
+            for lbl, pb in ((app.lbl_clip, app.pb_clip), (app.lbl_total, app.pb_total)):
+                self.assertGreaterEqual(pb.winfo_y(), lbl.winfo_y() + lbl.winfo_height(), f"scaling={scaling}")
+                self.assertLessEqual(lbl.winfo_x() + lbl.winfo_width(), app.winfo_width() + 1)
+            self.assertGreaterEqual(app.lbl_total.winfo_y(), app.pb_clip.winfo_y() + app.pb_clip.winfo_height())
+        finally:
+            try:
+                app.tk.call("tk", "scaling", orig)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                app.after_cancel(app._after_id)
+            except Exception:  # noqa: BLE001
+                pass
+            app.destroy()
+
+    def test_default(self):
+        self._check(None)
+
+    def test_scaling_2_0(self):
+        self._check(2.0)
+
+    def test_scaling_2_67(self):
+        self._check(2.67)
+
+
 if __name__ == "__main__":
     unittest.main()

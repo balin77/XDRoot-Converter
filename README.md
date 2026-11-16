@@ -185,6 +185,13 @@ nicht geprüft und das gemeldet; `--max-frames`-Läufe haben keine Abschlussprü
 gibt es nur, wenn die Prüfung vollständig lief und nichts fand; konnte sie nicht laufen oder wurde sie abgebrochen, sagt das
 Ergebnis das ausdrücklich. Die Prüfung beachtet Abbrechen, Temperaturpause und `--threads`.
 
+**Energiesparmodus:** Während einer Umwandlung (samt Abschlussprüfung) und bei `--verify` verhindert das Tool unter Windows, dass
+der Rechner wegen Inaktivität in Standby/Ruhezustand geht; der Bildschirm darf ausgehen. Nach dem Lauf (auch nach Abbruch oder
+Fehler) gilt wieder die normale Einstellung. Das Protokoll nennt es in einer Zeile. Nicht verhindert werden: Zuklappen des Deckels
+(Notebook), Druck auf den Netzschalter, kritischer Akkustand und manuelles „Energie sparen“ im Startmenü – dann pausiert die
+Umwandlung mit dem Rechner und läuft nach dem Aufwachen weiter bzw. lässt sich fortsetzen. In der Windows-Energieeinstellung
+bleibt der Deckel-/Netzschalter-Verhalten Sache des Nutzers.
+
 ## Was wird umgewandelt, kopiert, angepasst?
 
 - **Umgewandelt:** das Video jedes Clips (nur XAVC-I, 1920x1080 progressiv) nach H.264 High 4:2:2,

@@ -87,6 +87,29 @@ FEATURE_VALUE_ON = 1
 FEATURE_VALUE_OFF = 0
 # SmartFanMode (LENOVO_GAMEZONE_DATA.GetSmartFanMode) wird NUR GELESEN und in --thermal-test angezeigt.  Er wird NIE
 # geschaltet: Der Leistungsmodus (3) hebt die CPU-Leistungsgrenzen an und erzeugt MEHR Wärme.
+# Weitere Temperaturquellen (Gerätetest 16.11.2026: GetCPUTemp antwortet, liefert aber 0).  ALLE NUR LESEND.
+# 0x05040000 (CPU-Temperatur) sowie 0x04030001/0x04030002 (Lüfterdrehzahl 1/2) stammen aus dem Open-Source-Projekt "Lenovo
+# Legion Toolkit" und sind für dieses Gerät UNBESTÄTIGT.  Geschrieben wird dort nie.
+FEATURE_ID_CPU_TEMP = 0x05040000
+FEATURE_ID_FAN1_SPEED = 0x04030001
+FEATURE_ID_FAN2_SPEED = 0x04030002
+FAN_RPM_PLAUSIBLE_MIN, FAN_RPM_PLAUSIBLE_MAX = 100.0, 12000.0  # Drehzahl nur in diesem Bereich (U/min) gilt als plausibel
+KELVIN_OFFSET = 273.15
+# Untergrenze NUR für die Quellenwahl beim Öffnen (alle Quellen a-d): Werte wie 1 oder 2 sind Schalter/Flags, keine
+# Temperaturen (GetFeatureValue liefert je Kennung beliebige Zahlen).  Im Lauf gilt weiter die Grenze von ``plausible``.
+TEMP_SOURCE_MIN_C = 20.0
+# Konstant-Wächter für die Quellen b, c, d: liefert die gewählte Quelle so viele Messungen in Folge exakt denselben Wert
+# (36 x 5 s = 3 min), gilt sie als ausgefallen.  Nicht für Quelle a (GetCPUTemp).
+CONSTANT_GUARD_COUNT = 36
+CONSTANT_GUARD_SOURCES = ("feature", "acpi", "perf")
+COARSE_SOURCES = ("acpi", "perf")  # Thermalzonen: grob, nicht die CPU selbst
+# Quellenkette der CPU-Temperatur: (Schlüssel, Beschriftung).  Die erste Quelle mit plausiblem Wert gilt für den Lauf.
+TEMP_SOURCES = (
+    ("gamezone", "Lenovo GetCPUTemp"),
+    ("feature", f"Lenovo GetFeatureValue 0x{FEATURE_ID_CPU_TEMP:08X} (unbestätigt)"),
+    ("acpi", "ACPI-Thermalzone (grob, oft träge)"),
+    ("perf", "Windows-Leistungszähler Thermalzone (grob, oft träge)"),
+)
 STATE_FILE_NAME = "fan_state.json"
 
 _LIVE_HELPERS: "weakref.WeakSet" = weakref.WeakSet()
@@ -144,6 +167,7 @@ class Messung:
     cpu_temp_c: float
     fan_rpm: tuple = ()  # Drehzahlen der Lüfter (U/min), leer = unbekannt
     fan_max_rpm: Optional[int] = None
+    source: str = ""  # Schlüssel der Temperaturquelle (TEMP_SOURCES); "" = unbekannt/Standard
 
 
 def plausible(temp_c) -> bool:
@@ -202,6 +226,31 @@ def check_limits(fan_c: float, pause_c: float, fan_name: str = "Lüfter voll ab"
         raise ValueError(f"{pause_name} ({pause_c:g} °C) muss höher sein als {fan_name} ({fan_c:g} °C).")
 
 
+def plausible_rpm(rpm) -> bool:
+    """Drehzahl eines Lüfters plausibel (100 bis 12000 U/min)?"""
+    try:
+        v = float(rpm)
+    except (TypeError, ValueError):
+        return False
+    return v == v and FAN_RPM_PLAUSIBLE_MIN <= v <= FAN_RPM_PLAUSIBLE_MAX
+
+
+def kelvin10_to_c(v) -> float:
+    """Zehntel-Kelvin (ACPI, HighPrecisionTemperature) -> Grad Celsius."""
+    return float(v) / 10.0 - KELVIN_OFFSET
+
+
+def kelvin_to_c(v) -> float:
+    """Kelvin (Leistungszähler 'Temperature') -> Grad Celsius."""
+    return float(v) - KELVIN_OFFSET
+
+
+def best_plausible(values) -> Optional[float]:
+    """Höchster plausibler Wert (°C) einer Liste, sonst None."""
+    ok = [v for v in values if plausible(v)]
+    return max(ok) if ok else None
+
+
 def plausible_fan_max(fan_max, rpm_before: Optional[float] = None) -> Optional[float]:
     """GetFanMaxSpeed nur verwenden, wenn plausibel: 1000 bis 12000 U/min und nicht unter der Drehzahl vorher
     (andere Einheit, z. B. 100, oder Unsinn -> None)."""
@@ -253,7 +302,13 @@ def format_status(m: Messung, fan_full: bool = False, paused: bool = False, cfg:
     t = m.cpu_temp_c
     if paused:
         return f"Pause wegen Temperatur ({t:.0f} °C), weiter unter {cfg.resume_c:.0f} °C"
-    parts = [f"CPU {t:.0f} °C"]
+    src = getattr(m, "source", "")
+    if src in COARSE_SOURCES:
+        parts = [f"Thermalzone {t:.0f} °C (grob, nicht CPU)"]
+    elif src == "feature":
+        parts = [f"CPU {t:.0f} °C (Quelle unbestätigt)"]
+    else:
+        parts = [f"CPU {t:.0f} °C"]
     if m.fan_rpm:
         parts.append("Lüfter " + "/".join(str(int(r)) for r in m.fan_rpm) + " U/min")
     if fan_full:
@@ -326,12 +381,16 @@ class ThermalProvider:
 
 
 # --------------------------------------------------------------------------- PowerShell-Hilfsprozess
-# Festes Skript (kein frei wählbarer Code): nur "PING", "EXIT" und "CALL <LENOVO_*-Klasse> <Methode> Name=Zahl ...".
+# Festes Skript (kein frei wählbarer Code): nur "PING", "EXIT", "READ ACPI" / "READ PERF" (lesende Abfrage fester
+# Temperaturklassen) und "CALL <LENOVO_*-Klasse> <Methode> Name=Zahl ...".
 # Zeile rein: "<id> <befehl>", Zeile raus: "<id> OK <Name=Wert ...>" oder "<id> ERR <Code>|<Meldung>".
 _PS_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
 Import-Module "$PSHOME\Modules\CimCmdlets"
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+# eigener UTF-8-Schreiber auf stdout (Console.Out blieb sonst in der OEM-Codepage: Umlaute kamen verstümmelt an)
+$script:so = New-Object System.IO.StreamWriter([Console]::OpenStandardOutput(), (New-Object System.Text.UTF8Encoding($false)))
+$script:so.NewLine = "`n"
 $script:inst = @{}
 function Get-Inst([string]$cls) {
   if (-not $script:inst.ContainsKey($cls)) {
@@ -343,6 +402,19 @@ function Get-Inst([string]$cls) {
 function Handle([string]$cmd) {
   $t = $cmd.Split(' ')
   if ($t[0] -eq 'PING') { return 'pong' }
+  if ($t[0] -eq 'READ' -and $t.Count -eq 2) {
+    if ($t[1] -eq 'ACPI') {
+      $v = @(Get-CimInstance -Namespace 'root\wmi' -ClassName 'MSAcpi_ThermalZoneTemperature' | ForEach-Object { [string]$_.CurrentTemperature })
+      return ('CurrentTemperature=' + ($v -join ','))
+    }
+    if ($t[1] -eq 'PERF') {
+      $v = @(Get-CimInstance -Namespace 'root\cimv2' -ClassName 'Win32_PerfFormattedData_Counters_ThermalZoneInformation')
+      $a = @($v | ForEach-Object { [string]$_.Temperature })
+      $b = @($v | ForEach-Object { [string]$_.HighPrecisionTemperature })
+      return ('Temperature=' + ($a -join ',') + ' HighPrecisionTemperature=' + ($b -join ','))
+    }
+    throw 'BadArgs'
+  }
   if ($t[0] -ne 'CALL' -or $t.Count -lt 3) { throw 'BadCommand' }
   $cls = $t[1]; $m = $t[2]
   if ($cls -notmatch '^LENOVO_[A-Z_]+$' -or $m -notmatch '^[A-Za-z0-9_]+$') { throw 'BadArgs' }
@@ -351,6 +423,17 @@ function Handle([string]$cmd) {
     if ($t[$i] -notmatch '^([A-Za-z]+)=([0-9]{1,10})$') { throw 'BadArgs' }
     $prm[$Matches[1]] = [uint32]$Matches[2]
   }
+  # Feste Erlaubnisliste (der Prozess läuft als Administrator): alles andere wird OHNE Aufruf abgelehnt.
+  # IDs: 67239936 = 0x04020000 (Lüfter voll), 84148224 = 0x05040000 (CPU-Temperatur), 67305473/67305474 = 0x04030001/2 (Drehzahl)
+  $ok = $false
+  if ($cls -ceq 'LENOVO_GAMEZONE_DATA' -and $t.Count -eq 3 -and
+      (@('GetCPUTemp', 'GetFan1Speed', 'GetFan2Speed', 'GetFanMaxSpeed', 'GetSmartFanMode') -ccontains $m)) { $ok = $true }
+  elseif ($cls -ceq 'LENOVO_OTHER_METHOD' -and $m -ceq 'GetFeatureValue' -and $t.Count -eq 4 -and $prm.Count -eq 1 -and
+      $prm.ContainsKey('IDs') -and (@(67239936, 84148224, 67305473, 67305474) -contains [int64]$prm['IDs'])) { $ok = $true }
+  elseif ($cls -ceq 'LENOVO_OTHER_METHOD' -and $m -ceq 'SetFeatureValue' -and $t.Count -eq 5 -and $prm.Count -eq 2 -and
+      $prm.ContainsKey('IDs') -and $prm.ContainsKey('value') -and [int64]$prm['IDs'] -eq 67239936 -and
+      (@(0, 1) -contains [int64]$prm['value'])) { $ok = $true }
+  if (-not $ok) { throw 'BadArgs' }
   $r = Invoke-CimMethod -InputObject (Get-Inst $cls) -MethodName $m -Arguments $prm
   $o = @()
   foreach ($n in 'Data', 'IDs', 'value', 'ReturnValue') {
@@ -369,14 +452,14 @@ while ($true) {
   if ($cmd -eq 'EXIT') { break }
   try {
     $res = Handle $cmd
-    [Console]::Out.WriteLine("$id OK $res")
+    $script:so.WriteLine("$id OK $res")
   } catch {
     $code = ''
     try { $code = [string]$_.Exception.NativeErrorCode } catch { }
     $msg = ($_.Exception.Message -replace '[\r\n|]+', ' ')
-    [Console]::Out.WriteLine("$id ERR $code|$msg")
+    $script:so.WriteLine("$id ERR $code|$msg")
   }
-  [Console]::Out.Flush()
+  $script:so.Flush()
 }
 """
 
@@ -811,8 +894,13 @@ class LegionProvider(ThermalProvider):
     name = "Lenovo Legion (WMI)"
 
     def __init__(self, helper_factory: Optional[Callable] = None, trace: Optional[Callable] = None,
-                 platform: Optional[str] = None, state_store: Optional[FanStateStore] = None) -> None:
+                 platform: Optional[str] = None, state_store: Optional[FanStateStore] = None,
+                 diagnose: bool = False) -> None:
         self._factory = helper_factory or PowerShellHelper
+        self._diagnose = diagnose  # --thermal-test: ALLE Kandidaten auswerten (nicht bei der ersten plausiblen aufhören)
+        self._temp_source = ""  # Schlüssel aus TEMP_SOURCES; für den Lauf festgehalten
+        self._fan_source = "gamezone"  # "gamezone" | "feature" (Ausweichquelle der Drehzahl)
+        self._report: list = []  # Kandidatenliste (Textzeilen) der Öffnung, für --thermal-test
         self._trace = trace
         self._platform = platform or sys.platform
         self._store = state_store if state_store is not None else FanStateStore()
@@ -839,6 +927,22 @@ class LegionProvider(ThermalProvider):
     def fan_max_raw(self):
         """Rohwert von GetFanMaxSpeed (Einheit unbekannt; None = nicht lesbar)."""
         return self._fan_max_raw
+
+    @property
+    def temp_source(self) -> str:
+        """Schlüssel der gewählten Temperaturquelle ('' = keine)."""
+        return self._temp_source
+
+    @property
+    def temp_source_label(self) -> str:
+        """Beschriftung der gewählten Temperaturquelle für Anzeige/Protokoll ('' = keine)."""
+        return dict(TEMP_SOURCES).get(self._temp_source, "")
+
+    @property
+    def candidate_report(self) -> list:
+        """Zeilen der Kandidatenliste (Rohwert, umgerechnet, plausibel, Fehler) der Öffnung; nur Zahlen und Meldungen,
+        keine Seriennummern oder Rechnernamen."""
+        return list(self._report)
 
     def begin_close(self) -> None:
         """Der Lauf endet: kein Neustart des Hilfsprozesses mehr, Messungen scheitern sofort (das Zurückstellen
@@ -981,23 +1085,204 @@ class LegionProvider(ThermalProvider):
             self.close()
             raise
 
-    def _open_probe(self) -> None:
+    # ---- Temperaturquellen (alle nur lesend)
+    def _feature_raw(self, feature_id: int, timeout: Optional[float] = None) -> int:
+        """GetFeatureValue (NUR IDs als Eingabe) für eine beliebige Kennung: Rohwert (kein Schalten, nur lesen)."""
+        r = self._call(WMI_CLASS_OTHER, "GetFeatureValue", timeout, IDs=feature_id)
+        v = r.get("value")
+        if not isinstance(v, int):
+            raise ProviderError(f"GetFeatureValue(0x{feature_id:08X}) lieferte {v!r}")
+        return v
+
+    def _read_zones(self, what: str) -> dict:
+        """Feste lesende Abfrage des Hilfsprozesses ('ACPI' oder 'PERF'): {Feldname: [Zahlen]}.  Leere/nicht lesbare
+        Einträge einer Zone (z. B. ein fehlendes Feld) werden weggelassen; ein fehlendes Feld ergibt eine leere Liste."""
+        if what not in ("ACPI", "PERF"):
+            raise ProviderError(f"unzulässige Abfrage {what!r}")
+        helper = self._helper
+        if helper is None:
+            raise HelperError("Hilfsprozess nicht aktiv")
         try:
-            cpu = self._data("GetCPUTemp")
+            payload = helper.call(f"READ {what}")
         except HelperRemoteError as e:
-            if _is_denied(e):
-                raise ProviderUnavailable(
-                    "Administratorrechte nötig (Zugriff auf die Lenovo-Hardwareabfrage verweigert)", "admin") from e
-            if _is_nodevice(e):
-                raise ProviderUnavailable("Kein Lenovo-Legion-Gerät erkannt", "nodevice") from e
-            self._t(f"  Temperaturabfrage: {e.code or '-'}: {e.message}")
-            raise ProviderUnavailable("Die Temperaturabfrage ist fehlgeschlagen", "other") from e
+            self._t(f"  WMI READ {what} -> FEHLER {e.code or '-'}: {e.message}")
+            raise
         except ThermalError as e:
-            self._t(f"  Temperaturabfrage: {type(e).__name__}: {e}")
-            raise ProviderUnavailable("Die Temperaturabfrage ist fehlgeschlagen", "other") from e
-        if not plausible(cpu):
-            self._t(f"  Unplausible Temperatur: {cpu} °C")
+            self._t(f"  WMI READ {what} -> {e}")
+            raise
+        self._t(f"  WMI READ {what} -> {payload or '(leer)'}")
+        out: dict = {}
+        for tok in payload.split():
+            k, _, v = tok.partition("=")
+            vals = []
+            for part in v.split(","):
+                try:
+                    vals.append(float(part))
+                except ValueError:
+                    vals.append(None)
+            out[k] = [x for x in vals if x is not None] if v.strip() else []
+        return out
+
+    @staticmethod
+    def _fmt_list(values) -> str:
+        return "; ".join(f"{x:.1f}" for x in values)
+
+    def _source_value(self, key: str) -> tuple:
+        """(Rohtext, umgerechnet als Text, Wert in °C) einer Temperaturquelle (nie None).  Wirft ``ThermalError``, wenn
+        die Quelle nichts liefert.  Bei Zonenquellen zählt der höchste plausible Wert (gibt es keinen, der höchste Wert
+        überhaupt, damit der Regler ihn als unplausibel zählt)."""
+        if key == "gamezone":
+            v = self._data("GetCPUTemp")
+            return str(v), f"{v} °C", float(v)
+        if key == "feature":
+            v = self._feature_raw(FEATURE_ID_CPU_TEMP)
+            return str(v), f"{v} °C", float(v)
+        if key == "acpi":
+            raw = self._read_zones("ACPI").get("CurrentTemperature", [])
+            if not raw:
+                raise ProviderError("keine ACPI-Thermalzone gemeldet")
+            conv = [kelvin10_to_c(x) for x in raw]
+            rawtxt = ",".join(f"{x:g}" for x in raw) + " (Zehntel-Kelvin)"
+        elif key == "perf":
+            z = self._read_zones("PERF")
+            kel, hp = z.get("Temperature", []), z.get("HighPrecisionTemperature", [])
+            if not kel and not hp:
+                raise ProviderError("keine Thermalzone (Leistungszähler) gemeldet oder Felder fehlen")
+            conv = [kelvin10_to_c(x) for x in hp] + [kelvin_to_c(x) for x in kel]
+            rawtxt = (f"Temperature={','.join(f'{x:g}' for x in kel) or '-'} (Kelvin), "
+                      f"HighPrecisionTemperature={','.join(f'{x:g}' for x in hp) or '-'} (Zehntel-Kelvin)")
+        else:
+            raise ProviderError(f"unbekannte Temperaturquelle {key!r}")
+        best = best_plausible(conv)
+        return rawtxt, self._fmt_list(conv) + " °C", best if best is not None else max(conv)
+
+    def _probe_temp_sources(self) -> None:
+        """Quellenkette a-d: die erste Quelle mit plausiblem Wert wird für den Lauf festgehalten.  Im Diagnosemodus werden
+        trotzdem alle ausgewertet.  Eine Ausnahme in einer Quelle bricht die anderen nicht ab (ausser der Hilfsprozess
+        selbst ist ausgefallen).  Ohne Administratorrechte/ohne Lenovo-Gerät scheitert schon die erste Quelle (``ProviderUnavailable``)."""
+        self._temp_source = ""
+        answered = False  # mindestens eine Quelle hat einen Wert geliefert (auch unplausibel)
+        helper_failed = False  # der Hilfsprozess hing/starb bei einer Quelle (dann ist ein Urteil "unplausibel" nicht belastbar)
+        first_err: Optional[BaseException] = None  # Ursache der ersten gescheiterten Quelle (für die Einzelheiten)
+        for i, (key, label) in enumerate(TEMP_SOURCES):
+            if self._temp_source and not self._diagnose:
+                break
+            head = f"  Temperaturquelle {chr(97 + i)}) {label}: "
+            helper_dead = False
+            try:
+                raw, conv, val = self._source_value(key)
+            except HelperRemoteError as e:
+                if key == "gamezone" and _is_denied(e):
+                    raise ProviderUnavailable(
+                        "Administratorrechte nötig (Zugriff auf die Lenovo-Hardwareabfrage verweigert)", "admin") from e
+                if key == "gamezone" and _is_nodevice(e):
+                    raise ProviderUnavailable("Kein Lenovo-Legion-Gerät erkannt", "nodevice") from e
+                first_err = first_err or e
+                self._report.append(head + f"FEHLER {e.code or '-'}: {e.message[:150]}")
+                continue
+            except HelperError as e:
+                first_err = first_err or e
+                self._report.append(head + f"FEHLER {type(e).__name__}: {str(e)[:150]}")
+                helper_dead = True
+                helper_failed = True
+            except Exception as e:  # noqa: BLE001  (eine Quelle darf die anderen nicht abbrechen)
+                first_err = first_err or e
+                self._report.append(head + f"FEHLER {type(e).__name__}: {str(e)[:150]}")
+            else:
+                answered = True
+                ok = plausible(val) and val >= TEMP_SOURCE_MIN_C
+                note = "ja" if ok else ("nein (unter %g °C: Schalter/Flag, keine Temperatur)" % TEMP_SOURCE_MIN_C
+                                        if plausible(val) else "nein")
+                self._report.append(head + f"Rohwert {raw} -> {conv}, plausibel: {note}")
+                if ok and not self._temp_source:
+                    self._temp_source = key
+                if not ok:
+                    self._t(f"  Unplausible Temperatur ({label}): {conv}")
+            if helper_dead and not self._try_restart():
+                break  # Hilfsprozess nicht neu startbar: keine weitere Quelle möglich
+        if self._diagnose:
+            self._diagnose_extras()
+        if self._temp_source:
+            return
+        if answered and not helper_failed:
             raise ProviderUnavailable("Die gemessene Temperatur ist unplausibel", "implausible")
+        raise ProviderUnavailable("Die Temperaturabfrage ist fehlgeschlagen", "other") from first_err
+
+    def _try_restart(self) -> bool:
+        """Frischen Hilfsprozess starten (nach Zeitlimit/Absturz bei einer Quelle).  True = geklappt; wirft nie."""
+        if self._closing or self._aborted:
+            return False
+        try:
+            self._restart_helper()
+            return True
+        except Exception as e:  # noqa: BLE001
+            self._t(f"  Neustart des Hilfsprozesses gescheitert: {type(e).__name__}: {e}")
+            return False
+
+    def _probe_fans(self) -> None:
+        """Drehzahlquelle festlegen: GetFan1Speed/GetFan2Speed; sind beide nicht plausibel (0 o. ä.), die Ausweichquelle
+        GetFeatureValue 0x04030001/0x04030002 (unbestätigt; nur lesen), falls DIESE plausibel ist.  Die Drehzahl bleibt optional."""
+        self._fan_source = "gamezone"
+        gz_ok = False
+        for m in ("GetFan1Speed", "GetFan2Speed"):
+            try:
+                v = self._data(m)
+            except Exception as e:  # noqa: BLE001
+                self._report.append(f"  Drehzahlquelle {m}: FEHLER {type(e).__name__}: {str(e)[:150]}")
+                if isinstance(e, HelperError):
+                    self._try_restart()  # die Temperaturquelle ist schon gewählt und darf nicht darunter leiden
+                continue
+            ok = plausible_rpm(v)
+            gz_ok = gz_ok or ok
+            self._report.append(f"  Drehzahlquelle {m}: Rohwert {v}, plausibel: {'ja' if ok else 'nein'}")
+        if gz_ok and not self._diagnose:
+            return
+        fe_ok = False
+        for fid in (FEATURE_ID_FAN1_SPEED, FEATURE_ID_FAN2_SPEED):
+            try:
+                v = self._feature_raw(fid)
+            except Exception as e:  # noqa: BLE001
+                self._report.append(f"  Drehzahlquelle GetFeatureValue 0x{fid:08X} (unbestätigt): "
+                                    f"FEHLER {type(e).__name__}: {str(e)[:150]}")
+                if isinstance(e, HelperError):
+                    self._try_restart()
+                continue
+            ok = plausible_rpm(v)
+            fe_ok = fe_ok or ok
+            self._report.append(f"  Drehzahlquelle GetFeatureValue 0x{fid:08X} (unbestätigt): Rohwert {v}, "
+                                f"plausibel: {'ja' if ok else 'nein'}")
+        if not gz_ok and fe_ok:
+            self._fan_source = "feature"
+
+    def _diagnose_extras(self) -> None:
+        """Nur Diagnose: Drehzahlquellen, SmartFanMode und der aktuelle Zustand 'Lüfter voll' (alles nur gelesen)."""
+        try:
+            self._probe_fans()
+        except Exception as e:  # noqa: BLE001
+            self._report.append(f"  Drehzahlquellen: FEHLER {type(e).__name__}: {str(e)[:150]}")
+        try:
+            self._report.append(f"  SmartFanMode (GetSmartFanMode, nur gelesen, wird NIE geschaltet): {self._data('GetSmartFanMode')}")
+        except Exception as e:  # noqa: BLE001
+            self._report.append(f"  SmartFanMode (GetSmartFanMode): FEHLER {type(e).__name__}: {str(e)[:150]}")
+            if isinstance(e, HelperError):
+                self._try_restart()
+        try:
+            self._report.append(f"  Zustand 'Lüfter voll' (GetFeatureValue 0x{FEATURE_ID_FAN_FULL_SPEED:08X}, nur gelesen): "
+                                f"Rohwert {self._feature_raw(FEATURE_ID_FAN_FULL_SPEED)}")
+        except Exception as e:  # noqa: BLE001
+            self._report.append(f"  Zustand 'Lüfter voll' (GetFeatureValue 0x{FEATURE_ID_FAN_FULL_SPEED:08X}): "
+                                f"FEHLER {type(e).__name__}: {str(e)[:150]}")
+            if isinstance(e, HelperError):
+                self._try_restart()
+
+    def _open_probe(self) -> None:
+        self._report = []
+        self._probe_temp_sources()
+        if not self._diagnose:
+            try:
+                self._probe_fans()
+            except Exception as e:  # noqa: BLE001
+                self._t(f"  Drehzahlquelle: {type(e).__name__}: {e}")
         try:
             self._fan_max_raw = self._data("GetFanMaxSpeed")
             self._fan_max = self._fan_max_raw
@@ -1117,18 +1402,24 @@ class LegionProvider(ThermalProvider):
             return self._measure_once()
 
     def _measure_once(self) -> Messung:
-        cpu = self._data("GetCPUTemp")
+        # Die beim Öffnen gewählte Quelle gilt für den ganzen Lauf; fällt sie aus, gilt das Verhalten für Messausfälle
+        # (kein stilles Umschalten auf eine andere Quelle)
+        cpu = self._source_value(self._temp_source or "gamezone")[2]
         rpms = []
-        for m in ("GetFan1Speed", "GetFan2Speed"):
+        if self._fan_source == "feature":
+            fans = (("GetFeatureValue", FEATURE_ID_FAN1_SPEED), ("GetFeatureValue", FEATURE_ID_FAN2_SPEED))
+        else:
+            fans = (("GetFan1Speed", None), ("GetFan2Speed", None))
+        for m, fid in fans:
             if self._closing or self._aborted:
                 raise HelperError("Anbieter wird beendet")
             try:
-                rpms.append(self._data(m))
+                rpms.append(self._data(m) if fid is None else self._feature_raw(fid))
             except HelperError:
                 raise
             except ThermalError:
                 pass  # Drehzahl ist nur Anzeige
-        return Messung(float(cpu), tuple(rpms), self._fan_max)
+        return Messung(float(cpu), tuple(rpms), self._fan_max, self._temp_source)
 
     def fan_control_info(self) -> tuple:
         return bool(self._fan_mode), self._fan_note
@@ -1345,6 +1636,8 @@ class ThermalController:
         self._finished = False
         self._closing = False
         self._bad = 0
+        self._const_val: Optional[float] = None  # Konstant-Wächter (Quellen b, c, d)
+        self._const_n = 0
         self._up_fan = self._down_fan = self._up_pause = self._down_pause = 0
         self._pause_t0 = 0.0
         self._pause_log_t = 0.0
@@ -1395,6 +1688,13 @@ class ThermalController:
         self._n("info", f"Temperaturüberwachung aktiv ({getattr(self.provider, 'name', '?')}); "
                         f"Lüfter voll ab {self.cfg.fan_on_c:g} °C (zurück unter {self.cfg.fan_off_c:g}), "
                         f"Pause ab {self.cfg.pause_c:g} °C (weiter unter {self.cfg.resume_c:g}).")
+        src = getattr(self.provider, "temp_source_label", "")
+        if isinstance(src, str) and src:
+            if getattr(self.provider, "temp_source", "") in COARSE_SOURCES:
+                self._n("warn", f"Temperaturquelle: {src}. Schwellen gelten für die CPU; die Zone liegt meist darunter "
+                                "– Schutz eingeschränkt, ggf. CPU-Kerne begrenzen.")
+            else:
+                self._n("info", f"Temperaturquelle: {src}")
         if self.fan_ok:
             self._n("info", f"Lüfterschaltung: {note}")
         else:
@@ -1429,6 +1729,16 @@ class ThermalController:
                     self._fail("Die Temperaturmessung liefert unbrauchbare Werte", detail=f"{self._bad} unplausible Messungen in Folge (zuletzt {t} °C)")
                 return
             self._bad = 0
+            if getattr(m, "source", "") in CONSTANT_GUARD_SOURCES:
+                # Eine Quelle, die nie ihren Wert ändert (fester Wert, träge/tote Zone), schützt nicht: als ausgefallen werten
+                if self._const_val is not None and t == self._const_val:
+                    self._const_n += 1
+                else:
+                    self._const_val, self._const_n = t, 1
+                if self._const_n >= CONSTANT_GUARD_COUNT:
+                    self._fail("Temperaturquelle liefert einen konstanten Wert",
+                               detail=f"{self._const_n} Messungen in Folge exakt {t} °C ({m.source})")
+                    return
             self.last = m
             c = self.cfg
             if self.stats.max_cpu_c is None or t > self.stats.max_cpu_c:
@@ -1811,6 +2121,20 @@ def _out_messages(prov, out: Callable) -> None:
         out(f"  [{level}] {text}")
 
 
+def _out_candidates(prov, out: Callable) -> bool:
+    """Kandidatenliste des Anbieters (alle Temperatur- und Drehzahlquellen mit Rohwert, Umrechnung, Plausibilität,
+    Fehlertext) ausgeben.  True, wenn die Liste auch den SmartFanMode enthält."""
+    try:
+        lines = list(getattr(prov, "candidate_report", None) or [])
+    except Exception:  # noqa: BLE001
+        lines = []
+    if lines:
+        out("  Kandidaten (nur gelesen):")
+        for line in lines:
+            out(line)
+    return any("SmartFanMode" in x for x in lines)
+
+
 THERMAL_TEST_FILE = "thermal_test.txt"
 THERMAL_TEST_LOG_DIR: Optional[Path] = None  # None = Programmordner; die Tests setzen hier einen Wegwerf-Ordner
 
@@ -1878,8 +2202,8 @@ def run_thermal_test(out: Callable = print, provider_factory: Optional[Callable]
         "einem Open-Source-Projekt). Dieser Test soll am Gerät zeigen, ob sie wirkt.")
     if provider_factory is None:
         def provider_factory():  # noqa: E306
-            return LegionProvider(trace=out)
-    out("Schritt 1: Anbieter öffnen, Temperatur lesen")
+            return LegionProvider(trace=out, diagnose=True)
+    out("Schritt 1: Anbieter öffnen, alle Temperatur- und Drehzahlquellen einmal lesen (nur lesend)")
     prov = None
     problems = 0
     switched = False
@@ -1893,6 +2217,7 @@ def run_thermal_test(out: Callable = print, provider_factory: Optional[Callable]
             if e.__cause__ is not None:
                 detail(f"  Technische Ursache: {type(e.__cause__).__name__}: {e.__cause__}")
             _out_messages(prov, out)
+            _out_candidates(prov, out)
             if e.code == "admin":
                 out("  Hinweis: 'Temperatur-Test (Administrator).bat' bzw. eine Administrator-Konsole benutzen.")
             out("ERGEBNIS: nicht verfügbar - es wurde nichts geschaltet")
@@ -1907,8 +2232,21 @@ def run_thermal_test(out: Callable = print, provider_factory: Optional[Callable]
             return 1
         out(f"  Anbieter: {getattr(prov, 'name', '?')} - geöffnet")
         _out_messages(prov, out)
+        smart_listed = _out_candidates(prov, out)
+        src = getattr(prov, "temp_source_label", "")
+        src_key = getattr(prov, "temp_source", "")
+        src_note = ""  # Zusatz für die Ergebniszeilen
+        if isinstance(src, str) and src:
+            out(f"  Temperaturquelle: {src}")
+            if src_key in COARSE_SOURCES:
+                out("  ACHTUNG: nur grobe Thermalzone, nicht die CPU - Schutz eingeschränkt (die CPU-Schwellen greifen "
+                    "erst spät oder nie).")
+                src_note = " [nur grobe Thermalzone - Schutz eingeschränkt]"
+            elif src_key == "feature":
+                out("  Hinweis: Diese Temperaturquelle ist unbestätigt.")
+                src_note = " [Temperaturquelle unbestätigt]"
         smart = getattr(prov, "read_smart_fan_mode", None)
-        if smart is not None:
+        if smart is not None and not smart_listed:
             mode = smart()
             out("  SmartFanMode (nur gelesen, wird NIE geschaltet): "
                 + (f"{mode} (1 leise, 2 ausgewogen, 3 Leistung, 255 benutzerdefiniert)" if mode is not None else "nicht lesbar"))
@@ -1938,7 +2276,7 @@ def run_thermal_test(out: Callable = print, provider_factory: Optional[Callable]
         if not can:
             out("  -> Es wird NICHT geschaltet (nur Messung).")
             out(f"ERGEBNIS: nur Messung möglich - {note}"
-                + (f" ({problems} Problem(e) bei den Messungen)" if problems else ""))
+                + (f" ({problems} Problem(e) bei den Messungen)" if problems else "") + src_note)
             return 1 if problems else 0
         shown_before = last if last is not None else last_any
         before = ThermalController._top_rpm(shown_before)
@@ -2015,6 +2353,7 @@ def run_thermal_test(out: Callable = print, provider_factory: Optional[Callable]
         if err_text and not really:
             out(f"ERGEBNIS: nicht geschaltet - {err_text}{warn}")
             return 1
+        warn += src_note  # Hinweis auf grobe/unbestätigte Temperaturquelle an jedes Urteil unten anhängen
         near_before = fans_near_max(before, fan_max_for_check(last, during))
         top_during = max([r for r in (ThermalController._top_rpm(x) for x in during) if r is not None], default=None)
         fan_max = fan_max_for_check(last, during)

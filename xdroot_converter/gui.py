@@ -493,7 +493,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
         root = ttk.Frame(self, padding=8)
         root.pack(fill="both", expand=True)
         root.columnconfigure(1, weight=1)
-        root.rowconfigure(8, weight=1)
+        root.rowconfigure(10, weight=1)
         lock = self._locked_widgets
 
         ttk.Label(root, text="Quellordner:").grid(row=0, column=0, sticky="w", **pad)
@@ -581,15 +581,27 @@ class App(_Base):  # type: ignore[misc,valid-type]
         self.btn_cancel = ttk.Button(bf, text="Abbrechen", command=self._cancel, state="disabled")
         self.btn_cancel.pack(side="left")
 
-        ttk.Label(root, textvariable=self.var_clip_label).grid(row=6, column=0, columnspan=3, sticky="w", padx=8)
+        # Beschriftung und Balken in getrennten Zeilen (keine festen Pixelabstände: bei hoher DPI-Skalierung
+        # überdeckte der Balken sonst die untere Texthälfte)
+        self.lbl_clip = ttk.Label(root, textvariable=self.var_clip_label, justify="left", wraplength=700)
+        self.lbl_clip.grid(row=6, column=0, columnspan=3, sticky="ew", padx=8)
         self.pb_clip = ttk.Progressbar(root, maximum=1000)
-        self.pb_clip.grid(row=6, column=0, columnspan=3, sticky="ew", padx=8, pady=(22, 2))
-        ttk.Label(root, textvariable=self.var_total_label).grid(row=7, column=0, columnspan=3, sticky="w", padx=8)
+        self.pb_clip.grid(row=7, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 2))
+        self.lbl_total = ttk.Label(root, textvariable=self.var_total_label, justify="left", wraplength=700)
+        self.lbl_total.grid(row=8, column=0, columnspan=3, sticky="ew", padx=8)
         self.pb_total = ttk.Progressbar(root, maximum=1000)
-        self.pb_total.grid(row=7, column=0, columnspan=3, sticky="ew", padx=8, pady=(22, 6))
+        self.pb_total.grid(row=9, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 6))
+        self._lbl_h = -1
+        self._lbl_check_pending = False
+        for lbl in (self.lbl_clip, self.lbl_total):
+            lbl.bind("<Configure>", lambda e, w=lbl: (w.configure(wraplength=max(200, e.width - 8)),
+                                                      self._check_label_height()))
+        # nur wenn sich die benötigte Höhe der Beschriftungen ändert (Umbruch/Leerung), nicht bei jedem Fortschrittstext
+        self.var_clip_label.trace_add("write", lambda *_a: self._check_label_height())
+        self.var_total_label.trace_add("write", lambda *_a: self._check_label_height())
 
         logf = ttk.Frame(root)
-        logf.grid(row=8, column=0, columnspan=3, sticky="nsew", padx=8, pady=4)
+        logf.grid(row=10, column=0, columnspan=3, sticky="nsew", padx=8, pady=4)
         logf.rowconfigure(0, weight=1)
         logf.columnconfigure(0, weight=1)
         self.txt = tk.Text(logf, height=12, wrap="word", state="disabled", font=("Consolas", 9))
@@ -603,16 +615,37 @@ class App(_Base):  # type: ignore[misc,valid-type]
 
         self.lbl_status = ttk.Label(root, textvariable=self.var_status, relief="sunken", anchor="w", justify="left",
                                     wraplength=700)
-        self.lbl_status.grid(row=9, column=0, columnspan=3, sticky="ew", padx=8, pady=(4, 0))
+        self.lbl_status.grid(row=11, column=0, columnspan=3, sticky="ew", padx=8, pady=(4, 0))
         self.lbl_thermal = ttk.Label(root, textvariable=self.var_thermal, anchor="w", justify="left",
                                      foreground="#555555", wraplength=700)
-        self.lbl_thermal.grid(row=10, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 0))
+        self.lbl_thermal.grid(row=12, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 0))
         for lbl in (self.lbl_status, self.lbl_thermal):  # lange Texte umbrechen, statt aus dem Fenster zu laufen
             lbl.bind("<Configure>", lambda e, w=lbl: (w.configure(wraplength=max(200, e.width - 8)),
                                                       self._schedule_minsize()))
         # wird die Status- oder Temperaturzeile zwei-/einzeilig, passt sich die Mindesthöhe an (entprellt, nur im Leerlauf)
         self.var_status.trace_add("write", lambda *_a: self._schedule_minsize())
         self.var_thermal.trace_add("write", lambda *_a: self._schedule_minsize())
+
+    def _check_label_height(self) -> None:
+        """Mindesthöhe nur neu berechnen, wenn sich die Höhe der beiden Fortschritts-Beschriftungen geändert hat."""
+        if getattr(self, "_lbl_check_pending", False):
+            return
+        self._lbl_check_pending = True
+
+        def run() -> None:
+            self._lbl_check_pending = False
+            try:
+                h = self.lbl_clip.winfo_reqheight() + self.lbl_total.winfo_reqheight()
+            except Exception:  # noqa: BLE001
+                return
+            if h != self._lbl_h:
+                self._lbl_h = h
+                self._schedule_minsize()
+
+        try:
+            self.after_idle(run)
+        except Exception:  # noqa: BLE001
+            self._lbl_check_pending = False
 
     def _schedule_minsize(self) -> None:
         if getattr(self, "_minsize_pending", False):

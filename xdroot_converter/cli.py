@@ -18,7 +18,7 @@ import signal
 import sys
 import time
 
-from . import converter, thermal, tools, verify
+from . import converter, keepawake, thermal, tools, verify
 
 
 class CliReporter(converter.Reporter):
@@ -211,8 +211,9 @@ def main(argv=None) -> int:
     if args.verify:
         cancel = tools.CancelToken()
         try:
-            rep = verify.verify_card(args.verify, args.verify_source, deep=args.deep, log=lambda s: print(s, flush=True),
-                                     cancel=cancel, threads=args.threads)
+            with keepawake.keep_awake(lambda s: print(s, flush=True)):  # Standby verhindern (gilt je Thread: derselbe)
+                rep = verify.verify_card(args.verify, args.verify_source, deep=args.deep,
+                                         log=lambda s: print(s, flush=True), cancel=cancel, threads=args.threads)
         except FileNotFoundError as e:  # Ordner fehlt / kein XDROOT darin (die Meldung nennt den Pfad)
             print(f"FEHLER: {e if e.errno is None else _os_message(e, e.filename or args.verify)}", file=sys.stderr)
             return 2

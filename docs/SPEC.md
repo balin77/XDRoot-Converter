@@ -123,6 +123,16 @@ Ergebnis laut mxf2raw: `AVC_High_422`, coding_label und ec_label identisch zur F
 - GUI bleibt bedienbar (Arbeit im Thread, Fortschritt per Queue). Fortschritt: Balken
   pro Clip (aus ffmpeg `-progress`) und gesamt, Restzeit grob.
 
+#### Energiesparmodus während des Laufs
+
+Während einer Umwandlung (inkl. Abschlussprüfung) und bei `--verify` verhindert das Tool unter Windows den Standby/Ruhezustand
+wegen Inaktivität (`keepawake.py`: `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)`, beim Verlassen
+`ES_CONTINUOUS`). Der Bildschirm darf ausgehen (kein `ES_DISPLAY_REQUIRED`). Der Zustand gilt je Thread; deshalb wird er im
+äußersten Laufrahmen (`Converter.run`, im Arbeits-Thread der GUI; bzw. im `--verify`-Weg der CLI) gesetzt und im `finally`
+(Abbruch, Fehler, Temperatur-Abbruch) im selben Thread zurückgenommen. Testläufe (`--max-frames`) setzen ihn nicht. Verschachtelung ist
+harmlos; auf anderen Systemen oder bei einem Fehler passiert nichts außer einer Hinweiszeile im Protokoll. Nicht verhindert werden:
+Zuklappen des Deckels, Netzschalter, kritischer Akkustand, manuelles „Energie sparen“.
+
 ### GUI (tkinter, Deutsch)
 
 - Felder „Quellordner" und „Zielordner" mit „Durchsuchen…", Knopf **Konvertieren**,
@@ -454,6 +464,47 @@ Ergänzungen nach den Reviews (verbindlich):
 - **Nicht abgedeckt:** Wird das Programm hart beendet (Task-Manager) oder stürzt der Rechner ab, bleiben die Lüfter voll, bis
   das Tool das nächste Mal **mit Temperaturüberwachung und Administratorrechten** läuft (oder `--thermal-test` gestartet wird).
   Ein erhöhter Prozess sieht Netzlaufwerke des normalen Benutzers in der Regel nicht.
+
+#### Temperaturquellen (Ergänzung nach dem Gerätetest 16.11.2026)
+
+Befund am Lenovo Legion Pro 7 16IRX8H (mit Administratorrechten): `LENOVO_GAMEZONE_DATA.GetCPUTemp` antwortet, liefert aber
+`Data=0` (unplausibel, deshalb „nicht verfügbar“). Der Legion-Anbieter hat deshalb eine **Quellenkette**; die erste Quelle mit
+plausiblem Wert (über 0 bis 125 °C) bei der Öffnung gilt für den ganzen Lauf und wird einmal im Protokoll genannt
+(„Temperaturquelle: …“). Fällt sie im Lauf aus, gilt das normale Verhalten bei Messausfällen (kein stilles Umschalten).
+Alle Quellen sind **nur lesend**; es kommt kein neuer Schreibaufruf hinzu (`SetFeatureValue` weiter nur für `0x04020000` mit 0/1).
+
+1. `LENOVO_GAMEZONE_DATA.GetCPUTemp` (bisher).
+2. `LENOVO_OTHER_METHOD.GetFeatureValue(IDs=0x05040000)` – aus dem Projekt „Lenovo Legion Toolkit“ übernommen, für dieses
+   Gerät **unbestätigt**.
+3. `root\wmi` `MSAcpi_ThermalZoneTemperature.CurrentTemperature` (Zehntel-Kelvin, °C = Wert/10 − 273,15), höchster plausibler
+   Wert aller Zonen; „ACPI-Thermalzone (grob, oft träge)“.
+4. `root\cimv2` `Win32_PerfFormattedData_Counters_ThermalZoneInformation` (`Temperature` in Kelvin bzw.
+   `HighPrecisionTemperature` in Zehntel-Kelvin, was vorhanden ist), höchster plausibler Wert; ebenfalls grob.
+
+**Untergrenze der Quellenwahl:** Beim Öffnen gilt eine Quelle nur ab `TEMP_SOURCE_MIN_C` = 20 °C als brauchbar (alle Quellen a–d);
+GetFeatureValue liefert je Kennung beliebige Zahlen, und Werte wie 1 oder 2 sind Schalter, keine Temperaturen. Im Lauf gilt
+unverändert die Grenze über 0 bis 125 °C.
+
+**Schutz eingeschränkt bei b, c, d:** Bei c/d (Thermalzonen) zeigt die Statuszeile „Thermalzone 48 °C (grob, nicht CPU)“, bei b
+„CPU 71 °C (Quelle unbestätigt)“. Bei c/d ist die Protokollzeile zur Quelle eine **Warnung** („Schwellen gelten für die CPU; die
+Zone liegt meist darunter – Schutz eingeschränkt, ggf. CPU-Kerne begrenzen“), und `--thermal-test` hängt „nur grobe
+Thermalzone – Schutz eingeschränkt“ (c/d) bzw. „Temperaturquelle unbestätigt“ (b) an das Urteil. **Konstant-Wächter** (nur b, c,
+d): Liefert die gewählte Quelle 36 Messungen in Folge (3 min) exakt denselben Wert, gilt sie als ausgefallen (Lüfter zurück,
+„Temperatur nicht verfügbar: Temperaturquelle liefert einen konstanten Wert“, Umwandlung läuft weiter).
+
+**Robustheit/Sicherheit:** Hängt oder stirbt der Hilfsprozess bei einer Quelle oder der Drehzahl-Ausweichquelle, wird er neu
+gestartet und mit der nächsten Quelle weitergemacht; ein Fehler der Drehzahl-Ausweichquelle macht eine funktionierende
+Temperaturquelle nie unverfügbar. Das PowerShell-Skript (läuft als Administrator) hat eine **feste Erlaubnisliste**:
+`LENOVO_GAMEZONE_DATA` {GetCPUTemp, GetFan1Speed, GetFan2Speed, GetFanMaxSpeed, GetSmartFanMode}; `LENOVO_OTHER_METHOD.GetFeatureValue`
+nur mit `IDs` ∈ {0x04020000, 0x05040000, 0x04030001, 0x04030002}; `SetFeatureValue` nur mit `IDs=0x04020000` und `value` 0 oder 1.
+Alles andere endet vor jedem CIM-Aufruf mit `BadArgs`.
+
+Der Hilfsprozess kennt dafür zwei feste lesende Befehle (`READ ACPI`, `READ PERF`). **Drehzahl:** liefern `GetFan1Speed`/
+`GetFan2Speed` keinen plausiblen Wert (100–12000 U/min), dient `GetFeatureValue(0x04030001/0x04030002)` (unbestätigt) als
+Ausweichquelle; ohne Drehzahl bleibt es bei „Lüfter voll angefordert (keine Wirkung messbar)“.
+**Diagnose (`--thermal-test`):** Schritt 1 gibt alle Kandidaten roh aus (Rohwert, umgerechnet, plausibel ja/nein, Fehlertext),
+dazu `GetSmartFanMode` und den Zustand `GetFeatureValue(0x04020000)` (nur gelesen), dann die gewählte Quelle. Ist keine Quelle
+plausibel, steht die Liste trotzdem in `thermal_test.txt`; es wird nichts geschaltet.
 
 ### Abschlussprüfung mit automatischer Wiederholung (Runde 4, Spezifikation)
 

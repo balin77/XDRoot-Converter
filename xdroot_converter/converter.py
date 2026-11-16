@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime as _dt
 import json
@@ -17,7 +18,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Optional
 
-from . import card, mxfheader, mxfinfo, tools, verify
+from . import card, keepawake, mxfheader, mxfinfo, tools, verify
 from . import thermal as _thermal_mod  # (Options.thermal ist ein Feld; Modulname nicht verdecken)
 
 TMP_NAME = "_tmp_xdroot_converter"
@@ -1064,10 +1065,22 @@ class Converter:
         self._thermal_closed = False
         self._thermal = None
         self._abort_reason = ""
+        self._keepawake_msgs = []
+        # Energiesparmodus verhindern: Eintritt und Verlassen hier, im Thread, der den Lauf ausfuehrt (der Zustand gilt
+        # je Thread); Testlaeufe (--max-frames) brauchen es nicht.
+        guard = contextlib.nullcontext() if self.o.max_frames else keepawake.keep_awake(self._keepawake_msgs.append)
         try:
-            return self._run()
+            with guard:
+                return self._run()
         finally:
             self._thermal_stop()
+            self._flush_keepawake()
+
+    def _flush_keepawake(self) -> None:
+        """Gepufferte Hinweise von keepawake ins Protokoll (die Protokolldatei ist beim Eintritt noch nicht offen)."""
+        msgs, self._keepawake_msgs = self._keepawake_msgs, []
+        for m in msgs:
+            (self.warn if m.startswith("Hinweis") else self.info)(m)
 
     def _run(self) -> RunSummary:
         summary = RunSummary(test_run=bool(self.o.max_frames))
@@ -1100,6 +1113,7 @@ class Converter:
             summary.log_path = target_dir / LOG_NAME
             self._logf = open(summary.log_path, "a", encoding="utf-8")
             self.info(f"Start: Quelle {src_root} -> Ziel {out_root}")
+            self._flush_keepawake()
             if self.o.max_frames:
                 self.warn(f"TESTLAUF: nur die ersten {self.o.max_frames} Frames je Clip; dur/Duration werden NICHT angepasst")
             self.info(f"Einstellungen: Bitrate {self.o.bitrate_mbps} Mbit/s, Preset {self.o.preset}"
