@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover
     tk = None  # type: ignore[assignment]
     filedialog = messagebox = ttk = None  # type: ignore[assignment]
 
-from . import __version__, card, converter, thermal, tools
+from . import __version__, card, converter, jobqueue, keepawake, thermal, tools
 
 PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"]
 
@@ -349,9 +349,13 @@ def completion_message(summary) -> tuple[str, str, str]:
         parts.append(f"Last gedrosselt: gesamt {_fmt_pause(thr_s)}")
     pauses = int(getattr(summary, "pauses", 0) or 0)
     hot_max = getattr(summary, "max_cpu_c", None)
-    if pauses <= 0 and hot_max and not getattr(summary, "thermal_throttle", True):
-        parts.append(f"Höchste CPU-Temperatur {hot_max:.0f} °C (Messwert des Geräts, kann über der Anzeige des "
-                     "Herstellers liegen)")
+    if pauses <= 0 and hot_max:
+        if not getattr(summary, "thermal_throttle", True):
+            parts.append(f"Höchste CPU-Temperatur {hot_max:.0f} °C (Messwert des Geräts, kann über der Anzeige des "
+                         "Herstellers liegen)")
+        else:  # Schalter „drosseln/pausieren“ an, aber keine Pause nötig
+            parts.append(f"Höchste gemessene CPU-Temperatur: {hot_max:.0f} °C, keine Pause nötig (Messwert des Geräts, "
+                         "kann über der Anzeige des Herstellers liegen)")
     if pauses > 0:
         hot = getattr(summary, "max_cpu_c", None)
         parts.append(f"Temperaturpausen: {pauses}, gesamt {_fmt_pause(getattr(summary, 'pause_seconds', 0.0))}"
@@ -472,6 +476,11 @@ class App(_Base):  # type: ignore[misc,valid-type]
         self._locked_widgets: list = []
         self._ui_running = False       # Knöpfe stehen im Lauf-Zustand
         self._last_total = 0.0
+        # Auftragsliste (Runde 7)
+        self.jq = jobqueue.JobQueue()
+        self._run_mode: Optional[str] = None  # None | "single" | "list"
+        self._ov_est: dict = {}                # Übersichtsschlüssel -> geschätzte Zielgröße (aus der Analyse)
+        self._converter_factory = converter.Converter  # Tests setzen hier eine Attrappe
 
         self.var_src = tk.StringVar()
         self.var_dst = tk.StringVar()
@@ -495,6 +504,8 @@ class App(_Base):  # type: ignore[misc,valid-type]
         self.settings_open = tk.BooleanVar(value=False)
 
         self._build()
+        self._update_thermal_fields()  # Felder passend zu den Schaltern (z. B. „Pause ab“ aus, solange Drosseln aus ist)
+        self._update_verify_fields()
         self.var_skip_unlisted.trace_add("write", lambda *_a: self._schedule_overview(0))
         self.var_bitrate.trace_add("write", lambda *_a: self._schedule_overview(700))
         self.var_bitrate.trace_add("write", lambda *_a: self._update_br_hint())
@@ -596,12 +607,18 @@ class App(_Base):  # type: ignore[misc,valid-type]
         self._throttle_fields = [ck_thr]  # nur an die Überwachung gebunden (wie die Lüfter-Schwelle)
         self._verify_fields = [ck_deep]
 
-        bf = ttk.Frame(root)
-        bf.grid(row=5, column=0, columnspan=3, sticky="w", **pad)
+        act = ttk.Frame(root)  # Knöpfe und (nur bei Bedarf sichtbar) die Auftragsliste
+        act.grid(row=5, column=0, columnspan=3, sticky="ew", **pad)
+        act.columnconfigure(0, weight=1)
+        bf = ttk.Frame(act)
+        bf.grid(row=0, column=0, sticky="w")
         self.btn_start = ttk.Button(bf, text="Konvertieren", command=self._start)
         self.btn_start.pack(side="left", padx=(0, 8))
+        self.btn_add = ttk.Button(bf, text="Zur Liste hinzufügen", command=self._add_to_list)
+        self.btn_add.pack(side="left", padx=(0, 8))
         self.btn_cancel = ttk.Button(bf, text="Abbrechen", command=self._cancel, state="disabled")
         self.btn_cancel.pack(side="left")
+        self._build_job_list(act)
 
         # Beschriftung und Balken in getrennten Zeilen (keine festen Pixelabstände: bei hoher DPI-Skalierung
         # überdeckte der Balken sonst die untere Texthälfte)
@@ -647,6 +664,48 @@ class App(_Base):  # type: ignore[misc,valid-type]
         # wird die Status- oder Temperaturzeile zwei-/einzeilig, passt sich die Mindesthöhe an (entprellt, nur im Leerlauf)
         self.var_status.trace_add("write", lambda *_a: self._schedule_minsize())
         self.var_thermal.trace_add("write", lambda *_a: self._schedule_minsize())
+
+    def _build_job_list(self, parent) -> None:
+        """Auftragsliste (Treeview mit Bildlaufleiste); sichtbar nur, wenn sie Aufträge enthält oder ein Listenlauf läuft."""
+        s = self._scale()
+        self.frm_list = ttk.LabelFrame(parent, text="Auftragsliste", padding=(6, 2, 6, 4))
+        fl = self.frm_list
+        fl.columnconfigure(0, weight=1)
+        tf = ttk.Frame(fl)
+        tf.grid(row=0, column=0, sticky="ew")
+        tf.columnconfigure(0, weight=1)
+        cols = ("src", "dst", "settings", "status")
+        self.tree = ttk.Treeview(tf, columns=cols, show="headings", height=4, selectmode="browse")
+        for c, title, w, stretch in (("src", "Quelle", 130, True), ("dst", "Ziel", 130, True),
+                                     ("settings", "Einstellungen", 170, True), ("status", "Status", 170, False)):
+            self.tree.heading(c, text=title, anchor="w")
+            self.tree.column(c, width=int(w * s), minwidth=int(90 * s), stretch=stretch, anchor="w")
+        tsb = ttk.Scrollbar(tf, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=tsb.set)
+        self.tree.grid(row=0, column=0, sticky="ew")
+        tsb.grid(row=0, column=1, sticky="ns")
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._on_job_select())
+        self.tree.tag_configure("run", foreground="#0b5cad")
+        self.tree.tag_configure("bad", foreground="#b00020")
+        self.tree.tag_configure("warn", foreground="#9a6700")
+        # Ganze Texte des markierten Auftrags (Tabellenzellen können lange Pfade nicht umbrechen)
+        self.var_job_detail = tk.StringVar(value="")
+        self.lbl_job_detail = ttk.Label(fl, textvariable=self.var_job_detail, wraplength=700, justify="left",
+                                        foreground="#555555")
+        self.lbl_job_detail.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        self.lbl_job_detail.bind("<Configure>", lambda e: (self.lbl_job_detail.configure(
+            wraplength=max(200, e.width - 8)), self._schedule_minsize()))
+        self.var_job_detail.trace_add("write", lambda *_a: self._schedule_minsize())
+        lb = ttk.Frame(fl)
+        lb.grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.btn_remove = ttk.Button(lb, text="Entfernen", command=self._remove_job, state="disabled")
+        self.btn_remove.pack(side="left", padx=(0, 8))
+        self.btn_clear = ttk.Button(lb, text="Liste leeren", command=self._clear_jobs, state="disabled")
+        self.btn_clear.pack(side="left", padx=(0, 8))
+        self.btn_runall = ttk.Button(lb, text="Alle konvertieren", command=self._start_list, state="disabled")
+        self.btn_runall.pack(side="left")
+        self._list_shown = False
+        self.frm_list.grid_remove()
 
     def _check_label_height(self) -> None:
         """Mindesthöhe nur neu berechnen, wenn sich die Höhe der beiden Fortschritts-Beschriftungen geändert hat."""
@@ -844,6 +903,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
         def work() -> None:
             try:
                 ov = converter.overview(opts, cancel=cancel)
+                self._ov_est[key] = ov.est_target_bytes
                 self.q.put(("overview", token, overview_display_text(ov.text(), skip), True))
             except Exception as e:  # noqa: BLE001
                 if cancel.cancelled:
@@ -854,9 +914,13 @@ class App(_Base):  # type: ignore[misc,valid-type]
         self.ov_thread.start()
 
     # ------------------------------------------------------------------ Lauf
-    def _start(self) -> None:
-        if self._is_running() or self._closing:
-            return
+    def _prepare_job(self, for_list: bool = False) -> Optional["jobqueue.Job"]:
+        """Prüfungen und Rückfragen vor dem Start (gemeinsam für „Konvertieren“ und „Zur Liste hinzufügen“).
+
+        Gibt ein fertiges Auftragsobjekt zurück (Optionen als Momentaufnahme der Felder, gespeicherte Antworten, Kurztext
+        der Einstellungen) oder None, wenn eine Prüfung oder eine Rückfrage negativ war (Meldung ist schon angezeigt).
+        ``for_list``: zusätzlich Prüfung gegen die Liste (Duplikate, Überschneidungen)."""
+        answers: dict = {}
         src, dst = self.var_src.get().strip(), self.var_dst.get().strip()
         if not src or not dst:
             messagebox.showwarning("XDROOT-Converter", "Bitte Quell- und Zielordner angeben.")
@@ -906,18 +970,25 @@ class App(_Base):  # type: ignore[misc,valid-type]
         except Exception as e:  # noqa: BLE001
             messagebox.showwarning("XDROOT-Converter", str(e))
             return
+        if for_list:  # Liste: Duplikate/Überschneidungen vor den Rückfragen ablehnen
+            conflict = self.jq.find_conflict(src, eff_dst, str(src_root))
+            if conflict:
+                messagebox.showwarning("XDROOT-Converter", conflict)
+                return
         if use_parent:
             if not messagebox.askyesno(
                     "XDROOT-Converter",
                     f"Der gewählte Zielordner ist selbst ein XDROOT. "
                     f"Soll der übergeordnete Ordner „{eff_dst}“ als Ziel verwendet werden?"):
                 return
+            answers["use_parent"] = True
         if target_xdroot_has_files(eff_dst):
             if not messagebox.askyesno(
                     "XDROOT-Converter",
                     "Der Zielordner enthält bereits ein XDROOT (z. B. von einem früheren Lauf). "
                     "Fertige Clips werden übersprungen, fehlende ergänzt. Fortfahren?"):
                 return
+            answers["resume_existing"] = True
         dst = eff_dst
         if use_parent:
             self.var_dst.set(dst)
@@ -928,24 +999,38 @@ class App(_Base):  # type: ignore[misc,valid-type]
             temp_fan=temp_fan, temp_pause=temp_pause, thermal_throttle=throttle, threads=threads,
             auto_verify=bool(self.var_auto_verify.get()), auto_verify_deep=bool(self.var_verify_deep.get()),
         )
-        # Übersichts-Analyse beenden; der Worker wartet auf ihr Ende (kein paralleler Scan)
+        return jobqueue.Job(id=0, options=opts, answers=answers, settings_text=jobqueue.settings_text(opts))
+
+    def _begin_run_ui(self, mode: str) -> Optional[threading.Thread]:
+        """Gemeinsamer Start eines Laufs in der Oberfläche (einzeln oder Liste): Übersichts-Analyse beenden, Eingaben
+        sperren, Anzeige zurücksetzen.  Gibt den Übersichts-Thread zurück, auf dessen Ende der Worker wartet."""
         self._cancel_overview()
         self._last_overview_key = None
         prev_ov = self.ov_thread
         self.cancel_token = tools.CancelToken()
-        conv = converter.Converter(opts, QueueReporter(self.q), self.cancel_token)
+        self._run_mode = mode
+        self._ui_running = True
         self._set_inputs(False)
-        self.btn_start.configure(state="disabled")
-        self.btn_cancel.configure(state="normal")
         self.pb_clip["value"] = 0
         self.pb_total["value"] = 0
         self.var_clip_label.set("")
         self.var_total_label.set("")
         self.var_status.set("Läuft …")
-        self._ui_running = True
         self._last_total = 0.0
         if self.var_overview.get() == ANALYSE_TEXT:
             self.var_overview.set("Umwandlung läuft – die Übersicht wird danach aktualisiert.")
+        self.btn_cancel.configure(state="normal")
+        self._update_list_buttons()
+        return prev_ov
+
+    def _start(self) -> None:
+        if self._is_running() or self._closing:
+            return
+        job = self._prepare_job(for_list=False)
+        if job is None:
+            return
+        prev_ov = self._begin_run_ui("single")
+        conv = self._converter_factory(job.options, QueueReporter(self.q), self.cancel_token)
         stamp = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
         self._append(f"──────── Neuer Lauf {stamp} ────────", "sep")
 
@@ -960,6 +1045,184 @@ class App(_Base):  # type: ignore[misc,valid-type]
 
         self.worker = threading.Thread(target=work, daemon=True)
         self.worker.start()
+
+    # ------------------------------------------------------------------ Auftragsliste
+    def _estimate_bytes(self, opts) -> Optional[int]:
+        """Geschätzte Zielgröße der Quelle (aus der Übersichts-Analyse; sonst eigene Analyse); None, wenn nicht ermittelbar."""
+        key = overview_key(opts.source, opts.unlisted == "skip", f"{opts.bitrate_mbps:g}")
+        if key in self._ov_est:
+            return self._ov_est[key]
+        try:
+            return int(converter.overview(opts).est_target_bytes)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _add_to_list(self) -> None:
+        if self._closing:
+            return
+        job = self._prepare_job(for_list=True)
+        if job is None:
+            return
+        est = self._estimate_bytes(job.options)
+        warn = self.jq.space_warning(job.target, est, converter.fmt_size)
+        if warn and not messagebox.askyesno("XDROOT-Converter", warn, default="no"):
+            return
+        new = self.jq.add(job.options, job.answers, est_bytes=est, text=job.settings_text)
+        self._refresh_job_list(select=new.id)
+        n = len(self.jq)
+        self.var_status.set(f"Zur Liste hinzugefügt ({n} Auftrag/Aufträge in der Liste).")
+
+    def _selected_job(self) -> Optional["jobqueue.Job"]:
+        try:
+            sel = self.tree.selection()
+        except Exception:  # noqa: BLE001
+            return None
+        return self.jq.get(int(sel[0])) if sel else None
+
+    def _on_job_select(self) -> None:
+        j = self._selected_job()
+        if j is None:
+            self.var_job_detail.set("")
+        else:
+            self.var_job_detail.set(f"Quelle: {j.source}\nZiel: {j.target}\nEinstellungen: {j.settings_text}\n"
+                                    f"Status: {j.status}")
+        self._update_list_buttons()
+
+    def _remove_job(self) -> None:
+        j = self._selected_job()
+        if j is None or not self.jq.remove(j.id):
+            return
+        self._refresh_job_list()
+
+    def _clear_jobs(self) -> None:
+        self.jq.clear()
+        self._refresh_job_list()
+
+    def _refresh_job_list(self, select: Optional[int] = None) -> None:
+        """Tabelle aus der Liste neu aufbauen, Markierung behalten, Sichtbarkeit und Knöpfe aktualisieren."""
+        try:
+            keep = select if select is not None else (int(self.tree.selection()[0]) if self.tree.selection() else None)
+        except Exception:  # noqa: BLE001
+            keep = None
+        self.tree.delete(*self.tree.get_children())
+        for j in self.jq.jobs():
+            tag = {jobqueue.ST_RUN: "run", jobqueue.ST_ERROR: "bad", jobqueue.ST_DEVIATION: "warn",
+                   jobqueue.ST_CANCELLED: "warn"}.get(j.status, "")
+            self.tree.insert("", "end", iid=str(j.id), tags=(tag,) if tag else (),
+                             values=(j.source, j.target, j.settings_text, j.status))
+        if keep is not None and self.tree.exists(str(keep)):
+            self.tree.selection_set(str(keep))
+            self.tree.see(str(keep))
+        want = len(self.jq) > 0 or self._run_mode == "list"
+        if want != self._list_shown:
+            self._list_shown = want
+            if want:
+                self.frm_list.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+            else:
+                self.frm_list.grid_remove()
+            self._schedule_minsize()
+        self._on_job_select()
+
+    def _update_list_buttons(self) -> None:
+        busy = self._ui_running or self._closing
+        j = self._selected_job()
+        jobs = self.jq.jobs()
+        states = {
+            self.btn_start: not busy,
+            self.btn_runall: not busy and self.jq.has_runnable(),
+            self.btn_add: not self._closing,
+            self.btn_remove: j is not None and j.status != jobqueue.ST_RUN and not self._closing,
+            self.btn_clear: any(x.status != jobqueue.ST_RUN for x in jobs) and not self._closing,
+        }
+        for w, on in states.items():
+            try:
+                w.configure(state="normal" if on else "disabled")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _start_list(self) -> None:
+        """„Alle konvertieren“: wartende Aufträge in Listenreihenfolge nacheinander in EINEM Arbeits-Thread abarbeiten."""
+        if self._is_running() or self._closing:
+            return
+        if not self.jq.has_runnable():
+            return
+        n = self.jq.begin_run()
+        if n == 0:
+            return
+        prev_ov = self._begin_run_ui("list")
+        self._refresh_job_list()
+        stamp = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+        self._append(f"──────── Neuer Listenlauf {stamp} ({n} Auftrag/Aufträge) ────────", "sep")
+        token = self.cancel_token
+        jq, q = self.jq, self.q
+        factory = self._converter_factory
+
+        def log_keepawake(m: str) -> None:
+            q.put(("log", "warn" if m.startswith("Hinweis") else "info", m))
+
+        def work() -> None:
+            try:
+                # Energiesparmodus über den ganzen Listenlauf (Zustand gilt je Thread; Verschachtelung mit
+                # Converter.run im selben Thread ist harmlos)
+                with keepawake.keep_awake(log_keepawake):
+                    if prev_ov is not None and prev_ov.is_alive():
+                        prev_ov.join(timeout=60)
+                    while not token.cancelled:
+                        claim = jq.claim_next()
+                        if claim is None:
+                            break
+                        job = claim.job
+                        q.put(("job_start", job.id, claim.n, claim.total))
+                        try:
+                            summary = factory(job.options, QueueReporter(q), token).run()
+                            jq.finish(job, summary)
+                        except Exception as e:  # noqa: BLE001  (Fehler dieses Auftrags, die Liste läuft weiter)
+                            jq.fail(job, e)
+                            q.put(("log", "error", f"Auftrag {claim.n}: Unerwarteter Fehler: {job.error}"))
+                        q.put(("job_done", job.id))
+            except Exception as e:  # noqa: BLE001
+                q.put(("log", "error", f"Listenlauf: Unerwarteter Fehler: {type(e).__name__}: {e}"))
+            finally:
+                jq.abandon_running()
+                q.put(("list_finished",))
+
+        self.worker = threading.Thread(target=work, daemon=True)
+        self.worker.start()
+
+    def _on_job_start(self, job_id: int, n: int, total: int) -> None:
+        j = self.jq.get(job_id)
+        self.pb_clip["value"] = 0
+        self.pb_total["value"] = 0
+        self._last_total = 0.0
+        self.var_clip_label.set("")
+        self.var_total_label.set("")
+        self.var_status.set(f"Läuft … Auftrag {n} von {total}")
+        if j is not None:
+            self._append(f"──────── Auftrag {n} von {total}: {j.source} → {j.target} ────────", "sep")
+        self._refresh_job_list()
+
+    def _on_list_finished(self) -> None:
+        jobs = self.jq.run_jobs()
+        waiting = len(self.jq.waiting())
+        try:
+            self.var_clip_label.set("")
+            if jobs and all(j.status == jobqueue.ST_DONE for j in jobs):
+                self.pb_total["value"] = 1000
+                self.var_total_label.set("Gesamt 100 %")
+            else:
+                self.var_total_label.set("")
+        except Exception as e:  # noqa: BLE001
+            self._log_internal_error("list_finished", e)
+        finally:
+            self._run_mode = None
+            self._reset_buttons(jobqueue.batch_status(jobs, waiting))
+            self._refresh_job_list()
+        if not self._closing and jobs:
+            self.after(50, lambda: self._show_batch_result(jobs, waiting))
+
+    def _show_batch_result(self, jobs: list, waiting: int) -> None:
+        kind, title, text = jobqueue.batch_message(jobs, waiting)
+        {"info": messagebox.showinfo, "warning": messagebox.showwarning}[kind](title, text)
 
     def _cancel(self) -> None:
         if self.cancel_token is not None and self._is_running():
@@ -1014,6 +1277,12 @@ class App(_Base):  # type: ignore[misc,valid-type]
                 self.var_overview.set(text)
                 if not ok:
                     self._last_overview_key = None  # erneute Analyse erlauben (z. B. Karte nachträglich eingesteckt)
+        elif kind == "job_start":
+            self._on_job_start(item[1], item[2], item[3])
+        elif kind == "job_done":
+            self._refresh_job_list()
+        elif kind == "list_finished":
+            self._on_list_finished()
         elif kind == "finished":
             self._finish(item[1])
         elif kind == "crashed":
@@ -1099,11 +1368,12 @@ class App(_Base):  # type: ignore[misc,valid-type]
 
     def _reset_buttons(self, status: str) -> None:
         self._ui_running = False
+        self._run_mode = None
         self.var_thermal.set("")
         try:
             self._set_inputs(True)
-            self.btn_start.configure(state="normal")
             self.btn_cancel.configure(state="disabled")
+            self._refresh_job_list()  # Knöpfe der Liste, Sichtbarkeit
             self.var_status.set(status)
         finally:
             # Übersicht neu anstoßen (Text könnte noch „Analysiere …“ zeigen)
@@ -1124,7 +1394,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
                 self.cancel_token.cancel()
             self._cancel_overview()
             self._set_inputs(False)
-            self.btn_start.configure(state="disabled")
+            self._update_list_buttons()  # während des Schließens ist alles gesperrt
             self.btn_cancel.configure(state="disabled")
             self.var_status.set("Breche ab … das Fenster schließt sich, sobald alles beendet ist.")
             return

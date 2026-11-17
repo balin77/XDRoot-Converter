@@ -31,7 +31,7 @@ class ThrottleOffControllerTests(unittest.TestCase):
         r = Rig(cfg=off_cfg())
         r.run(110, 1800, dt=5.0)  # 30 min bei 110 °C (360 Messungen)
         r.run(110, 3600, dt=60.0)  # und weitere Stunde mit grossen Abständen (länger als die Höchstdauer einer Pause)
-        self.assertEqual(r.ctl.calls, [], "kein set_throttle")
+        self.assertEqual(r.ctl.calls, [], "keine Drossel-Stufe (nur das unbedingte set_throttle(1.0) am Ende ist erlaubt)")
         self.assertEqual(r.ctl.events, [], "keine Pause")
         self.assertFalse(r.c.paused)
         self.assertEqual(r.c.aborted, "")
@@ -82,7 +82,7 @@ class ThrottleOffControllerTests(unittest.TestCase):
             r.now[0] += 5
             r.c.tick(M(60.0, (3000,), source="feature"))
         self.assertTrue(r.c.failed)
-        self.assertEqual(r.ctl.calls[-1:], [1.0] if r.ctl.calls else [])  # nur das unbedingte Aufheben, nie eine Stufe
+        self.assertTrue(all(c == 1.0 for c in r.ctl.calls), r.ctl.calls)  # nur das unbedingte Aufheben, nie eine Stufe
 
     def test_failure_of_measurement_still_handled(self):
         r = Rig(cfg=off_cfg())
@@ -174,6 +174,13 @@ class SummaryTests(unittest.TestCase):
         _kind, _title, msg = gui.completion_message(s)
         self.assertIn("Höchste CPU-Temperatur 98 °C", msg)
         self.assertIn("kann über der Anzeige des Herstellers liegen", msg)
+
+    def test_gui_completion_window_names_max_temperature_with_switch_on_without_pause(self):
+        s = converter.RunSummary(max_cpu_c=90.0, thermal_throttle=True)
+        msg = gui.completion_message(s)[2]
+        self.assertIn("Höchste gemessene CPU-Temperatur: 90 °C, keine Pause nötig", msg)
+        s2 = converter.RunSummary(max_cpu_c=90.0, thermal_throttle=True, pauses=1, pause_seconds=10)
+        self.assertNotIn("keine Pause nötig", gui.completion_message(s2)[2])  # mit Pause steht die Pausenzeile da
 
     def test_run_transfers_max_temperature_and_flag(self):
         conv = converter.Converter(converter.Options(source="s", target="t", thermal="auto", thermal_throttle=False))
@@ -297,7 +304,7 @@ class GuiFieldStateTests(unittest.TestCase):
         self.assertTrue(a.var_thermal_on.get())
         self.assertFalse(a.var_throttle_on.get())
         fan, pause, ck = a._temp_fields[0], a._pause_fields[0], a._throttle_fields[0]
-        a._update_thermal_fields(True)
+        # direkt nach dem Start, ohne dass der Test die Methode selbst aufruft
         self.assertEqual((self.state(fan), self.state(ck), self.state(pause)), ("normal", "normal", "disabled"))
         a.var_throttle_on.set(True)
         a._update_thermal_fields(True)

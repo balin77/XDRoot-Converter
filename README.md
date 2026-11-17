@@ -93,6 +93,28 @@ Clips mit einer Abweichung werden neu umgewandelt (Standard: bis zu zwei Wiederh
 dann „Geprüft: N Clips, M ohne Abweichung“ sowie wiederholte und weiterhin fehlerhafte Clips mit Grund. In den Einstellungen
 lässt sich die Prüfung abschalten oder auf die schnelle Variante stellen (siehe „Abschlussprüfung“ unten).
 
+#### Auftragsliste: mehrere Karten nacheinander
+
+Mit **Zur Liste hinzufügen** (statt „Konvertieren“) wandert der aktuelle Auftrag in eine Liste mit den Spalten Quelle, Ziel,
+Einstellungen und Status; **Alle konvertieren** arbeitet die wartenden Aufträge in Listenreihenfolge nacheinander ab, z. B. drei
+Karten über Nacht. Die Liste erscheint erst, wenn sie Aufträge enthält.
+
+- Jeder Auftrag ist eine Momentaufnahme: Quelle, Ziel und alle Einstellungen werden beim Hinzufügen kopiert. Später geänderte
+  Felder wirken nur auf neue Aufträge.
+- Die Prüfungen und Rückfragen (z. B. „Fortsetzen?“) kommen schon beim Hinzufügen, nicht nachts; während des Listenlaufs gibt es
+  keine Rückfrage. Abgelehnt werden ein Ziel, das schon in der Liste steht, und eine Quelle, die Ziel eines anderen Auftrags ist
+  (und umgekehrt). Reicht der freie Platz für die geschätzten Zielgrößen aller wartenden Aufträge auf einem Laufwerk nicht, gibt es
+  eine Warnung mit Rückfrage.
+- Jeder Auftrag ist ein normaler Lauf (Abschlussprüfung, Temperaturüberwachung, Protokolldatei im Zielordner). Ein Fehler oder
+  Abweichungen halten die Liste nicht an. **Abbrechen** beendet den laufenden Auftrag und den Listenlauf; die übrigen bleiben
+  „wartet“, ein späteres „Alle konvertieren“ nimmt den abgebrochenen Auftrag wieder auf. Erledigte Aufträge werden nicht erneut
+  gestartet und bleiben stehen, bis sie entfernt werden.
+- Der Rechner geht während des ganzen Listenlaufs nicht in den Energiesparmodus. Am Ende erscheint ein einziges Abschlussfenster
+  mit einer Ergebniszeile je Auftrag und den Summen.
+- Grenzen: Die Liste wird nicht gespeichert (nach dem Schließen des Programms ist sie leer; ein unterbrochener Auftrag lässt sich
+  durch erneutes Hinzufügen fortsetzen). Es läuft immer nur ein Auftrag gleichzeitig. Die Kommandozeile kennt keine Liste.
+  Schließen während des Listenlaufs verhält sich wie beim Einzellauf (Rückfrage, dann Abbruch).
+
 ### Kommandozeile
 
 ```

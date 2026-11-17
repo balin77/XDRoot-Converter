@@ -2098,7 +2098,9 @@ class ThermalController:
     def _lift_throttle(self) -> None:
         """Drosselung aufheben (best effort, wirft nie).  UNBEDINGT ``set_throttle(1.0)`` (auch wenn der Regler selbst bei
         Stufe 0 steht: ein gescheiterter Schritt darf im pause_ctl keine Stufe hinterlassen).  Am Laufende nicht nötig (die
-        Affinität endet mit dem Prozess), aber bei Ausfall der Messung, während die Umwandlung weiterläuft."""
+        Affinität endet mit dem Prozess), aber bei Ausfall der Messung, während die Umwandlung weiterläuft.
+        Ohne den Schalter „drosseln und pausieren“ wird nie eine Stufe gesetzt; es bleibt nur dieses unbedingte
+        ``set_throttle(1.0)`` (am Laufende bzw. bei Ausfall), das keine Affinität setzt, wenn nie gedrosselt wurde."""
         fn = getattr(self.pause_ctl, "set_throttle", None)
         self._level = 0
         if callable(fn):
