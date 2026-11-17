@@ -481,6 +481,8 @@ class App(_Base):  # type: ignore[misc,valid-type]
         self._run_mode: Optional[str] = None  # None | "single" | "list"
         self._ov_est: dict = {}                # Übersichtsschlüssel -> geschätzte Zielgröße (aus der Analyse)
         self._converter_factory = converter.Converter  # Tests setzen hier eine Attrappe
+        self._user_cancel = threading.Event()  # Nutzer hat Abbrechen/Schliessen verlangt (beendet auch den Listenlauf)
+        self._est_pending: dict = {}           # Übersichtsschlüssel -> Aufträge, deren Schätzung im Hintergrund läuft
 
         self.var_src = tk.StringVar()
         self.var_dst = tk.StringVar()
@@ -814,7 +816,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
     def _update_verify_fields(self, inputs_enabled: Optional[bool] = None) -> None:
         """Der Haken „gründlich“ ist nur bedienbar, wenn die Abschlussprüfung an ist (und die Eingaben nicht gesperrt sind)."""
         if inputs_enabled is None:
-            inputs_enabled = not self._ui_running
+            inputs_enabled = not self._closing  # während eines Laufs bleiben die Einstellungen bedienbar (wirken nur auf neue Aufträge)
         on = bool(self.var_auto_verify.get()) and inputs_enabled
         for w in getattr(self, "_verify_fields", []):
             try:
@@ -825,7 +827,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
     def _update_thermal_fields(self, inputs_enabled: Optional[bool] = None) -> None:
         """Temperaturfelder nur bedienbar, wenn die Überwachung an ist (und die Eingaben nicht gesperrt sind)."""
         if inputs_enabled is None:
-            inputs_enabled = not self._ui_running
+            inputs_enabled = not self._closing
         on = bool(self.var_thermal_on.get()) and inputs_enabled
         pause_on = on and bool(self.var_throttle_on.get())  # "Pause ab" nur, wenn beide Schalter an sind
         for group, state_on in (("_temp_fields", on), ("_throttle_fields", on), ("_pause_fields", pause_on)):
@@ -877,7 +879,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
     def _refresh_overview(self) -> None:
         self._ov_after_id = None
         src = self.var_src.get().strip()
-        if not src or self._is_running() or self._closing:
+        if not src or self._closing:
             return
         skip = self.var_skip_unlisted.get()
         key = overview_key(src, skip, self.var_bitrate.get())
@@ -970,8 +972,22 @@ class App(_Base):  # type: ignore[misc,valid-type]
         except Exception as e:  # noqa: BLE001
             messagebox.showwarning("XDROOT-Converter", str(e))
             return
+        fingerprint = ""
         if for_list:  # Liste: Duplikate/Überschneidungen vor den Rückfragen ablehnen
             conflict = self.jq.find_conflict(src, eff_dst, str(src_root))
+            if conflict:
+                messagebox.showwarning("XDROOT-Converter", conflict)
+                return
+            if self.jq.same_source_jobs(src, str(src_root)):
+                if not messagebox.askyesno(
+                        "XDROOT-Converter",
+                        f"Dieselbe Quelle steht schon in der Liste (Quelle „{src}“). Trotzdem hinzufügen?",
+                        default="no"):
+                    return
+                answers["duplicate_source"] = True
+            fingerprint = jobqueue.source_fingerprint(src)
+        else:  # direkter Start: nie auf oder in eine Quelle der Liste schreiben
+            conflict = self.jq.find_source_conflict(eff_dst, str(src_root))
             if conflict:
                 messagebox.showwarning("XDROOT-Converter", conflict)
                 return
@@ -999,7 +1015,8 @@ class App(_Base):  # type: ignore[misc,valid-type]
             temp_fan=temp_fan, temp_pause=temp_pause, thermal_throttle=throttle, threads=threads,
             auto_verify=bool(self.var_auto_verify.get()), auto_verify_deep=bool(self.var_verify_deep.get()),
         )
-        return jobqueue.Job(id=0, options=opts, answers=answers, settings_text=jobqueue.settings_text(opts))
+        return jobqueue.Job(id=0, options=opts, answers=answers, settings_text=jobqueue.settings_text(opts),
+                            fingerprint=fingerprint)
 
     def _begin_run_ui(self, mode: str) -> Optional[threading.Thread]:
         """Gemeinsamer Start eines Laufs in der Oberfläche (einzeln oder Liste): Übersichts-Analyse beenden, Eingaben
@@ -1010,7 +1027,8 @@ class App(_Base):  # type: ignore[misc,valid-type]
         self.cancel_token = tools.CancelToken()
         self._run_mode = mode
         self._ui_running = True
-        self._set_inputs(False)
+        self._user_cancel.clear()
+        # Eingaben bleiben bedienbar (nur Konvertieren/Alle konvertieren sind gesperrt, siehe _update_list_buttons)
         self.pb_clip["value"] = 0
         self.pb_total["value"] = 0
         self.var_clip_label.set("")
@@ -1047,15 +1065,41 @@ class App(_Base):  # type: ignore[misc,valid-type]
         self.worker.start()
 
     # ------------------------------------------------------------------ Auftragsliste
+    @staticmethod
+    def _est_key(opts) -> tuple:
+        return overview_key(opts.source, opts.unlisted == "skip", f"{opts.bitrate_mbps:g}")
+
     def _estimate_bytes(self, opts) -> Optional[int]:
-        """Geschätzte Zielgröße der Quelle (aus der Übersichts-Analyse; sonst eigene Analyse); None, wenn nicht ermittelbar."""
-        key = overview_key(opts.source, opts.unlisted == "skip", f"{opts.bitrate_mbps:g}")
-        if key in self._ov_est:
-            return self._ov_est[key]
+        """Schon vorliegende Schätzung der Zielgröße (aus einer früheren Analyse) oder None.  Analysiert nie selbst."""
+        return self._ov_est.get(self._est_key(opts))
+
+    def _analyze(self, opts) -> Optional[int]:
+        """Analyse der Quelle im Hintergrund-Thread: geschätzte Zielgröße oder None (Tests ersetzen diese Methode)."""
         try:
             return int(converter.overview(opts).est_target_bytes)
         except Exception:  # noqa: BLE001
             return None
+
+    def _request_estimate(self, job: "jobqueue.Job") -> None:
+        """Schätzung für einen ohne Schätzung aufgenommenen Auftrag im Hintergrund nachtragen (eine Analyse je Karte)."""
+        key = self._est_key(job.options)
+        waiting = self._est_pending.get(key)
+        if waiting is not None:
+            waiting.append(job.id)
+            return
+        self._est_pending[key] = [job.id]
+        opts = jobqueue.snapshot_options(job.options)
+
+        def work() -> None:
+            self.q.put(("est", key, self._analyze(opts)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_estimate(self, key: tuple, est: Optional[int]) -> None:
+        if est:
+            self._ov_est[key] = est
+        for job_id in self._est_pending.pop(key, []):
+            self.jq.set_estimate(job_id, est)
 
     def _add_to_list(self) -> None:
         if self._closing:
@@ -1064,13 +1108,16 @@ class App(_Base):  # type: ignore[misc,valid-type]
         if job is None:
             return
         est = self._estimate_bytes(job.options)
-        warn = self.jq.space_warning(job.target, est, converter.fmt_size)
+        warn = self.jq.space_warning(job.target, est, converter.fmt_size)  # ohne Schätzung entfällt die Warnung
         if warn and not messagebox.askyesno("XDROOT-Converter", warn, default="no"):
             return
-        new = self.jq.add(job.options, job.answers, est_bytes=est, text=job.settings_text)
+        new = self.jq.add(job.options, job.answers, est_bytes=est, text=job.settings_text,
+                          fingerprint=job.fingerprint)
+        if est is None:
+            self._request_estimate(new)
         self._refresh_job_list(select=new.id)
-        n = len(self.jq)
-        self.var_status.set(f"Zur Liste hinzugefügt ({n} Auftrag/Aufträge in der Liste).")
+        if not self._ui_running:  # im Lauf gehören Status und Balken dem laufenden Auftrag
+            self.var_status.set(f"Zur Liste hinzugefügt ({jobqueue.plural_jobs(len(self.jq))} in der Liste).")
 
     def _selected_job(self) -> Optional["jobqueue.Job"]:
         try:
@@ -1152,9 +1199,9 @@ class App(_Base):  # type: ignore[misc,valid-type]
         prev_ov = self._begin_run_ui("list")
         self._refresh_job_list()
         stamp = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-        self._append(f"──────── Neuer Listenlauf {stamp} ({n} Auftrag/Aufträge) ────────", "sep")
-        token = self.cancel_token
+        self._append(f"──────── Neuer Listenlauf {stamp} ({jobqueue.plural_jobs(n)}) ────────", "sep")
         jq, q = self.jq, self.q
+        user_cancel = self._user_cancel
         factory = self._converter_factory
 
         def log_keepawake(m: str) -> None:
@@ -1167,15 +1214,26 @@ class App(_Base):  # type: ignore[misc,valid-type]
                 with keepawake.keep_awake(log_keepawake):
                     if prev_ov is not None and prev_ov.is_alive():
                         prev_ov.join(timeout=60)
-                    while not token.cancelled:
+                    # Nur der Nutzer (Kennzeichen) beendet die Liste.  Jeder Auftrag hat sein eigenes, frisches Abbruch-Signal:
+                    # ein Abbruch, den ein Lauf selbst auslöst (Hitze), trifft nur diesen Auftrag.
+                    while not user_cancel.is_set():
                         claim = jq.claim_next()
                         if claim is None:
                             break
                         job = claim.job
                         q.put(("job_start", job.id, claim.n, claim.total))
+                        token = tools.CancelToken()
+                        self.cancel_token = token
+                        if user_cancel.is_set():  # Abbrechen kam zwischen Kennzeichen-Prüfung und Veröffentlichung des Tokens
+                            token.cancel()
                         try:
-                            summary = factory(job.options, QueueReporter(q), token).run()
-                            jq.finish(job, summary)
+                            changed = jobqueue.source_changed(job)
+                            if changed:
+                                jq.fail(job, changed)
+                                q.put(("log", "error", f"Auftrag {claim.n}: {changed}"))
+                            else:
+                                summary = factory(job.options, QueueReporter(q), token).run()
+                                jq.finish(job, summary, user_cancelled=user_cancel.is_set())
                         except Exception as e:  # noqa: BLE001  (Fehler dieses Auftrags, die Liste läuft weiter)
                             jq.fail(job, e)
                             q.put(("log", "error", f"Auftrag {claim.n}: Unerwarteter Fehler: {job.error}"))
@@ -1204,6 +1262,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
     def _on_list_finished(self) -> None:
         jobs = self.jq.run_jobs()
         waiting = len(self.jq.waiting())
+        cancelled = self._user_cancel.is_set()
         try:
             self.var_clip_label.set("")
             if jobs and all(j.status == jobqueue.ST_DONE for j in jobs):
@@ -1215,18 +1274,25 @@ class App(_Base):  # type: ignore[misc,valid-type]
             self._log_internal_error("list_finished", e)
         finally:
             self._run_mode = None
-            self._reset_buttons(jobqueue.batch_status(jobs, waiting))
+            self._reset_buttons(jobqueue.batch_status(jobs, waiting, cancelled))
             self._refresh_job_list()
         if not self._closing and jobs:
-            self.after(50, lambda: self._show_batch_result(jobs, waiting))
+            self.after(50, lambda: self._show_batch_result(jobs, waiting, cancelled))
 
-    def _show_batch_result(self, jobs: list, waiting: int) -> None:
-        kind, title, text = jobqueue.batch_message(jobs, waiting)
+    def _show_batch_result(self, jobs: list, waiting: int, cancelled: bool = False) -> None:
+        kind, title, text = jobqueue.batch_message(jobs, waiting, user_cancelled=cancelled)
         {"info": messagebox.showinfo, "warning": messagebox.showwarning}[kind](title, text)
 
+    def _request_cancel(self) -> None:
+        """Nutzer-Abbruch (Abbrechen, Schliessen): Kennzeichen setzen (beendet die Liste) und den laufenden Auftrag abbrechen."""
+        self._user_cancel.set()
+        tok = self.cancel_token
+        if tok is not None:
+            tok.cancel()
+
     def _cancel(self) -> None:
-        if self.cancel_token is not None and self._is_running():
-            self.cancel_token.cancel()
+        if self._is_running():
+            self._request_cancel()
             self.var_status.set("Breche ab … laufende Prozesse werden beendet.")
             self.btn_cancel.configure(state="disabled")
 
@@ -1277,6 +1343,8 @@ class App(_Base):  # type: ignore[misc,valid-type]
                 self.var_overview.set(text)
                 if not ok:
                     self._last_overview_key = None  # erneute Analyse erlauben (z. B. Karte nachträglich eingesteckt)
+        elif kind == "est":
+            self._on_estimate(item[1], item[2])
         elif kind == "job_start":
             self._on_job_start(item[1], item[2], item[3])
         elif kind == "job_done":
@@ -1390,8 +1458,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
                 return
             self._closing = True
             self._close_started = self._close_asked = time.monotonic()
-            if self.cancel_token is not None:
-                self.cancel_token.cancel()
+            self._request_cancel()
             self._cancel_overview()
             self._set_inputs(False)
             self._update_list_buttons()  # während des Schließens ist alles gesperrt

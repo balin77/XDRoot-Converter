@@ -103,14 +103,26 @@ Karten über Nacht. Die Liste erscheint erst, wenn sie Aufträge enthält.
   Felder wirken nur auf neue Aufträge.
 - Die Prüfungen und Rückfragen (z. B. „Fortsetzen?“) kommen schon beim Hinzufügen, nicht nachts; während des Listenlaufs gibt es
   keine Rückfrage. Abgelehnt werden ein Ziel, das schon in der Liste steht, und eine Quelle, die Ziel eines anderen Auftrags ist
-  (und umgekehrt). Reicht der freie Platz für die geschätzten Zielgrößen aller wartenden Aufträge auf einem Laufwerk nicht, gibt es
-  eine Warnung mit Rückfrage.
-- Jeder Auftrag ist ein normaler Lauf (Abschlussprüfung, Temperaturüberwachung, Protokolldatei im Zielordner). Ein Fehler oder
-  Abweichungen halten die Liste nicht an. **Abbrechen** beendet den laufenden Auftrag und den Listenlauf; die übrigen bleiben
-  „wartet“, ein späteres „Alle konvertieren“ nimmt den abgebrochenen Auftrag wieder auf. Erledigte Aufträge werden nicht erneut
-  gestartet und bleiben stehen, bis sie entfernt werden.
-- Der Rechner geht während des ganzen Listenlaufs nicht in den Energiesparmodus. Am Ende erscheint ein einziges Abschlussfenster
-  mit einer Ergebniszeile je Auftrag und den Summen.
+  (und umgekehrt); verglichen werden die aufgelösten Pfade (Kurznamen, Verknüpfungen und Langpfad-Schreibweise zählen als derselbe
+  Ordner). Auch „Konvertieren“ lehnt ein Ziel ab, das in oder auf einer Quelle der Liste liegt. Steht dieselbe Quelle schon in
+  der Liste, gibt es eine Rückfrage. Reicht der freie Platz für die geschätzten Zielgrößen aller wartenden, abgebrochenen und des
+  laufenden Auftrags auf einem Laufwerk nicht, gibt es eine Warnung mit Rückfrage (die Schätzung wird bei Bedarf im Hintergrund
+  nachgetragen; solange sie fehlt, entfällt die Warnung).
+- Kartenwechsel: Beim Hinzufügen wird ein Fingerabdruck der Quelle gespeichert (MEDIAPRO.XML sowie Namen und Größen der
+  Clip-Dateien; die Clips selbst werden nicht gelesen). Beim Start des Auftrags wird er verglichen. Hat sich die Quelle geändert
+  (andere Karte im selben Kartenleser, Karte entfernt), endet der Auftrag sofort mit „Fehler“, ohne etwas zu schreiben.
+- Jeder Auftrag ist ein normaler Lauf (Abschlussprüfung, Temperaturüberwachung, Protokolldatei im Zielordner). Ein Fehler,
+  Abweichungen oder ein Hitze-Abbruch halten die Liste nicht an; der nächste Auftrag startet. **Abbrechen** (oder Schließen des
+  Fensters) beendet den laufenden Auftrag und den Listenlauf; die übrigen bleiben „wartet“, ein späteres „Alle konvertieren“
+  nimmt den abgebrochenen Auftrag wieder auf. Aufträge mit „Fehler“ werden nicht automatisch wiederholt: zum Fortsetzen den
+  Auftrag entfernen und erneut hinzufügen (fertige Clips werden übersprungen). Erledigte Aufträge werden nicht erneut gestartet
+  und bleiben stehen, bis sie entfernt werden.
+- Während eines Laufs bleiben Quelle, Ziel, „Durchsuchen“ und die Einstellungen bedienbar; sie wirken nur auf neue Aufträge, der
+  laufende Auftrag arbeitet mit seiner Momentaufnahme. Gesperrt sind nur „Konvertieren“ und „Alle konvertieren“; „Zur Liste
+  hinzufügen“ ist weiter möglich (der Auftrag wird am Ende mit abgearbeitet).
+- Der Rechner geht während des ganzen Listenlaufs nicht in den Energiesparmodus (die Zeile steht auch in der Protokolldatei jedes
+  Auftrags). Am Ende erscheint ein einziges Abschlussfenster mit einer Ergebniszeile je Auftrag und den Summen (auch nach einem
+  Abbruch, sofern mindestens ein Auftrag gelaufen ist).
 - Grenzen: Die Liste wird nicht gespeichert (nach dem Schließen des Programms ist sie leer; ein unterbrochener Auftrag lässt sich
   durch erneutes Hinzufügen fortsetzen). Es läuft immer nur ein Auftrag gleichzeitig. Die Kommandozeile kennt keine Liste.
   Schließen während des Listenlaufs verhält sich wie beim Einzellauf (Rückfrage, dann Abbruch).

@@ -1082,6 +1082,9 @@ class Converter:
         guard = contextlib.nullcontext() if self.o.max_frames else keepawake.keep_awake(self._keepawake_msgs.append)
         try:
             with guard:
+                if not self.o.max_frames and not self._keepawake_msgs and keepawake.is_active():
+                    # verschachtelt (Listenlauf der GUI hält den Zustand schon): Zeile trotzdem ins Protokoll dieses Laufs
+                    self._keepawake_msgs.append(keepawake.MSG_ACTIVE)
                 return self._run()
         finally:
             self._thermal_stop()

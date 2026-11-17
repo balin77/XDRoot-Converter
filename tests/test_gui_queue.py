@@ -32,9 +32,14 @@ class FakeFactory:
         self.gate = threading.Event()
         self.gate.set()
         self.opts_seen = []
+        self.tokens = []
+        self.after_job = None  # Rückruf nach jedem Auftrag (Name) - z. B. Nutzer-Abbruch zwischen zwei Aufträgen
 
     def __call__(self, opts, reporter=None, cancel=None):
         fac = self
+        fac.tokens.append(cancel)
+        if self.behaviors.get(Path(opts.source).name) == "ctor_raise":
+            raise RuntimeError("Konstruktor kaputt")
 
         class Conv:
             def run(self_inner):
@@ -44,6 +49,13 @@ class FakeFactory:
                 beh = fac.behaviors.get(name, "ok")
                 if beh == "raise":
                     raise RuntimeError("Attrappe kaputt")
+                if beh in ("thermal", "selfcancel"):  # wie Converter._thermal_abort: bricht den EIGENEN Token ab
+                    cancel.cancel()
+                    s = converter.RunSummary()
+                    s.cancelled = True
+                    if beh == "thermal":
+                        s.abort_reason = "CPU kühlt nicht ab."
+                    return s
                 if beh == "fatal":
                     s = converter.RunSummary()
                     s.fatal = "Platte voll"
@@ -58,6 +70,8 @@ class FakeFactory:
                     return s
                 fac.started.set()
                 fac.gate.wait(10)
+                if fac.after_job:
+                    fac.after_job(name)
                 return _ok_summary(name)
 
         return Conv()
@@ -74,7 +88,7 @@ class GuiQueueBase(unittest.TestCase):
         self.addCleanup(self._cleanup, orig)
         app.attributes("-alpha", 0.0)
         app._refresh_overview = lambda: None  # keine Übersichts-Analyse (kein ffprobe)
-        app._estimate_bytes = lambda opts: 1000
+        app._analyze = lambda opts: 1000  # Schätzung im Hintergrund (keine echte Analyse)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
@@ -114,11 +128,14 @@ class GuiQueueBase(unittest.TestCase):
         (d / "MEDIAPRO.XML").write_text("x")
         return str(d)
 
-    def add(self, name, dst=None, bitrate="50"):
+    def add(self, name, dst=None, bitrate="50", est=None):
         a = self.app
-        a.var_src.set(self.card(name))
+        src = self.card(name)
+        a.var_src.set(src)
         a.var_dst.set(dst or str(self.root / "dst" / name))
         a.var_bitrate.set(bitrate)
+        if est is not None:  # Schätzung liegt schon vor (sonst wird sie im Hintergrund nachgetragen)
+            a._ov_est[gui.overview_key(src, False, bitrate)] = est
         a._add_to_list()
 
     def pump(self, cond, timeout=10.0):
@@ -190,7 +207,7 @@ class ListHandlingTests(GuiQueueBase):
         row = a.tree.item(str(j1.id), "values")
         self.assertEqual(row[3], jq.ST_WAIT)
         self.assertIn("42 Mbit/s, slow", row[2])
-        self.assertEqual(j1.est_bytes, 1000)
+        self.assertTrue(self.pump(lambda: j1.est_bytes == 1000 and j2.est_bytes == 1000))  # im Hintergrund nachgetragen
 
     def test_ungueltige_eingaben_fuegen_nichts_hinzu(self):
         a = self.app
@@ -234,15 +251,15 @@ class ListHandlingTests(GuiQueueBase):
 
     def test_platzwarnung_mit_rueckfrage(self):
         a = self.app
-        self.add("A")
+        self.add("A", est=1000)
         with mock.patch.object(jq, "free_bytes", lambda p: 500):
             self.mb["askyesno"].return_value = False
-            self.add("B")
+            self.add("B", est=1000)
             self.assertEqual(len(a.jq), 1)  # abgelehnt
             self.assertEqual(self.mb["askyesno"].call_count, 1)
             self.assertIn("geschätzte Zielgröße", self.mb["askyesno"].call_args.args[1])
             self.mb["askyesno"].return_value = True
-            self.add("B")
+            self.add("B", est=1000)
             self.assertEqual(len(a.jq), 2)  # trotzdem hinzugefügt (kein hartes Verbot)
 
     def test_rueckfrage_antwort_wird_gespeichert(self):
@@ -330,6 +347,13 @@ class ListRunTests(GuiQueueBase):
         self.assertEqual(self.state(a.btn_start), "disabled")
         self.assertEqual(self.state(a.btn_runall), "disabled")
         self.assertEqual(self.state(a.btn_add), "normal")
+        # Quelle, Ziel, Durchsuchen und Einstellungen bleiben im Lauf bedienbar (echte Widget-Zustände, nicht nur StringVars)
+        locked = [str(w.cget("state")) for w, _normal in a._locked_widgets]
+        self.assertTrue(locked)
+        self.assertNotIn("disabled", locked)
+        self.assertEqual(self.state(a._temp_fields[0]), "normal")
+        self.assertEqual(self.state(a._throttle_fields[0]), "normal")
+        self.assertEqual(self.state(a._verify_fields[0]), "normal")
         self.assertEqual(self.state(a.btn_cancel), "normal")
         self.assertTrue(a.frm_list.winfo_ismapped())
         self.assertTrue(self.pump(lambda: a.var_status.get() == "Läuft … Auftrag 1 von 2"), a.var_status.get())
@@ -392,6 +416,156 @@ class ListRunTests(GuiQueueBase):
         self.run_list_to_end()
         o = self.factory.opts_seen[0]
         self.assertEqual((o.bitrate_mbps, o.preset), (45.0, "slow"))
+
+
+class ListRunRobustnessTests(GuiQueueBase):
+    def test_hitze_abbruch_beendet_nur_den_auftrag(self):
+        a = self.app
+        for n in ("A", "B", "C"):
+            self.add(n)
+        self.factory.behaviors = {"A": "thermal"}
+        self.run_list_to_end()
+        self.assertEqual([e[1] for e in self.factory.events], ["A", "B", "C"])
+        self.assertEqual(self.statuses(), [jq.ST_ERROR, jq.ST_DONE, jq.ST_DONE])
+        t = self.factory.tokens
+        self.assertEqual(len(set(map(id, t))), 3)  # je Auftrag ein eigener, frischer Token
+        self.assertTrue(t[0].cancelled)
+        self.assertFalse(t[1].cancelled or t[2].cancelled)
+        self.assertEqual(self.dialogs(), 1)
+        self.assertIn("mit Problemen", self.mb["showwarning"].call_args.args[0])
+
+    def test_anderer_selbst_ausgeloester_abbruch_ist_fehler(self):
+        a = self.app
+        for n in ("A", "B"):
+            self.add(n)
+        self.factory.behaviors = {"A": "selfcancel"}
+        self.run_list_to_end()
+        self.assertEqual(self.statuses(), [jq.ST_ERROR, jq.ST_DONE])
+
+    def test_abbruch_vor_dem_ersten_auftrag(self):
+        a = self.app
+        for n in ("A", "B", "C"):
+            self.add(n)
+
+        @contextmanager
+        def spy(log=None):
+            a._request_cancel()  # Nutzer bricht ab, bevor der erste Auftrag beginnt
+            yield True
+
+        with mock.patch.object(gui.keepawake, "keep_awake", spy):
+            self.run_list_to_end()
+        self.assertEqual(self.factory.events, [])
+        self.assertEqual(self.statuses(), [jq.ST_WAIT] * 3)
+        self.assertIn("Listenlauf abgebrochen", a.var_status.get())
+        self.assertIn("3 Aufträge nicht gestartet", a.var_status.get())
+        self.assertEqual(self.dialogs(), 0)  # kein Auftrag gelaufen: kein Abschlussfenster
+        self.assertEqual(self.state(a.btn_runall), "normal")
+
+    def test_abbruch_zwischen_zwei_auftraegen(self):
+        a = self.app
+        for n in ("A", "B", "C"):
+            self.add(n)
+        self.factory.after_job = lambda name: a._request_cancel() if name == "A" else None
+        self.run_list_to_end()
+        self.assertEqual([e[1] for e in self.factory.events], ["A"])
+        self.assertEqual(self.statuses(), [jq.ST_DONE, jq.ST_WAIT, jq.ST_WAIT])
+        self.assertIn("Listenlauf abgebrochen", a.var_status.get())
+        self.assertEqual(self.dialogs(), 1)
+        title, text = self.mb["showwarning"].call_args.args
+        self.assertEqual(title, "Listenlauf abgebrochen")
+        self.assertIn("Nicht gestartet: 2 Aufträge warten noch", text)
+        self.mb["showinfo"].assert_not_called()
+
+    def test_schliessen_im_listenlauf(self):
+        a = self.app
+        self.add("A")
+        self.add("B")
+        self.factory.behaviors = {"A": "block"}
+        a._start_list()
+        self.assertTrue(self.pump(lambda: ("job", "A") in self.factory.events))
+        a._on_close()  # askyesno -> True: abbrechen und beenden
+        self.assertTrue(a._closing)
+        t0 = time.time()
+        while not a._destroyed and time.time() - t0 < 10:
+            a.update()
+            time.sleep(0.01)
+        self.assertTrue(a._destroyed)
+        self.assertEqual([e[1] for e in self.factory.events], ["A"])  # B wurde nicht mehr gestartet
+        self.assertEqual(self.dialogs(), 0)
+        self.assertEqual(self.statuses()[1], jq.ST_WAIT)
+
+    def test_ausnahme_im_converter_konstruktor(self):
+        a = self.app
+        for n in ("A", "B", "C"):
+            self.add(n)
+        self.factory.behaviors = {"B": "ctor_raise"}
+        self.run_list_to_end()
+        self.assertEqual([e[1] for e in self.factory.events], ["A", "C"])
+        self.assertEqual(self.statuses(), [jq.ST_DONE, jq.ST_ERROR, jq.ST_DONE])
+        self.assertIn("Konstruktor kaputt", a.jq.jobs()[1].error)
+        self.assertEqual(self.dialogs(), 1)
+
+    def test_doppelte_quelle_rueckfrage(self):
+        a = self.app
+        self.add("A", dst=str(self.root / "dst" / "A1"))
+        self.mb["askyesno"].return_value = False
+        self.add("A", dst=str(self.root / "dst" / "A2"))
+        self.assertEqual(len(a.jq), 1)
+        self.assertIn("Dieselbe Quelle steht schon in der Liste", self.mb["askyesno"].call_args.args[1])
+        self.mb["askyesno"].return_value = True
+        self.add("A", dst=str(self.root / "dst" / "A2"))
+        self.assertEqual(len(a.jq), 2)
+        self.assertEqual(a.jq.jobs()[1].answers.get("duplicate_source"), True)
+
+    def test_geaenderte_quelle_wird_nicht_gestartet(self):
+        a = self.app
+        self.add("A")
+        self.add("B")
+        # andere Karte im Kartenleser: Clip-Liste der Quelle A ändert sich
+        (Path(self.card("A")) / "Clip" / "NEU.MXF").write_bytes(b"anderer Inhalt")
+        self.run_list_to_end()
+        self.assertEqual([e[1] for e in self.factory.events], ["B"])  # A wurde nicht gestartet
+        self.assertEqual(self.statuses(), [jq.ST_ERROR, jq.ST_DONE])
+        self.assertIn("Die Quelle hat sich seit dem Hinzufügen geändert", a.jq.jobs()[0].error)
+        self.assertIn("geändert", self.mb["showwarning"].call_args.args[1])
+
+    def test_direkter_start_lehnt_ziel_in_quelle_der_liste_ab(self):
+        a = self.app
+        self.add("A")
+        a.var_src.set(self.card("C"))
+        a.var_dst.set(str(Path(self.card("A")) / "ausgabe"))
+        a._start()
+        self.assertEqual(self.factory.events, [])
+        self.assertFalse(a._ui_running)
+        self.assertIn("Quelle eines Auftrags", self.mb["showwarning"].call_args.args[1])
+
+    def test_schaetzung_im_hintergrund_ohne_doppelte_analyse(self):
+        a = self.app
+        calls = []
+        gate = threading.Event()
+
+        def slow(opts):
+            calls.append(opts.source)
+            gate.wait(10)
+            return 1234
+
+        a._analyze = slow
+        src = self.card("A")
+        a.var_src.set(src)
+        a.var_dst.set(str(self.root / "dst" / "A1"))
+        t0 = time.time()
+        a._add_to_list()
+        self.assertLess(time.time() - t0, 2.0)  # blockiert die Oberfläche nicht
+        j1 = a.jq.jobs()[0]
+        self.assertIsNone(j1.est_bytes)
+        self.mb["askyesno"].return_value = True  # dieselbe Quelle: Rückfrage bestätigen
+        a.var_dst.set(str(self.root / "dst" / "A2"))
+        a._add_to_list()
+        j2 = a.jq.jobs()[1]
+        self.assertEqual(len(a.jq), 2)
+        gate.set()
+        self.assertTrue(self.pump(lambda: j1.est_bytes == 1234 and j2.est_bytes == 1234))
+        self.assertEqual(len(calls), 1)  # nur EINE Analyse für dieselbe Karte
 
 
 class ListLayoutTests(GuiQueueBase):

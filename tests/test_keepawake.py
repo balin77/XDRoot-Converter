@@ -141,5 +141,17 @@ class RealWindowsTest(unittest.TestCase):
         self.assertEqual(keepawake._set_thread_execution_state(CONT) & SYS, 0)
 
 
+class IsActiveTests(unittest.TestCase):
+    def test_is_active_nested_and_released(self):
+        with mock.patch.object(keepawake, "_set_thread_execution_state", return_value=1),                 mock.patch.object(keepawake.sys, "platform", "win32"):
+            self.assertFalse(keepawake.is_active())
+            with keepawake.keep_awake():
+                self.assertTrue(keepawake.is_active())
+                with keepawake.keep_awake() as inner:  # verschachtelt (Listenlauf + Converter.run)
+                    self.assertTrue(inner)
+                    self.assertTrue(keepawake.is_active())
+            self.assertFalse(keepawake.is_active())
+
+
 if __name__ == "__main__":
     unittest.main()

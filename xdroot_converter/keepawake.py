@@ -38,6 +38,11 @@ def _set_thread_execution_state(flags: int) -> int:
     return int(fn(ctypes.c_uint32(flags)))
 
 
+def is_active() -> bool:
+    """Hält dieser Thread die Anforderung gerade (aeusserer Eintritt aktiv)?"""
+    return bool(getattr(_local, "depth", 0) > 0 and getattr(_local, "active", False))
+
+
 def _say(log: Optional[Callable[[str], None]], msg: str) -> None:
     if log is not None:
         try:
@@ -70,10 +75,12 @@ def keep_awake(log: Optional[Callable[[str], None]] = None) -> Iterator[bool]:
         except Exception as e:  # noqa: BLE001
             _say(log, MSG_FAILED.format(why=f"{type(e).__name__}: {e}"))
     _local.depth = 1
+    _local.active = active
     try:
         yield active
     finally:
         _local.depth = 0
+        _local.active = False
         if active:
             try:
                 _set_thread_execution_state(ES_CONTINUOUS)

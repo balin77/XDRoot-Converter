@@ -3,6 +3,7 @@
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 from xdroot_converter import converter, jobqueue as jq
 
@@ -131,6 +132,14 @@ class SpaceTests(unittest.TestCase):
         done.status = jq.ST_DONE  # erledigt: zählt nicht
         key, need = jq.space_needed(q.jobs(), "D:/z4", 300, self.drive)
         self.assertEqual((key, need), ("D", 700))
+
+    def test_abgebrochene_und_laufende_zaehlen_mit(self):
+        q = jq.JobQueue()
+        a = q.add(_opts("A", "D:/z1"), est_bytes=100)
+        b = q.add(_opts("B", "D:/z2"), est_bytes=200)
+        c = q.add(_opts("C", "D:/z3"), est_bytes=400)
+        a.status, b.status = jq.ST_CANCELLED, jq.ST_RUN
+        self.assertEqual(jq.space_needed(q.jobs(), "D:/z4", 1000, self.drive), ("D", 1700))
 
     def test_warnung(self):
         q = jq.JobQueue()
@@ -311,13 +320,213 @@ class BatchTests(unittest.TestCase):
         self.assertIn("Nicht gestartet: 1", text)
         self.assertIn("Alle konvertieren", text)
         self.assertIn("abgebrochen", jq.batch_status(q.run_jobs(), waiting))
-        self.assertIn("1 warten noch", jq.batch_status(q.run_jobs(), waiting))
+        self.assertIn("1 Auftrag nicht gestartet", jq.batch_status(q.run_jobs(), waiting))
 
     def test_status_text(self):
         q = jq.JobQueue()
         q.add(_opts())
         self._done(q, ["ok"])
-        self.assertEqual(jq.batch_status(q.run_jobs()), "Liste fertig: 1 Auftrag/Aufträge.")
+        self.assertEqual(jq.batch_status(q.run_jobs()), "Liste fertig: 1 Auftrag.")
+
+
+class TextTests(unittest.TestCase):
+    def test_einzahl_mehrzahl(self):
+        self.assertEqual(jq.plural_jobs(1), "1 Auftrag")
+        self.assertEqual(jq.plural_jobs(0), "0 Aufträge")
+        self.assertEqual(jq.plural_jobs(3), "3 Aufträge")
+
+    def test_abbruch_vor_dem_ersten_auftrag(self):
+        st = jq.batch_status([], 3, user_cancelled=True)
+        self.assertIn("Listenlauf abgebrochen", st)
+        self.assertIn("3 Aufträge nicht gestartet", st)
+        self.assertNotIn("fertig", st)
+        self.assertIn("1 Auftrag nicht gestartet", jq.batch_status([], 1, user_cancelled=True))
+
+    def test_abbruch_zwischen_zwei_auftraegen(self):
+        q = jq.JobQueue()
+        for i in range(3):
+            q.add(_opts(f"Q{i}", f"Z{i}"))
+        q.begin_run()
+        q.finish(q.claim_next().job, _summary())  # Q0 fertig, danach Nutzerabbruch ohne weiteren Auftrag
+        jobs, waiting = q.run_jobs(), len(q.waiting())
+        kind, title, text = jq.batch_message(jobs, waiting, user_cancelled=True)
+        self.assertEqual((kind, title), ("warning", "Listenlauf abgebrochen"))
+        self.assertIn("Nicht gestartet: 2 Aufträge warten noch", text)
+        self.assertNotIn("Empfehlung", text)
+        self.assertIn("Listenlauf abgebrochen", jq.batch_status(jobs, waiting, user_cancelled=True))
+        self.assertIn("1 Auftrag bearbeitet", text)
+        self.assertIn("Nicht gestartet: 1 Auftrag wartet noch", jq.batch_message(jobs, 1, user_cancelled=True)[2])
+
+    def test_hinweis_bei_fehler(self):
+        q = jq.JobQueue()
+        q.add(_opts())
+        q.begin_run()
+        q.finish(q.claim_next().job, _summary(fatal="x"))
+        text = jq.batch_message(q.run_jobs())[2]
+        self.assertIn("nicht automatisch wiederholt", text)
+        self.assertIn("entfernen und erneut hinzufügen", text)
+
+    def test_eigener_abbruch_ist_fehler_nicht_abgebrochen(self):
+        self.assertEqual(jq.classify(_summary(cancelled=True), user_cancelled=False), jq.ST_ERROR)
+        self.assertEqual(jq.classify(_summary(cancelled=True), user_cancelled=True), jq.ST_CANCELLED)
+
+
+def _make_card(root, name, clip_bytes=b"x"):
+    d = os.path.join(root, name)
+    os.makedirs(os.path.join(d, "Clip"), exist_ok=True)
+    with open(os.path.join(d, "MEDIAPRO.XML"), "wb") as f:
+        f.write(b"<x/>")
+    with open(os.path.join(d, "Clip", "C0001.MXF"), "wb") as f:
+        f.write(clip_bytes)
+    return d
+
+
+class FingerprintTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_stabil_und_aenderung(self):
+        d = _make_card(self.tmp.name, "K")
+        fp = jq.source_fingerprint(d)
+        self.assertTrue(fp)
+        self.assertEqual(jq.source_fingerprint(d), fp)
+        with open(os.path.join(d, "Clip", "C0002.MXF"), "wb") as f:
+            f.write(b"y")  # zusätzlicher Clip
+        self.assertNotEqual(jq.source_fingerprint(d), fp)
+        fp2 = jq.source_fingerprint(d)
+        with open(os.path.join(d, "Clip", "C0002.MXF"), "wb") as f:
+            f.write(b"yy")  # andere Größe
+        self.assertNotEqual(jq.source_fingerprint(d), fp2)
+        fp3 = jq.source_fingerprint(d)
+        with open(os.path.join(d, "MEDIAPRO.XML"), "wb") as f:
+            f.write(b"<y/>")  # andere MEDIAPRO.XML
+        self.assertNotEqual(jq.source_fingerprint(d), fp3)
+
+    def test_liest_keine_clips(self):
+        d = _make_card(self.tmp.name, "K")
+        real_open = open
+        seen = []
+
+        def spy(file, *a, **k):
+            seen.append(str(file))
+            return real_open(file, *a, **k)
+
+        from unittest import mock
+        with mock.patch("builtins.open", spy), mock.patch.object(type(__import__("pathlib").Path()), "read_bytes",
+                                                                 lambda self_: seen.append(str(self_)) or b"<x/>"):
+            jq.source_fingerprint(d)
+        self.assertFalse([x for x in seen if x.upper().endswith(".MXF")], seen)
+
+    def test_source_changed(self):
+        d = _make_card(self.tmp.name, "K")
+        q = jq.JobQueue()
+        j = q.add(_opts(d, "Z"), fingerprint=jq.source_fingerprint(d))
+        self.assertEqual(jq.source_changed(j), "")
+        _make_card(self.tmp.name, "K", clip_bytes=b"anderer Inhalt laenger")
+        self.assertIn("Die Quelle hat sich seit dem Hinzufügen geändert", jq.source_changed(j))
+        j2 = q.add(_opts(d, "Z2"))  # ohne Fingerabdruck keine Prüfung
+        self.assertEqual(jq.source_changed(j2), "")
+        j.fingerprint = jq.source_fingerprint(d)
+        import shutil
+        shutil.rmtree(d)  # Karte entfernt
+        self.assertTrue(jq.source_changed(j))
+
+    def test_fail_mit_text(self):
+        q = jq.JobQueue()
+        j = q.add(_opts())
+        q.begin_run()
+        q.claim_next()
+        q.fail(j, jq.SOURCE_CHANGED_MSG)
+        self.assertEqual(j.status, jq.ST_ERROR)
+        self.assertTrue(j.result_line().startswith("Ergebnis: Fehler – Die Quelle hat sich"))
+
+
+class SameSourceAndDirectTests(unittest.TestCase):
+    def test_gleiche_quelle(self):
+        q = jq.JobQueue()
+        a = q.add(_opts("QA", "ZA"))
+        self.assertEqual(q.same_source_jobs("QA"), [a])
+        self.assertEqual(q.same_source_jobs("QB"), [])
+        a.status = jq.ST_DONE
+        self.assertEqual(q.same_source_jobs("QA"), [])  # nur wartende/abgebrochene
+
+    def test_direkter_start_gegen_quellen_der_liste(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "karte")
+            os.makedirs(src)
+            q = jq.JobQueue()
+            q.add(_opts(src, os.path.join(d, "ziel")))
+            self.assertIn("Quelle eines Auftrags", q.find_source_conflict(os.path.join(src, "unter")))
+            self.assertIn("Quelle eines Auftrags", q.find_source_conflict(src))
+            self.assertEqual(q.find_source_conflict(os.path.join(d, "anders")), "")
+
+
+class ResolvedPathTests(unittest.TestCase):
+    def setUp(self):
+        self.out = Path(__file__).resolve().parent.parent / "_test_out" / "lokal"
+        self.out.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.mkdtemp(dir=str(self.out))
+        self.addCleanup(self._cleanup)
+        self.links = []
+
+    def _cleanup(self):
+        import shutil
+        for lk in self.links:
+            try:
+                os.rmdir(lk)  # entfernt nur die Verknüpfung, nicht ihr Ziel
+            except OSError:
+                pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_junction_in_der_quellkarte(self):
+        if os.name != "nt":
+            self.skipTest("nur Windows")
+        import subprocess
+        src = os.path.join(self.tmp, "quellkarte")
+        os.makedirs(src)
+        link = os.path.join(self.tmp, "verknuepfung")
+        r = subprocess.run(["cmd", "/c", "mklink", "/J", link, src], capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.isdir(link):
+            self.skipTest("Junction nicht erzeugbar: " + r.stdout + r.stderr)
+        self.links.append(link)
+        q = jq.JobQueue()
+        q.add(_opts(src, os.path.join(self.tmp, "ziel1")))
+        # Ziel eines neuen Auftrags liegt über die Junction IN der Quellkarte des ersten
+        self.assertTrue(q.find_conflict("anderequelle", os.path.join(link, "ziel2")))
+        self.assertTrue(q.find_source_conflict(os.path.join(link, "ziel2")))
+        self.assertTrue(jq.paths_related(link, src))
+
+    def test_kurzname_8_3(self):
+        if os.name != "nt":
+            self.skipTest("nur Windows")
+        import ctypes
+        long_dir = os.path.join(self.tmp, "ein sehr langer Ordnername fuer den Test")
+        os.makedirs(long_dir)
+        buf = ctypes.create_unicode_buffer(520)
+        n = ctypes.windll.kernel32.GetShortPathNameW(long_dir, buf, 520)
+        short = buf.value if n else ""
+        if not short or short.lower() == long_dir.lower():
+            self.skipTest("Kurznamen (8.3) auf diesem Laufwerk nicht verfügbar")
+        self.assertEqual(jq.norm_path(short), jq.norm_path(long_dir))
+        q = jq.JobQueue()
+        q.add(_opts("Q", long_dir))
+        self.assertIn("steht schon in der Liste", q.find_conflict("X", short))
+
+    def test_langpfad_praefix(self):
+        if os.name != "nt":
+            self.skipTest("nur Windows")
+        d = os.path.join(self.tmp, "praefix")
+        os.makedirs(d)
+        self.assertEqual(jq.norm_path("\\\\?\\" + d), jq.norm_path(d))
+        q = jq.JobQueue()
+        q.add(_opts("Q", d))
+        self.assertTrue(q.find_conflict("X", "\\\\?\\" + d))
+
+    def test_ruckfall_bei_fehler(self):
+        from unittest import mock
+        with mock.patch.object(Path, "resolve", side_effect=OSError("kaputt")):
+            self.assertEqual(jq.norm_path("a"), os.path.normcase(os.path.abspath("a")))
 
 
 if __name__ == "__main__":

@@ -674,6 +674,40 @@ ohne dass zwischendurch jemand am Rechner sitzen muss. Nur Oberfläche; die Komm
    Schliessen des Fensters während eines Listenlaufs verhält sich wie beim Einzellauf (Rückfrage, dann Abbruch).
 10. **Quellen bleiben unberührt:** wie bei jedem Lauf wird aus den Quellen nur gelesen.
 
+**Ergänzungen nach dem ersten Review (verbindlich):**
+
+- **Abbruch-Signal je Auftrag:** Jeder Auftrag bekommt ein eigenes, frisches Abbruch-Signal (`CancelToken`). Nur der Nutzer
+  („Abbrechen“, Schliessen des Fensters) beendet den Listenlauf – über ein eigenes Kennzeichen, das die Schleife prüft. Ein
+  Hitze-Abbruch oder jeder andere Abbruch, den ein Lauf selbst auslöst, beendet nur diesen Auftrag (Status „Fehler“); der
+  nächste startet.
+- **Pfadvergleich über aufgelöste Pfade:** Alle Vergleiche von Quellen und Zielen (zwischen Aufträgen und gegen die Felder)
+  arbeiten auf vollständig aufgelösten Pfaden (`Path.resolve()`, mit Rückfall auf `abspath`, wenn das scheitert), damit
+  Kurznamen (8.3), Verknüpfungen/Junctions und `\\?\`-Schreibweisen denselben Ordner als denselben erkennen. Auch der
+  direkte Start („Konvertieren“) lehnt ein Ziel ab, das in oder auf einer Quelle eines Auftrags der Liste liegt.
+- **Quelle ist noch dieselbe Karte:** Beim Hinzufügen wird ein Fingerabdruck der Quelle gespeichert (Hash von
+  `MEDIAPRO.XML`, falls vorhanden, sowie Namen und Grössen der Clip-Dateien; nur lesend, ohne die Clips zu lesen). Beim
+  Start des Auftrags wird er neu gebildet; weicht er ab (andere Karte im selben Kartenleser, Karte entfernt), endet der
+  Auftrag sofort als „Fehler“ mit der Meldung „Die Quelle hat sich seit dem Hinzufügen geändert“, ohne etwas zu schreiben.
+  Steht dieselbe Quelle schon in einem wartenden Auftrag, gibt es beim Hinzufügen eine Rückfrage („Dieselbe Quelle steht
+  schon in der Liste … trotzdem hinzufügen?“).
+- **Hinzufügen während eines Laufs muss wirklich möglich sein:** Quelle, Ziel, „Durchsuchen“ und die Einstellungen bleiben
+  während eines Laufs bedienbar (sie wirken nur auf neue Aufträge; der laufende Auftrag arbeitet mit seiner Momentaufnahme
+  bzw. der Einzellauf mit den beim Start gelesenen Werten). Gesperrt sind während eines Laufs nur „Konvertieren“ und „Alle
+  konvertieren“. Die Übersichtszeile („Kamera: …“) darf dabei die Karte aus dem Feld zeigen; Status und Balken gehören
+  weiter dem laufenden Auftrag.
+- **Kein Einfrieren beim Hinzufügen:** Liegt die geschätzte Zielgrösse noch nicht vor, wird der Auftrag ohne Schätzung
+  aufgenommen und die Schätzung im Hintergrund nachgetragen (keine Analyse im Oberflächen-Thread, keine doppelte Analyse
+  derselben Karte). Für diesen Auftrag entfällt dann die Platzwarnung beim Hinzufügen.
+- **Platzbedarf:** In die Summe je Laufwerk gehen wartende **und abgebrochene** Aufträge ein sowie der laufende Auftrag.
+- **Texte nach Abbruch:** Wird vor dem ersten oder zwischen zwei Aufträgen abgebrochen, sagen Statuszeile und Abschlussfenster
+  „Listenlauf abgebrochen“ (nicht „fertig“) und nennen die nicht gestarteten Aufträge; es gibt auch dann genau ein
+  Abschlussfenster, sofern mindestens ein Auftrag gelaufen ist. Einzahl/Mehrzahl werden ausgeschrieben („1 Auftrag“,
+  „3 Aufträge“).
+- **Hinweis bei „Fehler“:** Das Abschlussfenster nennt bei Aufträgen mit „Fehler“, dass sie nicht automatisch wiederholt
+  werden und zum Fortsetzen entfernt und erneut hinzugefügt werden (fertige Clips werden übersprungen).
+- **Protokolldatei:** Die Zeile „Energiesparmodus wird … verhindert“ steht im Listenlauf auch in der Protokolldatei jedes
+  Auftrags.
+
 ### Abschlussprüfung mit automatischer Wiederholung (Runde 4, Spezifikation)
 
 Anlass: Beim lokalen Test schlug ein Clip wegen eines Lesehängers fehl und musste von Hand per Fortsetzungslauf nachgeholt
