@@ -47,7 +47,9 @@ def norm_path(p: str) -> str:
     Langpfad-Präfix), bei einem Fehler Rückfall auf ``abspath``; Groß-/Kleinschreibung wie das Betriebssystem."""
     raw = _strip_long_prefix(str(p).strip())
     try:
-        return os.path.normcase(_strip_long_prefix(str(Path(raw).resolve())))
+        # abspath zuerst: es entfernt nachgestellte Punkte/Leerzeichen (Windows legt „ziel.“ als „ziel“ an), die resolve()
+        # bei nicht existierenden Pfaden stehen lässt
+        return os.path.normcase(_strip_long_prefix(str(Path(os.path.abspath(raw)).resolve())))
     except (OSError, RuntimeError, ValueError):
         return os.path.normcase(os.path.abspath(raw))
 
@@ -175,21 +177,23 @@ def classify(summary, user_cancelled: bool = True) -> str:
     return ST_DONE
 
 
-def find_conflict(jobs: list, source: str, target: str, source_root: Optional[str] = None) -> str:
+def find_conflict(jobs: list, source: str, target: str, source_root: Optional[str] = None,
+                  labels: Optional[list] = None) -> str:
     """Deutsche Meldung, wenn Quelle/Ziel eines neuen Auftrags mit der Liste kollidieren, sonst ''.
 
     Abgelehnt: Ziel steht schon in der Liste (auch ineinander verschachtelt), Quelle ist Ziel eines anderen Auftrags und
     umgekehrt.  Dieselbe Quelle mit verschiedenen Zielen ist erlaubt."""
     srcs = [s for s in (source, source_root) if s]
     for n, j in enumerate(jobs, 1):
+        lab = labels[n - 1] if labels else f"Auftrag {n}"
         if paths_related(target, j.target):
-            return (f"Das Ziel „{target}“ steht schon in der Liste (Auftrag {n}: Ziel „{j.target}“). "
+            return (f"Das Ziel „{target}“ steht schon in der Liste ({lab}: Ziel „{j.target}“). "
                     "Zwei Aufträge dürfen nicht in denselben Ordner schreiben.")
         if any(paths_related(s, j.target) for s in srcs):
-            return (f"Die Quelle „{source}“ ist Ziel eines anderen Auftrags (Auftrag {n}: Ziel „{j.target}“). "
+            return (f"Die Quelle „{source}“ ist Ziel eines anderen Auftrags ({lab}: Ziel „{j.target}“). "
                     "Quellen werden nur gelesen, nie beschrieben.")
         if any(paths_related(target, s) for s in (j.source,)):
-            return (f"Das Ziel „{target}“ ist Quelle eines anderen Auftrags (Auftrag {n}: Quelle „{j.source}“). "
+            return (f"Das Ziel „{target}“ ist Quelle eines anderen Auftrags ({lab}: Quelle „{j.source}“). "
                     "Quellen werden nur gelesen, nie beschrieben.")
     return ""
 
@@ -420,6 +424,15 @@ class JobQueue:
                 if j.status == ST_RUN:
                     j.status = ST_ERROR
                     j.error = j.error or why
+
+    def release(self, job: Job) -> None:
+        """Einen gerade übernommenen Auftrag, der nicht gestartet wurde (Nutzer-Abbruch), wieder auf „wartet“ setzen und aus
+        den Aufträgen des Listenlaufs nehmen."""
+        with self._lock:
+            if job.status == ST_RUN:
+                job.status = ST_WAIT
+            if job in self._claimed:
+                self._claimed.remove(job)
 
     def run_jobs(self) -> list:
         """Aufträge des letzten Listenlaufs (in der Reihenfolge, in der sie gestartet wurden)."""

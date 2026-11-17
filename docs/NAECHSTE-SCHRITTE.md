@@ -114,6 +114,50 @@ ungedrosselt; ein Vergleich mit echtem Material steht aus). Offene Notizen dazu:
 hat keinen Endzustand, wenn Drosseln nicht hilft (der Lauf kommt aber voran); ein theoretischer Ausnahmepfad beim Aufheben der
 Drosselung könnte die alte Stufe stehen lassen; in `_set_fan` steht noch ein kosmetischer `if True:`-Block.
 
+**Zweiter ganzer Lauf (17.11.2026) und Runde 6 – Drosseln hat am Gerät NICHT geholfen:** Mit dem Regler aus Runde 5 erreichte
+die Messung auch auf 8 von 32 Kernen wieder 97 °C; ein 58-Minuten-Clip endete in einer Kette von mehr als 20 Pausen und kam
+kaum voran (Lauf vom Nutzer abgebrochen). Ohne Überwachung lief derselbe Clip mit voller Leistung durch; Lenovo Vantage zeigte
+dabei etwa 87 °C. In 8 Vergleichsablesungen lag unser Messwert 4 bis 14 °C (meist etwa 10 °C) über der Anzeige von Vantage
+(nicht exakt gleichzeitig abgelesen; welcher Wert der heisseste Kern ist, ist nicht belegt). Folgerung: Die Schwelle 97 °C
+liegt auf dieser Quelle im normalen Betriebsbereich, der Regler bremste, ohne zu schützen. Seit Runde 6 sind Drosseln und
+Pause deshalb **standardmässig aus** (Schalter „Bei Hitze drosseln und pausieren“ bzw. `--thermal-throttle`); die
+Überwachung misst, zeigt an und schaltet die Lüfter auf voll. Ein Opus-Review, keine groben Fehler. **Nicht belegt:** ein
+ganzer Lauf mit dem neuen Standard (nur Lüfter voll) am Gerät; ob der Rechner unter stundenlanger Volllast stabil bleibt
+(ein früherer Absturz hatte eine ungeklärte Ursache); der Bitstrom-Vergleich mit Drosselung (jetzt nur noch für den
+eingeschalteten Schalter von Belang).
+
+**Fortschritt beim Verpacken (17.11.2026):** Während `raw2bmx` wird der Fortschritt aus der Grösse der entstehenden Datei
+geschätzt (vorher stand der Balken bei langen Clips minutenlang still). Nur mit Attrappen getestet, kein echter Lauf.
+
+## Auftragsliste (Runde 7, 17.11.2026)
+
+Mehrere Karten lassen sich in der Oberfläche in eine Liste legen und mit „Alle konvertieren“ nacheinander umwandeln (SPEC,
+„Auftragsliste“). Zwei Opus-Reviews: das erste fand zwei grobe Fehler (ein Hitze-Abbruch beendete die ganze Liste; ein Ziel
+konnte über Kurznamen/Junctions unbemerkt in der Quelle eines anderen Auftrags liegen), beide behoben; das zweite fand keine
+groben Fehler mehr. **Stand der Belege:** 926 Unit-Tests (Attrappen-Converter, echtes Tk) und **ein echter, per Skript
+gesteuerter Listenlauf** über die GUI-Klasse mit echten Umwandlungen (17.11.2026, F5-Testkarte, je Auftrag ein Clip): drei
+Aufträge, der mittlere mit absichtlich verfälschtem Fingerabdruck → Status fertig / Fehler („Die Quelle hat sich seit dem
+Hinzufügen geändert“, nicht gestartet) / fertig; beide umgewandelten Clips von der Abschlussprüfung ohne Abweichung
+bestätigt; genau ein Abschlussfenster; „Konvertieren“/„Alle konvertieren“ während des Laufs ohne Wirkung; Rückfrage bei
+doppelter Quelle erschien beim Hinzufügen. Dazu ein echter Einzellauf über die Kommandozeile mit dem neuen Stand (1 Clip,
+1774 Frames, 1007 MB → 255 MB, Abschlussprüfung ohne Abweichung; ohne Administratorrechte, also ohne Temperaturmessung).
+**Nicht geprüft:** Bedienung von Hand mit Maus (Liste, Knöpfe, Optik, hohe DPI-Skalierung), ein Listenlauf mit ganzen Karten
+über Stunden, Abbrechen eines echten Listenlaufs, Kurznamen (8.3; auf dem Testsystem abgeschaltet), Netzlaufwerke; die
+Prozentanzeige beim Verpacken war im echten Lauf nicht zu sehen (Verpacken dauerte nur Sekunden).
+
+Offene Notizen (keine groben Fehler):
+
+- Klickt man „Abbrechen“, während der letzte Auftrag gerade regulär fertig wird, heisst es trotzdem „Listenlauf abgebrochen“.
+- Ein Auftrag, der während einer offenen Rückfrage kurz vor Listenende hinzukommt, bleibt wartend; das Abschlussfenster kann
+  über der Rückfrage erscheinen.
+- Der Pfadvergleich greift auf das Dateisystem zu; bei einem nicht erreichbaren Netzwerkpfad kann das Hinzufügen einige
+  Sekunden hängen.
+- `\\?\Volume{GUID}\…`-Pfade werden nicht korrekt verglichen (kommen aus dem Ordnerdialog nicht vor).
+- Scheitert die Anforderung „nicht einschlafen“ im Listenlauf, steht der Hinweis nur im Fensterprotokoll, nicht in den
+  Protokolldateien der Aufträge.
+- Die Hintergrund-Schätzung der Zielgrösse hat kein Abbruch-Signal; beim Schliessen können `ffprobe`-Prozesse kurz weiterlaufen.
+- Aufträge mit „Fehler“ werden nicht automatisch wiederholt (entfernen und neu hinzufügen; fertige Clips werden übersprungen).
+
 Offene Notizen aus dem letzten Review der Temperaturüberwachung und des Energiesparschutzes (keine groben Fehler; der Zustand
 ist in allen Fällen sicher, d. h. `ffmpeg` läuft weiter und die Lüfter werden zurückgestellt):
 

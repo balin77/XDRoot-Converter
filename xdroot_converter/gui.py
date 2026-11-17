@@ -482,6 +482,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
         self._ov_est: dict = {}                # Übersichtsschlüssel -> geschätzte Zielgröße (aus der Analyse)
         self._converter_factory = converter.Converter  # Tests setzen hier eine Attrappe
         self._user_cancel = threading.Event()  # Nutzer hat Abbrechen/Schliessen verlangt (beendet auch den Listenlauf)
+        self._single_opts = None               # Optionen des laufenden Einzellaufs (beim Start gemerkt, nicht aus den Feldern)
         self._est_pending: dict = {}           # Übersichtsschlüssel -> Aufträge, deren Schätzung im Hintergrund läuft
 
         self.var_src = tk.StringVar()
@@ -906,8 +907,10 @@ class App(_Base):  # type: ignore[misc,valid-type]
             try:
                 ov = converter.overview(opts, cancel=cancel)
                 self._ov_est[key] = ov.est_target_bytes
+                self.q.put(("est", key, ov.est_target_bytes))  # wartende Aufträge dieser Quelle nachtragen
                 self.q.put(("overview", token, overview_display_text(ov.text(), skip), True))
             except Exception as e:  # noqa: BLE001
+                self.q.put(("est_retry", key))  # wartende Aufträge brauchen dann eine eigene Analyse
                 if cancel.cancelled:
                     return
                 self.q.put(("overview", token, f"Quelle nicht nutzbar: {e}", False))
@@ -975,6 +978,10 @@ class App(_Base):  # type: ignore[misc,valid-type]
         fingerprint = ""
         if for_list:  # Liste: Duplikate/Überschneidungen vor den Rückfragen ablehnen
             conflict = self.jq.find_conflict(src, eff_dst, str(src_root))
+            if not conflict and self._run_mode == "single" and self._single_opts is not None:
+                # auch gegen Quelle und Ziel des laufenden Einzellaufs (gemerkte Werte vom Start, nicht die Felder)
+                run_job = jobqueue.Job(id=0, options=self._single_opts)
+                conflict = jobqueue.find_conflict([run_job], src, eff_dst, str(src_root), labels=["laufender Lauf"])
             if conflict:
                 messagebox.showwarning("XDROOT-Converter", conflict)
                 return
@@ -1048,6 +1055,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
         if job is None:
             return
         prev_ov = self._begin_run_ui("single")
+        self._single_opts = jobqueue.snapshot_options(job.options)
         conv = self._converter_factory(job.options, QueueReporter(self.q), self.cancel_token)
         stamp = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
         self._append(f"──────── Neuer Lauf {stamp} ────────", "sep")
@@ -1088,12 +1096,25 @@ class App(_Base):  # type: ignore[misc,valid-type]
             waiting.append(job.id)
             return
         self._est_pending[key] = [job.id]
-        opts = jobqueue.snapshot_options(job.options)
+        ov = self.ov_thread
+        if ov is not None and ov.is_alive() and self._last_overview_key == key:
+            return  # die Übersichts-Analyse dieser Quelle läuft schon: ihr Ergebnis wird nachgetragen (est / est_retry)
+        self._spawn_estimate(key, jobqueue.snapshot_options(job.options))
 
+    def _spawn_estimate(self, key: tuple, opts) -> None:
         def work() -> None:
             self.q.put(("est", key, self._analyze(opts)))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _on_estimate_retry(self, key: tuple) -> None:
+        """Die Übersichts-Analyse ist gescheitert/abgebrochen: für die wartenden Aufträge selbst analysieren."""
+        ids = self._est_pending.get(key)
+        job = self.jq.get(ids[0]) if ids else None
+        if job is None:
+            self._est_pending.pop(key, None)
+            return
+        self._spawn_estimate(key, jobqueue.snapshot_options(job.options))
 
     def _on_estimate(self, key: tuple, est: Optional[int]) -> None:
         if est:
@@ -1231,6 +1252,9 @@ class App(_Base):  # type: ignore[misc,valid-type]
                             if changed:
                                 jq.fail(job, changed)
                                 q.put(("log", "error", f"Auftrag {claim.n}: {changed}"))
+                            elif user_cancel.is_set():
+                                # Abbrechen kam während der Prüfung: Converter gar nicht erst starten, Auftrag bleibt „wartet“
+                                jq.release(job)
                             else:
                                 summary = factory(job.options, QueueReporter(q), token).run()
                                 jq.finish(job, summary, user_cancelled=user_cancel.is_set())
@@ -1343,6 +1367,8 @@ class App(_Base):  # type: ignore[misc,valid-type]
                 self.var_overview.set(text)
                 if not ok:
                     self._last_overview_key = None  # erneute Analyse erlauben (z. B. Karte nachträglich eingesteckt)
+        elif kind == "est_retry":
+            self._on_estimate_retry(item[1])
         elif kind == "est":
             self._on_estimate(item[1], item[2])
         elif kind == "job_start":
@@ -1437,6 +1463,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
     def _reset_buttons(self, status: str) -> None:
         self._ui_running = False
         self._run_mode = None
+        self._single_opts = None
         self.var_thermal.set("")
         try:
             self._set_inputs(True)

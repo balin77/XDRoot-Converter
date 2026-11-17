@@ -104,7 +104,7 @@ Karten über Nacht. Die Liste erscheint erst, wenn sie Aufträge enthält.
 - Die Prüfungen und Rückfragen (z. B. „Fortsetzen?“) kommen schon beim Hinzufügen, nicht nachts; während des Listenlaufs gibt es
   keine Rückfrage. Abgelehnt werden ein Ziel, das schon in der Liste steht, und eine Quelle, die Ziel eines anderen Auftrags ist
   (und umgekehrt); verglichen werden die aufgelösten Pfade (Kurznamen, Verknüpfungen und Langpfad-Schreibweise zählen als derselbe
-  Ordner). Auch „Konvertieren“ lehnt ein Ziel ab, das in oder auf einer Quelle der Liste liegt. Steht dieselbe Quelle schon in
+  Ordner). Dasselbe gilt gegen Quelle und Ziel eines gerade laufenden Einzellaufs. Auch „Konvertieren“ lehnt ein Ziel ab, das in oder auf einer Quelle der Liste liegt. Steht dieselbe Quelle schon in
   der Liste, gibt es eine Rückfrage. Reicht der freie Platz für die geschätzten Zielgrößen aller wartenden, abgebrochenen und des
   laufenden Auftrags auf einem Laufwerk nicht, gibt es eine Warnung mit Rückfrage (die Schätzung wird bei Bedarf im Hintergrund
   nachgetragen; solange sie fehlt, entfällt die Warnung).

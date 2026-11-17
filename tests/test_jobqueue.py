@@ -523,6 +523,16 @@ class ResolvedPathTests(unittest.TestCase):
         q.add(_opts("Q", d))
         self.assertTrue(q.find_conflict("X", "\\\\?\\" + d))
 
+    def test_nachgestellte_punkte_und_leerzeichen_bei_nicht_existierendem_ziel(self):
+        if os.name != "nt":
+            self.skipTest("nur Windows")
+        base = os.path.join(self.tmp, "ausgabe")  # existiert nicht auf der Platte
+        q = jq.JobQueue()
+        q.add(_opts("Q", base + "A"))
+        for variant in (base + "A.", base + "A..", base + "A .", base + "A.\\sub"):
+            self.assertIn("steht schon in der Liste", q.find_conflict("X", variant), variant)
+        self.assertEqual(q.find_conflict("X", base + "B"), "")
+
     def test_ruckfall_bei_fehler(self):
         from unittest import mock
         with mock.patch.object(Path, "resolve", side_effect=OSError("kaputt")):

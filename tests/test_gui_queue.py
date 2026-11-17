@@ -568,6 +568,184 @@ class ListRunRobustnessTests(GuiQueueBase):
         self.assertEqual(len(calls), 1)  # nur EINE Analyse für dieselbe Karte
 
 
+class FakeOverview:
+    def __init__(self, est=777, text="Kamera: Attrappe"):
+        self.est_target_bytes = est
+        self._t = text
+
+    def text(self):
+        return self._t
+
+
+class ListRound10Tests(GuiQueueBase):
+    def _real_overview(self, behaviour):
+        """Echtes _refresh_overview wieder einsetzen, converter.overview durch eine Attrappe ersetzen."""
+        a = self.app
+        a._refresh_overview = gui.App._refresh_overview.__get__(a)
+        p = mock.patch.object(gui.converter, "overview", behaviour)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _snapshot(self):
+        a = self.app
+        return (a.var_status.get(), a.pb_total["value"], self.state(a.btn_start), self.state(a.btn_runall),
+                self.state(a.btn_cancel), a._ui_running, a._run_mode)
+
+    def test_abbruch_waehrend_der_fingerabdruck_pruefung_startet_keinen_converter(self):
+        a = self.app
+        self.add("A")
+        self.add("B")
+        orig = jq.source_changed
+
+        def slow(job, fp_fn=None):
+            a._request_cancel()  # Nutzer bricht ab, während die Prüfung läuft
+            return orig(job, fp_fn)
+
+        with mock.patch.object(jq, "source_changed", slow):
+            self.run_list_to_end()
+        self.assertEqual(self.factory.events, [])
+        self.assertEqual(self.factory.tokens, [])  # Converter wurde gar nicht erzeugt
+        self.assertEqual(self.statuses(), [jq.ST_WAIT, jq.ST_WAIT])
+        self.assertIn("Listenlauf abgebrochen", a.var_status.get())
+        self.assertEqual(self.dialogs(), 0)
+        self.assertEqual(self.state(a.btn_runall), "normal")
+
+    def test_uebersicht_laeuft_schon_nur_eine_analyse(self):
+        a = self.app
+        gate = threading.Event()
+        calls = []
+        analyze_calls = []
+
+        def ov(opts, cancel=None):
+            calls.append(opts.source)
+            gate.wait(10)
+            return FakeOverview(est=4321)
+
+        a._analyze = lambda opts: analyze_calls.append(opts.source) or 1
+        self._real_overview(ov)
+        src = self.card("A")
+        a.var_src.set(src)
+        a._refresh_overview()  # Übersichts-Analyse läuft (blockiert)
+        self.assertTrue(self.pump(lambda: len(calls) == 1))
+        a.var_dst.set(str(self.root / "dst" / "A1"))
+        a._add_to_list()
+        j = a.jq.jobs()[0]
+        self.assertIsNone(j.est_bytes)
+        gate.set()
+        self.assertTrue(self.pump(lambda: j.est_bytes == 4321))
+        self.assertEqual(len(calls), 1)       # genau EIN converter.overview-Aufruf
+        self.assertEqual(analyze_calls, [])   # keine zweite Analyse
+
+    def test_uebersicht_scheitert_eigene_analyse_springt_ein(self):
+        a = self.app
+        gate = threading.Event()
+
+        def ov(opts, cancel=None):
+            gate.wait(10)
+            raise FileNotFoundError("weg")
+
+        a._analyze = lambda opts: 99
+        self._real_overview(ov)
+        a.var_src.set(self.card("A"))
+        a._refresh_overview()
+        self.pump(lambda: False, 0.2)
+        a.var_dst.set(str(self.root / "dst" / "A1"))
+        a._add_to_list()
+        j = a.jq.jobs()[0]
+        gate.set()
+        self.assertTrue(self.pump(lambda: j.est_bytes == 99))
+
+    def test_einzellauf_prueft_hinzufuegen_gegen_laufenden_lauf(self):
+        a = self.app
+        src, dst = self.card("S"), str(self.root / "dst" / "S")
+        a.var_src.set(src)
+        a.var_dst.set(dst)
+        self.factory.gate.clear()
+        a._start()
+        self.assertTrue(self.pump(lambda: self.factory.started.is_set()))
+        # Felder ändern: geprüft wird gegen die beim Start gemerkten Werte
+        a.var_src.set(self.card("T"))
+        a.var_dst.set(dst)  # gleiches Ziel wie der laufende Lauf
+        a._add_to_list()
+        self.assertEqual(len(a.jq), 0)
+        self.assertIn("laufender Lauf", self.mb["showwarning"].call_args.args[1])
+        a.var_dst.set(str(Path(src) / "ausgabe"))  # Ziel in der Quelle des laufenden Laufs
+        a._add_to_list()
+        self.assertEqual(len(a.jq), 0)
+        a.var_src.set(dst)  # Quelle = Ziel des laufenden Laufs
+        a.var_dst.set(str(self.root / "dst" / "X"))
+        a._add_to_list()
+        self.assertEqual(len(a.jq), 0)
+        self.assertEqual(self.mb["showwarning"].call_count, 3)
+        self.add("U")  # unabhängiger Auftrag ist weiter möglich
+        self.assertEqual(len(a.jq), 1)
+        self.factory.gate.set()
+        self.assertTrue(self.pump(lambda: not a._ui_running))
+        self.pump(lambda: False, 0.3)
+        self.assertIsNone(a._single_opts)
+
+    def test_uebersicht_waehrend_listenlauf_aendert_den_lauf_nicht(self):
+        a = self.app
+        self.add("A")
+        self.add("B")
+        self.factory.gate.clear()
+
+        def ov(opts, cancel=None):
+            if "KAPUTT" in opts.source:
+                raise FileNotFoundError("weg")
+            return FakeOverview()
+
+        self._real_overview(ov)
+        a._start_list()
+        self.assertTrue(self.pump(lambda: self.factory.started.is_set()))
+        self.assertTrue(self.pump(lambda: a.var_status.get().startswith("Läuft … Auftrag 1")))
+        a.pb_total["value"] = 420
+        before = self._snapshot()
+        a.var_src.set(self.card("NEU"))
+        a._refresh_overview()
+        self.assertTrue(self.pump(lambda: a.var_overview.get().startswith("Kamera"), 3))
+        a.var_src.set(str(self.root / "KAPUTT"))
+        a._refresh_overview()
+        self.assertTrue(self.pump(lambda: "nicht nutzbar" in a.var_overview.get(), 3))
+        a.var_bitrate.set("60")
+        self.pump(lambda: False, 1.0)
+        self.assertEqual(before, self._snapshot())
+        # Knöpfe/Tastatur starten keinen zweiten Lauf
+        a.btn_start.invoke()
+        a.btn_runall.invoke()
+        a._start()
+        a._start_list()
+        self.factory.gate.set()
+        self.assertTrue(self.pump(lambda: not a._ui_running))
+        self.pump(lambda: False, 0.3)
+        self.assertEqual([e[1] for e in self.factory.events], ["A", "B"])
+        self.assertEqual(self.dialogs(), 1)
+
+    def test_uebersicht_waehrend_einzellauf_aendert_den_lauf_nicht(self):
+        a = self.app
+        self._real_overview(lambda opts, cancel=None: FakeOverview())
+        a.var_src.set(self.card("S"))
+        a.var_dst.set(str(self.root / "dst" / "S"))
+        self.factory.gate.clear()
+        a._start()
+        self.assertTrue(self.pump(lambda: self.factory.started.is_set()))
+        self.assertTrue(self.pump(lambda: a._ui_running))
+        a.pb_total["value"] = 300
+        before = self._snapshot()
+        a.var_src.set(self.card("T"))
+        a._refresh_overview()
+        self.assertTrue(self.pump(lambda: a.var_overview.get().startswith("Kamera"), 3))
+        self.assertEqual(before, self._snapshot())
+        self.assertEqual(a._run_mode, "single")
+        a.btn_start.invoke()
+        a.btn_runall.invoke()
+        self.factory.gate.set()
+        self.assertTrue(self.pump(lambda: not a._ui_running))
+        self.pump(lambda: False, 0.3)
+        self.assertEqual([Path(o.source).name for o in self.factory.opts_seen], ["S"])  # Start-Werte, nicht die Felder
+        self.assertEqual(self.dialogs(), 1)
+
+
 class ListLayoutTests(GuiQueueBase):
     def test_mindesthoehe_waechst_mit_liste_ohne_abschneiden(self):
         a = self.app
