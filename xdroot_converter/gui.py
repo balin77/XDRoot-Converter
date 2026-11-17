@@ -41,8 +41,9 @@ TEMP_FAN_MIN, TEMP_FAN_MAX = thermal.TEMP_FAN_MIN, thermal.TEMP_FAN_MAX  # gleic
 TEMP_PAUSE_MIN, TEMP_PAUSE_MAX = thermal.TEMP_PAUSE_MIN, thermal.TEMP_PAUSE_MAX
 THREADS_MAX = 256
 HINT_THERMAL = ("Nur als Administrator und auf Lenovo Legion; sonst läuft alles unverändert. Die Lüfter bleiben nach dem "
-                "Einschalten bis zum Ende voll; ab der Pausen-Temperatur wird zuerst die Last gedrosselt (weniger Kerne), "
-                "die Pause ist nur die letzte Stufe.")
+                "Einschalten bis zum Ende voll. Die CPU schützt sich selbst; „Bei Hitze drosseln und pausieren“ ist nur "
+                "nötig, wenn der Rechner unter Volllast abstürzt (dann wird ab „Pause ab“ zuerst die Last gedrosselt, die "
+                "Pause ist nur die letzte Stufe). Der Messwert kann rund 10 °C über der Anzeige in Lenovo Vantage liegen.")
 HINT_THREADS = "leer = alle Kerne; weniger = kühler, aber langsamer"
 LOG_MIN_PX = 80  # so viel Protokoll bleibt bei Mindesthöhe (auch mit geöffneten Einstellungen) sichtbar
 HINT_ADMIN = ("Hinweis: Für die Temperaturanzeige und die Lüftersteuerung braucht das Programm Administratorrechte. "
@@ -81,9 +82,12 @@ def _parse_number(text: str, label: str, lo: float, hi: float) -> float:
     return v
 
 
-def parse_temp_limits(fan_text: str, pause_text: str) -> tuple:
-    """(Lüfter-voll-Schwelle, Pausen-Schwelle) in °C aus den Eingabefeldern; ValueError mit deutscher Meldung."""
+def parse_temp_limits(fan_text: str, pause_text: Optional[str]) -> tuple:
+    """(Lüfter-voll-Schwelle, Pausen-Schwelle) in °C aus den Eingabefeldern; ValueError mit deutscher Meldung.
+    ``pause_text=None`` (Drosseln/Pause aus): nur die Lüfter-Schwelle wird geprüft, die zweite Zahl ist None."""
     fan = _parse_number(fan_text, "Lüfter voll ab", TEMP_FAN_MIN, TEMP_FAN_MAX)
+    if pause_text is None:
+        return fan, None
     pause = _parse_number(pause_text, "Pause ab", TEMP_PAUSE_MIN, TEMP_PAUSE_MAX)
     if fan >= pause:
         raise ValueError("Die Pausen-Temperatur muss höher sein als die Temperatur für „Lüfter voll“.")
@@ -344,6 +348,10 @@ def completion_message(summary) -> tuple[str, str, str]:
     if int(getattr(summary, "throttle_steps", 0) or 0) > 0 or thr_s >= 1:
         parts.append(f"Last gedrosselt: gesamt {_fmt_pause(thr_s)}")
     pauses = int(getattr(summary, "pauses", 0) or 0)
+    hot_max = getattr(summary, "max_cpu_c", None)
+    if pauses <= 0 and hot_max and not getattr(summary, "thermal_throttle", True):
+        parts.append(f"Höchste CPU-Temperatur {hot_max:.0f} °C (Messwert des Geräts, kann über der Anzeige des "
+                     "Herstellers liegen)")
     if pauses > 0:
         hot = getattr(summary, "max_cpu_c", None)
         parts.append(f"Temperaturpausen: {pauses}, gesamt {_fmt_pause(getattr(summary, 'pause_seconds', 0.0))}"
@@ -473,6 +481,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
         self.var_status = tk.StringVar(value="Bereit.")
         self.var_thermal = tk.StringVar(value="")
         self.var_thermal_on = tk.BooleanVar(value=True)
+        self.var_throttle_on = tk.BooleanVar(value=False)  # Runde 6: Drosseln/Pause nur auf Wunsch (Standard aus)
         self.var_temp_fan = tk.StringVar(value=f"{thermal.DEFAULT_FAN_ON_C:g}")
         self.var_temp_pause = tk.StringVar(value=f"{thermal.DEFAULT_PAUSE_C:g}")
         self.var_threads = tk.StringVar(value="")
@@ -551,14 +560,20 @@ class App(_Base):  # type: ignore[misc,valid-type]
         ttk.Label(tf, text="Lüfter voll ab (°C):").grid(row=0, column=1, sticky="w", padx=(12, 4), pady=1)
         e_fan = ttk.Entry(tf, textvariable=self.var_temp_fan, width=5)
         e_fan.grid(row=0, column=2, sticky="w", padx=4, pady=1)
-        ttk.Label(tf, text="Pause ab (°C):").grid(row=0, column=3, sticky="w", padx=(12, 4), pady=1)
-        e_pause = ttk.Entry(tf, textvariable=self.var_temp_pause, width=5)
-        e_pause.grid(row=0, column=4, sticky="w", padx=4, pady=1)
+        # Drosseln/Pause: eigener Schalter darunter; das Feld "Pause ab" gilt nur, wenn beide Schalter an sind
+        tf2 = ttk.Frame(fs)
+        tf2.grid(row=4, column=0, columnspan=5, sticky="w", padx=(22, 0))
+        ck_thr = ttk.Checkbutton(tf2, text="Bei Hitze drosseln und pausieren", variable=self.var_throttle_on,
+                                 command=self._update_thermal_fields)
+        ck_thr.grid(row=0, column=0, sticky="w", padx=4, pady=1)
+        ttk.Label(tf2, text="Pause ab (°C):").grid(row=0, column=1, sticky="w", padx=(12, 4), pady=1)
+        e_pause = ttk.Entry(tf2, textvariable=self.var_temp_pause, width=5)
+        e_pause.grid(row=0, column=2, sticky="w", padx=4, pady=1)
         self.lbl_th_hint = ttk.Label(fs, text=HINT_THERMAL, wraplength=400, justify="left", foreground="#555555")
-        self.lbl_th_hint.grid(row=4, column=0, columnspan=5, sticky="ew", padx=(26, 4), pady=0)
+        self.lbl_th_hint.grid(row=5, column=0, columnspan=5, sticky="ew", padx=(26, 4), pady=0)
         # Schonmodus (unabhängig von der Messung): Feld und kurzer Hinweis in einer Zeile
         cf = ttk.Frame(fs)
-        cf.grid(row=5, column=0, columnspan=5, sticky="w")
+        cf.grid(row=6, column=0, columnspan=5, sticky="w")
         ttk.Label(cf, text="CPU-Kerne begrenzen auf:").grid(row=0, column=0, sticky="w", padx=4, pady=1)
         e_thr = ttk.Entry(cf, textvariable=self.var_threads, width=5)
         e_thr.grid(row=0, column=1, sticky="w", padx=4, pady=1)
@@ -567,16 +582,18 @@ class App(_Base):  # type: ignore[misc,valid-type]
         # Abschlussprüfung (Standard an, gründlich); der zweite Haken hängt vom ersten ab (_update_verify_fields)
         ck_av = ttk.Checkbutton(fs, text="Nach der Umwandlung prüfen und fehlerhafte Clips wiederholen",
                                 variable=self.var_auto_verify, command=self._update_verify_fields)
-        ck_av.grid(row=6, column=0, columnspan=5, sticky="w", padx=4, pady=1)
+        ck_av.grid(row=7, column=0, columnspan=5, sticky="w", padx=4, pady=1)
         ck_deep = ttk.Checkbutton(fs, text="gründlich (jeden Clip komplett dekodieren)", variable=self.var_verify_deep)
-        ck_deep.grid(row=7, column=0, columnspan=5, sticky="w", padx=(26, 4), pady=1)
+        ck_deep.grid(row=8, column=0, columnspan=5, sticky="w", padx=(26, 4), pady=1)
         # Hinweistexte passen ihre Umbruchbreite der Breite des Rahmens an (auch bei Mindestgröße lesbar)
         fs.bind("<Configure>", self._wrap_setting_hints)
         # (Widget, Zustand im freigegebenen Betrieb); die Temperaturfelder steuert _update_thermal_fields
         lock.extend([(e_src, "normal"), (b_src, "normal"), (e_dst, "normal"), (b_dst, "normal"),
-                     (sp, "normal"), (cb, "readonly"), (ck, "normal"), (ck_th, "normal"),
+                     (sp, "normal"), (cb, "readonly"), (ck, "normal"), (ck_th, "normal"), (ck_thr, "normal"),
                      (e_thr, "normal"), (ck_av, "normal")])
-        self._temp_fields = [e_fan, e_pause]
+        self._temp_fields = [e_fan]  # nur an die Überwachung gebunden
+        self._pause_fields = [e_pause]  # zusätzlich an "drosseln und pausieren" gebunden
+        self._throttle_fields = [ck_thr]  # nur an die Überwachung gebunden (wie die Lüfter-Schwelle)
         self._verify_fields = [ck_deep]
 
         bf = ttk.Frame(root)
@@ -751,11 +768,13 @@ class App(_Base):  # type: ignore[misc,valid-type]
         if inputs_enabled is None:
             inputs_enabled = not self._ui_running
         on = bool(self.var_thermal_on.get()) and inputs_enabled
-        for w in getattr(self, "_temp_fields", []):
-            try:
-                w.configure(state="normal" if on else "disabled")
-            except Exception:  # noqa: BLE001
-                pass
+        pause_on = on and bool(self.var_throttle_on.get())  # "Pause ab" nur, wenn beide Schalter an sind
+        for group, state_on in (("_temp_fields", on), ("_throttle_fields", on), ("_pause_fields", pause_on)):
+            for w in getattr(self, group, []):
+                try:
+                    w.configure(state="normal" if state_on else "disabled")
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _wrap_setting_hints(self, _event=None) -> None:
         try:
@@ -848,8 +867,12 @@ class App(_Base):  # type: ignore[misc,valid-type]
             messagebox.showwarning("XDROOT-Converter", str(e))
             return
         try:
-            if self.var_thermal_on.get():  # bei ausgeschalteter Überwachung werden die Temperaturfelder nicht geprüft
+            throttle = bool(self.var_thermal_on.get() and self.var_throttle_on.get())
+            if self.var_thermal_on.get() and throttle:  # bei ausgeschalteter Überwachung werden die Temperaturfelder nicht geprüft
                 temp_fan, temp_pause = parse_temp_limits(self.var_temp_fan.get(), self.var_temp_pause.get())
+            elif self.var_thermal_on.get():  # ohne Drosseln/Pause wird "Pause ab" weder ausgewertet noch geprüft
+                temp_fan, _ignored = parse_temp_limits(self.var_temp_fan.get(), None)
+                temp_pause = thermal.DEFAULT_PAUSE_C
             else:
                 temp_fan, temp_pause = thermal.DEFAULT_FAN_ON_C, thermal.DEFAULT_PAUSE_C
             threads = parse_threads(self.var_threads.get())
@@ -902,7 +925,7 @@ class App(_Base):  # type: ignore[misc,valid-type]
             source=src, target=dst, bitrate_mbps=bitrate, preset=self.var_preset.get() or "medium",
             unlisted="skip" if self.var_skip_unlisted.get() else "convert",
             thermal="auto" if self.var_thermal_on.get() else "off",
-            temp_fan=temp_fan, temp_pause=temp_pause, threads=threads,
+            temp_fan=temp_fan, temp_pause=temp_pause, thermal_throttle=throttle, threads=threads,
             auto_verify=bool(self.var_auto_verify.get()), auto_verify_deep=bool(self.var_verify_deep.get()),
         )
         # Übersichts-Analyse beenden; der Worker wartet auf ihr Ende (kein paralleler Scan)

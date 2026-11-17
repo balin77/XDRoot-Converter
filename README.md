@@ -17,7 +17,7 @@ and an unplanned machine crash were exercised on Windows. After every conversion
 against the source (full decode, full per-track audio comparison) and clips with deviations are converted again. The converted F55 card was imported by the author into DaVinci
 Resolve and Sony Catalyst Browse (card recognised, playback and audio tracks fine; timecode display not compared).
 **Not tested:** other NLEs and Sony tools, frame rates other than 50p with camera files, and (beyond a single diagnostic run on one Legion model) real temperature readings
-and fan control of the optional temperature monitor (needs administrator rights and a Lenovo Legion). **Please note:** the MXF
+and fan control of the optional temperature monitor (needs administrator rights and a Lenovo Legion). By default the monitor only measures and runs the fans at full speed; throttling/pausing on heat is opt-in (`--thermal-throttle`), because on the tested machine it slowed a run down without protecting anything (the CPU regulates itself). **Please note:** the MXF
 headers of the output carry the **Sony identifiers of the source camera** (company/product/version
 copied from the source file, Sony track IDs 2, 3, ...), but the files were **created by this tool, not by a
 camera**. They are not bit-identical to a camera recording, and playback in NLEs and Sony tools is
@@ -80,7 +80,7 @@ Unter Linux wurden Umwandlung, Fortsetzen, Abbruch und `--verify` mit einer **sy
 wählen, **Konvertieren**. Im Zielordner entstehen `XDROOT\` und `konvertierung.log`.
 Unter „Einstellungen" lassen sich Bitrate (Standard 50 Mbit/s), x264-Preset und das Überspringen von
 Clips, die nicht in `MEDIAPRO.XML` stehen, einstellen, außerdem die Temperaturüberwachung („Temperatur überwachen“, „Lüfter
-voll ab“, „Pause ab“) und „CPU-Kerne begrenzen“ (siehe „Temperaturüberwachung und Schonmodus“); Hinweise zu den Einstellungen
+voll ab“, „Bei Hitze drosseln und pausieren“, „Pause ab“) und „CPU-Kerne begrenzen“ (siehe „Temperaturüberwachung und Schonmodus“); Hinweise zu den Einstellungen
 stehen in der Oberfläche. Enthält der
 Zielordner schon ein XDROOT, fragt das Programm vor dem Start „Fortsetzen?“ (weitere Rückfragen beim Start, z. B. zu
 abweichenden Einstellungen). **Abbrechen** beendet alle laufenden Prozesse und räumt temporäre Dateien auf; ein erneuter Lauf mit
@@ -105,7 +105,7 @@ python -m xdroot_converter.cli --mxf-info <datei.MXF>
 python -m xdroot_converter.cli --thermal-test
 ```
 
-Weitere Optionen zu Temperatur und Schonmodus (`--threads`, `--thermal`, `--temp-fan`, `--temp-pause`) stehen in der Tabelle.
+Weitere Optionen zu Temperatur und Schonmodus (`--threads`, `--thermal`, `--temp-fan`, `--thermal-throttle`, `--temp-pause`) stehen in der Tabelle.
 
 | Option | Bedeutung |
 |---|---|
@@ -123,8 +123,10 @@ Weitere Optionen zu Temperatur und Schonmodus (`--threads`, `--thermal`, `--temp
 | `--no-auto-verify` | keine Abschlussprüfung nach der Umwandlung (Standard: Prüfung wie `--verify --source --deep`, fehlerhafte Clips werden neu umgewandelt) |
 | `--auto-verify-quick` | Abschlussprüfung ohne vollständiges Dekodieren und ohne vollständigen Tonvergleich (schneller, weniger gründlich) |
 | `--retries N` | Wiederholungsrunden für fehlerhafte Clips (0 bis 5, Standard 2) |
-| `--thermal auto` / `off` | Temperaturüberwachung (Standard `auto`; ohne nutzbare Messung läuft alles wie gewohnt), siehe unten |
-| `--temp-fan GRAD`, `--temp-pause GRAD` | Schwellen für „Lüfter voll“ (Standard 85 °C, erlaubt 50–110; die Lüfter bleiben dann bis Laufende voll) und für Drosseln/Pause (Standard 97 °C, erlaubt 60–120, höher als die Lüfter-Schwelle): ab dieser Temperatur wird zuerst die Last gedrosselt, die Pause ist nur die letzte Stufe (oder 5 °C darüber); weiter geht es 12 °C darunter |
+| `--thermal auto` / `off` | Temperaturüberwachung (Standard `auto`: messen, anzeigen, „Lüfter voll“; ohne nutzbare Messung läuft alles wie gewohnt; `off` schaltet alles ab), siehe unten |
+| `--temp-fan GRAD` | Schwelle für „Lüfter voll“ (Standard 85 °C, erlaubt 50–110; die Lüfter bleiben dann bis Laufende voll) |
+| `--thermal-throttle` | Bei Hitze die Last drosseln und notfalls pausieren (Standard **aus**; die CPU regelt sich selbst) |
+| `--temp-pause GRAD` | nur mit `--thermal-throttle` (sonst nur ein Hinweis): Schwelle für Drosseln/Pause (Standard 97 °C, erlaubt 60–120, höher als die Lüfter-Schwelle); ab dieser Temperatur wird zuerst die Last gedrosselt, die Pause ist nur die letzte Stufe (oder 5 °C darüber); weiter geht es 12 °C darunter |
 | `--thermal-test` | Diagnose der Temperaturmessung und Lüftersteuerung (braucht Administratorrechte) |
 | `--verbose` | auch Einzelheiten ausgeben (z. B. jede Änderung der MXF-Kopfdaten); sie stehen immer in `konvertierung.log` |
 | `--mxf-info DATEI` | Header-Metadaten einer MXF-Datei ausgeben (Diagnose, liest nur) |
@@ -275,7 +277,9 @@ Lange Umwandlungen lasten die CPU voll aus. Zwei Hilfen:
 - **Temperaturüberwachung (derzeit nur Lenovo Legion, nur mit Administratorrechten):** Start über
   `XDROOT-Converter (Administrator).bat`. Die Oberfläche zeigt CPU-Temperatur und Lüfterdrehzahl und fordert ab 85 °C volle Lüfter
   an; **die Lüfter bleiben dann bis zum Ende des Laufs voll** (kein Hin und Her) und werden erst am Laufende zurückgestellt.
-  Ab 97 °C wird **zuerst die Last gedrosselt**: `ffmpeg` darf nur noch 75 %, 50 %, 35 % und zuletzt 25 % der logischen Kerne
+  **Drosseln und Pausieren sind seit dem 17.11.2026 standardmäßig aus** (siehe „Befund“ unten) und nur mit dem Schalter „Bei
+  Hitze drosseln und pausieren“ bzw. `--thermal-throttle` aktiv; ohne ihn wird nur gemessen, angezeigt, der Lüfter geschaltet
+  und die höchste gemessene Temperatur in der Zusammenfassung genannt. Mit dem Schalter gilt: Ab 97 °C wird **zuerst die Last gedrosselt**: `ffmpeg` darf nur noch 75 %, 50 %, 35 % und zuletzt 25 % der logischen Kerne
   benutzen (mindestens 2; nach einem Schritt nach unten frühestens nach 30 s der nächste, nach einem Lockern darf sofort wieder gedrosselt werden; die Anzeige nennt z. B. „gedrosselt auf 24 von 32 Kernen“).
   Neu gestartete Hilfsprogramme laufen mindestens 3 s Laufzeit ungedrosselt (bis zur nächsten Messung, also etwa 3–8 s), damit `ffmpeg`/x264 ihre Threadzahl wie ohne
   Drosselung wählen; die Drosselung soll den Datenstrom nicht beeinflussen (Beleg mit echtem Material steht aus). Pausenzeit
@@ -290,6 +294,11 @@ Lange Umwandlungen lasten die CPU voll aus. Zwei Hilfen:
   nicht möglich (z. B. mehr als 64 Kerne), wird wie früher sofort pausiert. Die Zusammenfassung nennt die gedrosselte und die
   pausierte Zeit. Ohne Administratorrechte oder auf anderen Geräten steht dort „Temperatur nicht verfügbar“, und die
   Umwandlung läuft wie gewohnt (ohne Messung wird nie gedrosselt).
+- **Befund vom 17.11.2026 (Legion Pro 7 16IRX8H, Leistungsmodus):** Mit eingeschaltetem Drosseln erreichte die Messung auch auf
+  8 von 32 Kernen wieder 97 °C; der Lauf endete in einer Kette von mehr als 20 Pausen und kam kaum voran. Ohne Überwachung lief
+  derselbe Clip mit voller Leistung durch (Lenovo Vantage zeigte etwa 87 °C). Der Messwert lag in 8 Vergleichsablesungen 4 bis
+  14 °C (meist etwa 10 °C) über der Anzeige von Vantage (nicht exakt gleichzeitig abgelesen). Die CPU arbeitet unter Volllast
+  bestimmungsgemäß nahe ihrer Grenze und regelt sich selbst; der Schalter ist nur nötig, wenn der Rechner unter Volllast abstürzt.
 - **Vor dem ersten Einsatz:** `Temperatur-Test (Administrator).bat` ausführen. Der Test zeigt, ob Messung und „Lüfter voll“ auf
   dem Gerät wirken. Das Tool probiert mehrere nur lesende Temperaturquellen der Reihe nach (Lenovo `GetCPUTemp`, Lenovo
   `GetFeatureValue`, ACPI-Thermalzone, Windows-Leistungszähler) und nimmt die erste mit plausiblem Wert; grobe Quellen
@@ -302,7 +311,7 @@ Lange Umwandlungen lasten die CPU voll aus. Zwei Hilfen:
   Dafür merkt es sich den Zustand in `%LOCALAPPDATA%\XDROOT-Converter\fan_state.json` (wird nach dem Zurückstellen gelöscht).
 - Mit Administratorrechten sieht das Programm Netzlaufwerke des normalen Benutzers in der Regel nicht.
 
-Kommandozeile: `--thermal auto|off`, `--temp-fan GRAD`, `--temp-pause GRAD`, `--threads N`, `--thermal-test`.
+Kommandozeile: `--thermal auto|off`, `--temp-fan GRAD`, `--thermal-throttle`, `--temp-pause GRAD`, `--threads N`, `--thermal-test`.
 
 ## Einschränkungen
 

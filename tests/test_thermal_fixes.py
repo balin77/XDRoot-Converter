@@ -656,7 +656,7 @@ class PauseLimitRunTests(RunTestBase):
     def run_hot(self, **kw):
         prov = FakeProvider([99], [])
         opts = converter.Options(source=str(self.src), target=str(self.tgt), thermal="auto", thermal_interval_s=0.01,
-                                 thermal_provider=lambda: prov, thermal_max_pause_s=0.3, **kw)
+                                 thermal_provider=lambda: prov, thermal_max_pause_s=0.3, thermal_throttle=True, **kw)
         rep = Rep()
         statuses = []
         rep.thermal_status = lambda text, state: statuses.append((text, state))
@@ -981,8 +981,8 @@ class SummaryPauseTests(unittest.TestCase):
 class SmallFixTests(unittest.TestCase):
     def test_cli_limits_like_gui(self):
         p = cli.build_parser()
-        for bad, word in ((["--temp-fan", "40"], "40"), (["--temp-fan", "111"], "111"), (["--temp-pause", "59"], "59"),
-                          (["--temp-pause", "121"], "121")):
+        for bad, word in ((["--temp-fan", "40"], "40"), (["--temp-fan", "111"], "111"), (["--temp-pause", "59", "--thermal-throttle"], "59"),
+                          (["--temp-pause", "121", "--thermal-throttle"], "121")):
             err = io.StringIO()
             with mock.patch("sys.stderr", err), self.assertRaises(SystemExit):
                 cli.main(["q", "z", *bad])
@@ -997,7 +997,7 @@ class SmallFixTests(unittest.TestCase):
     def test_cli_relation_message_names_entered_values(self):
         err = io.StringIO()
         with mock.patch("sys.stderr", err), self.assertRaises(SystemExit):
-            cli.main(["q", "z", "--temp-fan", "99", "--temp-pause", "90"])
+            cli.main(["q", "z", "--thermal-throttle", "--temp-fan", "99", "--temp-pause", "90"])
         msg = err.getvalue()
         self.assertIn("--temp-pause (90 °C)", msg)
         self.assertIn("--temp-fan (99 °C)", msg)

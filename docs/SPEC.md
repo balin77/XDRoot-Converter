@@ -586,6 +586,94 @@ und zur sofortigen Pause werden deshalb ersetzt:
 6. Die Affinität wird nur für die vom Tool gestarteten Hilfsprogramme gesetzt (`ffmpeg`, `ffprobe`, `raw2bmx`, `mxf2raw`;
    nicht für das Tool selbst, nicht für andere Programme) und endet mit dem Prozess; es bleibt nichts am System verstellt.
 
+#### Eingreifen bei Hitze nur noch auf Wunsch (Runde 6, Ergänzung nach dem zweiten echten Lauf 17.11.2026)
+
+**Befund am Gerät (Legion Pro 7 16IRX8H, Leistungsmodus in Lenovo Vantage):**
+
+- Mit dem Regler aus Runde 5 erreichte die Messung auch auf 8 von 32 Kernen wieder 97 °C; der Lauf endete in einer Kette
+  von Pausen (mehr als 20 in Folge) und kam kaum voran. Weniger Kerne senken die Temperatur dieser CPU nicht ausreichend
+  (vermutlich taktet sie die verbleibenden Kerne höher; nicht gemessen).
+- Ohne Überwachung lief derselbe Clip mit voller Leistung durch; Lenovo Vantage zeigte dabei etwa 87 °C.
+- Bei eingeschalteter Überwachung lag unser Messwert (Quelle b, `GetFeatureValue 0x05040000`) in 8 Vergleichsablesungen
+  4 bis 14 °C über der Anzeige von Vantage, meist etwa 10 °C (Ablesungen nicht exakt gleichzeitig). Welche Anzeige der
+  heisseste Kern ist, ist nicht belegt.
+- Folgerung: Die CPU arbeitet unter Volllast bestimmungsgemäss nahe ihrer Grenze und regelt sich selbst. Eine Schwelle von
+  97 °C auf dieser Quelle liegt im normalen Betriebsbereich; der Regler bremste den Lauf, ohne etwas zu schützen.
+
+**Neue Regeln (ersetzen die Voreinstellung, nicht die Mechanik aus Runde 5):**
+
+1. **Zwei getrennte Schalter.** „Temperatur überwachen“ (wie bisher, Standard an) bedeutet nur noch: messen, anzeigen,
+   „Lüfter voll“ ab der Lüfter-Schwelle (bleibt bis zum Laufende), höchste Temperatur in der Zusammenfassung. Neu:
+   „Bei Hitze drosseln und pausieren“ – **Standard aus**. Nur wenn dieser Schalter an ist, gelten Drosselstufen, Pause,
+   Notfall und Hitze-Abbruch aus Runde 5 unverändert.
+2. **Schalter aus:** Der Regler setzt nie eine Affinität, hält `ffmpeg` nie an und bricht nie wegen Hitze ab. Die
+   Pausen-Schwelle wird nicht ausgewertet und nicht geprüft (auch nicht ihr Verhältnis zur Lüfter-Schwelle). Lüfter voll,
+   Wirkungsprüfung an der Drehzahl, Wiederherstellen am Laufende, Ausfallbehandlung der Messung und die Konstanz-Wache
+   bleiben wie bisher (die Bedingung „weder Pause noch Lüfter voll aktiv“ gilt unverändert).
+3. **Kommandozeile:** neue Option `--thermal-throttle` (ohne Wert; schaltet Drosseln und Pause ein). `--temp-pause` wirkt nur
+   zusammen mit `--thermal-throttle`; wird `--temp-pause` ohne sie angegeben, gibt es einen Hinweis (kein Fehler).
+   `--thermal off` schaltet wie bisher alles ab.
+4. **Oberfläche:** eigene Checkbox „Bei Hitze drosseln und pausieren“ unter „Temperatur überwachen“; das Feld „Pause ab
+   (°C)“ ist nur bedienbar, wenn beide Schalter an sind. Hinweistext sinngemäss: „Die CPU schützt sich selbst; dieser Schalter
+   ist nur nötig, wenn der Rechner unter Volllast abstürzt. Der Messwert kann rund 10 °C über der Anzeige in Lenovo Vantage
+   liegen.“ Texte dürfen nicht abgeschnitten werden (Mindesthöhe des Fensters anpassen).
+5. **Protokoll:** Die Startzeile der Überwachung nennt den Zustand, z. B. „Temperaturüberwachung aktiv (…); Lüfter voll ab
+   85 °C (bleibt bis zum Laufende); kein Drosseln, keine Pause (die CPU regelt sich selbst).“ bzw. mit Schalter an der
+   bisherige Text. Die Statuszeile zeigt ohne Schalter nur Temperatur, Drehzahl und „Lüfter voll“.
+6. **Zusammenfassung:** höchste gemessene Temperatur auch dann, wenn nie pausiert wurde (CLI-Zusammenfassung und
+   Abschlussfenster), z. B. „Höchste CPU-Temperatur 98 °C (Messwert des Geräts, kann über der Anzeige des Herstellers liegen)“.
+
+#### Fortschritt beim Verpacken (Ergänzung 17.11.2026)
+
+Bei einem 58-Minuten-Clip stand der Balken während `raw2bmx` minutenlang still (kein Absturz, die Datei wuchs mit etwa
+50 MB/s). Während des Verpackens wird der Clip-Fortschritt deshalb aus der Grösse der entstehenden MXF-Datei im Verhältnis
+zur erwarteten Grösse (Summe der Eingabedateien des Verpackens: Videostrom, WAV-Dateien, Zusatzdaten) geschätzt, höchstens
+einmal pro Sekunde abgefragt und auf 99 % begrenzt; die Clip-Zeile zeigt z. B. „Verpacke MXF (raw2bmx) 63 %“. Fehler beim
+Abfragen der Grösse werden ignoriert (dann bleibt die Anzeige wie bisher). Am Ablauf, an den Dateien und am Gesamtfortschritt
+(Gewichtung der Schritte) ändert sich nichts.
+
+### Auftragsliste: mehrere Karten nacheinander (Runde 7, Spezifikation 17.11.2026)
+
+**Ziel:** Mehrere Karten in eine Liste legen und mit einem Klick nacheinander umwandeln lassen (z. B. drei Karten über Nacht),
+ohne dass zwischendurch jemand am Rechner sitzen muss. Nur Oberfläche; die Kommandozeile bleibt unverändert.
+
+1. **Bedienung:** Neben „Konvertieren“ (startet wie bisher sofort den einen Lauf) gibt es „Zur Liste hinzufügen“. Darunter
+   eine Liste der Aufträge mit den Spalten Quelle, Ziel, Einstellungen (kurz, z. B. „50 Mbit/s, medium“) und Status, dazu
+   „Entfernen“ (markierter Auftrag), „Liste leeren“ und „Alle konvertieren“. Die Liste ist nur sichtbar, wenn sie Aufträge
+   enthält oder ein Listenlauf läuft; das Fenster darf dadurch keine Texte abschneiden (Mindesthöhe anpassen).
+2. **Auftrag = Momentaufnahme:** Beim Hinzufügen werden Quelle, Ziel und alle Einstellungen (Bitrate, Preset, MEDIAPRO-Schalter,
+   Temperatur-Schalter und -Schwellen, Kernbegrenzung, Abschlussprüfung) in den Auftrag kopiert. Spätere Änderungen in den
+   Feldern wirken nur auf neue Aufträge.
+3. **Prüfung beim Hinzufügen, nicht in der Nacht:** Es gelten dieselben Prüfungen und Rückfragen wie beim direkten Start
+   (Quelle ist ein XDROOT, Ziel ungleich/ausserhalb der Quelle, Rückfrage bei nicht leerem Ziel bzw. Fortsetzen usw.). Die
+   Antworten auf Rückfragen werden im Auftrag gespeichert; während des Listenlaufs erscheint **keine** Rückfrage mehr.
+   Zusätzlich abgelehnt: ein Ziel, das schon in der Liste steht; eine Quelle, die Ziel eines anderen Auftrags ist (und
+   umgekehrt). Speicherplatz: die geschätzten Zielgrössen aller wartenden Aufträge auf demselben Laufwerk werden addiert;
+   reicht der freie Platz dafür nicht, gibt es beim Hinzufügen eine Warnung mit Rückfrage (kein hartes Verbot, die
+   Schätzung ist grob). Die normale Platzprüfung jedes Laufs bleibt.
+4. **Ablauf:** „Alle konvertieren“ arbeitet die wartenden Aufträge in Listenreihenfolge nacheinander ab, jeder Auftrag als
+   normaler Lauf mit allem, was dazugehört (Abschlussprüfung, Temperaturüberwachung, Lüfter zurückstellen am Laufende,
+   Protokolldatei). Status je Auftrag: wartet → läuft → fertig / fertig mit Abweichungen / Fehler / abgebrochen. Im Protokoll
+   beginnt jeder Auftrag mit einer Trennzeile „Auftrag 2 von 3: …“. Der Gesamtbalken gilt für den laufenden Auftrag; die
+   Statuszeile nennt zusätzlich „Auftrag 2 von 3“.
+5. **Fehler halten die Liste nicht an:** Endet ein Auftrag mit Fehler oder Abweichungen (auch Hitze-Abbruch), wird der
+   nächste trotzdem gestartet. **„Abbrechen“** bricht den laufenden Auftrag ab und beendet den Listenlauf; die übrigen
+   bleiben „wartet“ und können später mit „Alle konvertieren“ fortgesetzt werden (der abgebrochene Auftrag wird dabei
+   wieder aufgenommen; fertige Clips überspringt der Lauf wie gewohnt). Ein unerwarteter Programmfehler in einem Auftrag
+   (Ausnahme) zählt als Fehler dieses Auftrags, nicht als Ende der Liste.
+6. **Energiesparmodus:** Die Anforderung „nicht einschlafen“ gilt über den ganzen Listenlauf, auch zwischen zwei Aufträgen.
+7. **Abschluss:** Erst am Ende der Liste erscheint **ein** Abschlussfenster: je Auftrag eine Zeile mit Ziel und Ergebniszeile
+   („Ergebnis: …“), darunter die Summen (Clips, Grösse vorher/nachher, Dauer). Die Einzel-Abschlussfenster entfallen im
+   Listenlauf. Erledigte Aufträge bleiben mit ihrem Status in der Liste stehen, bis sie entfernt werden; sie werden von
+   „Alle konvertieren“ nicht erneut gestartet.
+8. **Sperren:** Während eines Laufs (einzeln oder Liste) sind „Konvertieren“ und „Alle konvertieren“ gesperrt; „Zur Liste
+   hinzufügen“ und „Entfernen“ für wartende Aufträge bleiben möglich (ein während des Listenlaufs hinzugefügter Auftrag wird
+   am Ende mit abgearbeitet). Der laufende Auftrag kann nicht entfernt werden.
+9. **Grenzen (bewusst):** Die Liste wird nicht gespeichert; nach dem Schliessen des Programms ist sie leer (ein
+   unterbrochener Auftrag lässt sich durch erneutes Hinzufügen fortsetzen). Es läuft immer nur ein Auftrag gleichzeitig.
+   Schliessen des Fensters während eines Listenlaufs verhält sich wie beim Einzellauf (Rückfrage, dann Abbruch).
+10. **Quellen bleiben unberührt:** wie bei jedem Lauf wird aus den Quellen nur gelesen.
+
 ### Abschlussprüfung mit automatischer Wiederholung (Runde 4, Spezifikation)
 
 Anlass: Beim lokalen Test schlug ein Clip wegen eines Lesehängers fehl und musste von Hand per Fortsetzungslauf nachgeholt

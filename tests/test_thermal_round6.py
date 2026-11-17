@@ -1301,7 +1301,7 @@ class ThrottleRunTests(RunTestBase):
         rep = Rep()
         conv = converter.Converter(converter.Options(
             source=str(self.src), target=str(self.tgt), thermal="auto", thermal_interval_s=0.01,
-            thermal_provider=lambda: prov), rep)
+            thermal_provider=lambda: prov, thermal_throttle=True), rep)
         clk = [1000.0]  # eingefrorene Uhr des Tokens: die Startverzögerung (3 s Laufzeit) läuft nur, wenn der Test sie vorstellt
         conv.cancel = tools.CancelToken(clock=lambda: clk[0])
         fake = converter.Converter._transcode

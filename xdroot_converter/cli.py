@@ -5,7 +5,8 @@
   python -m xdroot_converter.cli --mxf-info <datei.MXF>
   python -m xdroot_converter.cli --thermal-test        (Diagnose Temperatur/Lüfter; Administrator-Konsole)
 
-Temperaturüberwachung: --thermal auto|off (Standard auto), --temp-fan GRAD, --temp-pause GRAD;
+Temperaturüberwachung: --thermal auto|off (Standard auto: messen, anzeigen, Lüfter voll), --temp-fan GRAD;
+Drosseln/Pause bei Hitze nur auf Wunsch: --thermal-throttle (Standard aus), dazu --temp-pause GRAD;
 Schonmodus: --threads N (ffmpeg-Threads begrenzen).
 Abschlussprüfung nach der Umwandlung (Standard an, gründlich): --no-auto-verify, --auto-verify-quick, --retries N.
 """
@@ -85,6 +86,14 @@ def _temp_value(text: str) -> float:
     return v
 
 
+class _SeenAction(argparse.Action):
+    """Wie ``store``, merkt sich aber, dass die Option ausdrücklich angegeben wurde (``<dest>_given``)."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, self.dest + "_given", True)
+
+
 def _os_message(e: OSError, path) -> str:
     """Deutsche Meldung statt des (englischen) strerror-Textes."""
     if isinstance(e, FileNotFoundError):
@@ -99,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="xdroot_converter.cli", description="Sony XDROOT: XAVC-Intra -> XAVC-L",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Exit-Codes: 0 fertig (mit Abschlussprüfung: geprüft ohne Abweichung), 1 Fehler oder Abweichung, "
-               "2 falscher Aufruf, 3 Rechte-Erhöhung abgelehnt, 130 abgebrochen (auch Temperatur-Abbruch)")
+               "2 falscher Aufruf, 3 Rechte-Erhöhung abgelehnt, 130 abgebrochen (auch Temperatur-Abbruch); der Hitze-Abbruch gilt nur mit --thermal-throttle")
     ap.add_argument("source", nargs="?", help="Quellordner (XDROOT oder Elternordner)")
     ap.add_argument("target", nargs="?", help="Zielordner (darin entsteht XDROOT)")
     ap.add_argument("--bitrate", type=float, default=50.0, help="Video-Bitrate in Mbit/s (Standard 50)")
@@ -117,12 +126,16 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--verbose", action="store_true",
                     help="auch Einzelheiten ausgeben (z. B. jede Aenderung der MXF-Kopfdaten); sie stehen immer in konvertierung.log")
     ap.add_argument("--thermal", choices=["auto", "off"], default="auto",
-                    help="Temperaturüberwachung (Messung, Lüfter voll, Last drosseln, Pause); auto = nur wenn ein Anbieter nutzbar ist "
-                         "(Standard), sonst läuft alles unverändert")
+                    help="Temperaturüberwachung (Messung, Anzeige, Lüfter voll; Drosseln/Pause nur mit --thermal-throttle); auto = nur "
+                         "wenn ein Anbieter nutzbar ist (Standard), sonst läuft alles unverändert; off schaltet alles ab")
     ap.add_argument("--temp-fan", type=_temp_value, default=thermal.DEFAULT_FAN_ON_C, metavar="GRAD",
                     help=f"Lüfter voll ab dieser CPU-Temperatur (Standard {thermal.DEFAULT_FAN_ON_C:g}{NB}°C; bleibt bis zum Laufende voll; erlaubt {thermal.TEMP_FAN_MIN:.0f} bis {thermal.TEMP_FAN_MAX:.0f}{NB}°C)")
-    ap.add_argument("--temp-pause", type=_temp_value, default=thermal.DEFAULT_PAUSE_C, metavar="GRAD",
-                    help=f"ab dieser CPU-Temperatur zuerst Last drosseln (weniger Kerne), ffmpeg anhalten nur als letzte Stufe bzw. 5{NB}°C darüber (Standard {thermal.DEFAULT_PAUSE_C:g}{NB}°C; weiter 12{NB}°C darunter; erlaubt {thermal.TEMP_PAUSE_MIN:.0f} bis {thermal.TEMP_PAUSE_MAX:.0f}{NB}°C)")
+    ap.add_argument("--thermal-throttle", action="store_true",
+                    help="bei Hitze die Last drosseln und ffmpeg notfalls pausieren (Standard aus: die CPU regelt sich selbst; "
+                         "nur nötig, wenn der Rechner unter Volllast abstürzt). Der Messwert kann rund 10" + NB + "°C über der "
+                         "Anzeige des Herstellers liegen")
+    ap.add_argument("--temp-pause", type=_temp_value, default=thermal.DEFAULT_PAUSE_C, metavar="GRAD", action=_SeenAction,
+                    help=f"nur mit --thermal-throttle: ab dieser CPU-Temperatur zuerst Last drosseln (weniger Kerne), ffmpeg anhalten nur als letzte Stufe bzw. 5{NB}°C darüber (Standard {thermal.DEFAULT_PAUSE_C:g}{NB}°C; weiter 12{NB}°C darunter; erlaubt {thermal.TEMP_PAUSE_MIN:.0f} bis {thermal.TEMP_PAUSE_MAX:.0f}{NB}°C)")
     ap.add_argument("--threads", type=_positive_int, default=None, metavar="N",
                     help="Schonmodus: ffmpeg höchstens N Threads (1 bis 256; Decoder und Encoder; auch bei --verify --deep) - weniger "
                          "Wärme, dauert länger (Standard: unbegrenzt). Achtung: x264 mit anderer Kernzahl erzeugt einen "
@@ -225,9 +238,14 @@ def main(argv=None) -> int:
 
     if not args.source or not args.target:
         build_parser().error("Quelle und Ziel angeben (oder --verify)")
+    if getattr(args, "temp_pause_given", False) and not args.thermal_throttle:
+        print("Hinweis: --temp-pause wirkt nur zusammen mit --thermal-throttle (ohne diese Option wird bei Hitze weder "
+              "gedrosselt noch pausiert).", flush=True)
     if args.thermal != "off":  # wie die Oberflaeche: bei ausgeschalteter Ueberwachung werden die Grenzen nicht geprueft
         try:
-            thermal.check_limits(args.temp_fan, args.temp_pause, "--temp-fan", "--temp-pause")
+            # ohne --thermal-throttle wird die Pausen-Schwelle weder ausgewertet noch geprueft
+            thermal.check_limits(args.temp_fan, args.temp_pause if args.thermal_throttle else None,
+                                 "--temp-fan", "--temp-pause")
         except ValueError as e:
             build_parser().error(str(e))
     opts = converter.Options(
@@ -244,6 +262,7 @@ def main(argv=None) -> int:
         thermal=args.thermal,
         temp_fan=args.temp_fan,
         temp_pause=args.temp_pause,
+        thermal_throttle=bool(args.thermal_throttle and args.thermal != "off"),
         threads=args.threads,
         auto_verify=not args.no_auto_verify,
         auto_verify_deep=not args.auto_verify_quick,

@@ -1128,7 +1128,7 @@ class CliThermalTests(unittest.TestCase):
 
     def test_main_rejects_inconsistent_limits(self):
         with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as cm:
-            cli.main(["q", "z", "--temp-fan", "99", "--temp-pause", "90"])
+            cli.main(["q", "z", "--thermal-throttle", "--temp-fan", "99", "--temp-pause", "90"])
         self.assertEqual(cm.exception.code, 2)
 
     def test_thermal_test_flag_runs_diagnosis_only(self):
@@ -1210,6 +1210,7 @@ class RunIntegrationTests(RunTestBase):
     def run_thermal(self, provider, transcode=None, **kw):
         kw.setdefault("thermal", "auto")
         kw.setdefault("thermal_interval_s", 0.01)
+        kw.setdefault("thermal_throttle", True)  # Runde 6: Drosseln/Pause sind nur auf Wunsch an; diese Tests prüfen es
         kw["thermal_provider"] = (lambda: provider) if isinstance(provider, thermal.ThermalProvider) else provider
         rep = Rep()
         rep.thermal_status = lambda text, state: self.statuses.append((text, state))

@@ -77,6 +77,8 @@ class Options:
     thermal: str = "off"  # 'auto' | 'off'
     temp_fan: float = _thermal_mod.DEFAULT_FAN_ON_C  # Luefter voll ab (Grad C); bleibt bis zum Laufende
     temp_pause: float = _thermal_mod.DEFAULT_PAUSE_C  # ab hier erst drosseln, Pause als letzte Stufe; weiter unter temp_pause - 12
+    # Runde 6: Drosseln, Pause, Notfall und Hitze-Abbruch NUR auf Wunsch (Standard aus); temp_pause wirkt nur damit
+    thermal_throttle: bool = False
     threads: Optional[int] = None  # ffmpeg -threads fuer Decoder und Encoder (None = unbegrenzt)
     thermal_interval_s: float = _thermal_mod.DEFAULT_INTERVAL_S  # Messabstand
     thermal_provider: Optional[object] = None  # nur Tests: Fabrik fuer einen Attrappen-Anbieter
@@ -172,6 +174,7 @@ class RunSummary:
     throttle_steps: int = 0  # Stufenwechsel der Lastdrosselung nach unten (Prozess-Affinitaet)
     throttle_seconds: float = 0.0  # Zeit gedrosselt (ohne die Zeit in der Pause)
     max_cpu_c: Optional[float] = None
+    thermal_throttle: bool = True  # Schalter "Bei Hitze drosseln und pausieren" war an (steuert nur den Text der Hoechsttemperatur)
     thermal_note: str = ""  # z. B. "Temperatur nicht verfuegbar: ..." (leer = keine Besonderheit)
     abort_reason: str = ""  # Abbruch durch die Temperaturueberwachung (Pause zu lang); gesetzt zusammen mit cancelled
     verify: Optional[VerifyOutcome] = None  # Abschlusspruefung (None = nicht eingeschaltet)
@@ -341,6 +344,9 @@ class RunSummary:
         if self.pauses:
             lines.append(f"Temperaturpausen: {self.pauses}, gesamt {fmt_duration(self.pause_seconds)}"
                          + (f" (höchste gemessene CPU-Temperatur {self.max_cpu_c:.0f} °C)" if self.max_cpu_c else ""))
+        elif self.max_cpu_c and not self.thermal_throttle:
+            lines.append(f"Höchste CPU-Temperatur {self.max_cpu_c:.0f} °C (Messwert des Geräts, kann über der Anzeige "
+                         "des Herstellers liegen)")
         elif self.max_cpu_c:
             lines.append(f"Höchste gemessene CPU-Temperatur: {self.max_cpu_c:.0f} °C, keine Pause nötig")
         if self.thermal_note:
@@ -1576,7 +1582,8 @@ class Converter:
             return
         try:
             cfg = _thermal_mod.ThermalConfig.from_limits(self.o.temp_fan, self.o.temp_pause,
-                                                         max_pause_s=self.o.thermal_max_pause_s)
+                                                         max_pause_s=self.o.thermal_max_pause_s,
+                                                         throttle=bool(self.o.thermal_throttle))
             self._thermal = _thermal_mod.ThermalSession(
                 cfg, self.cancel, notify=self._thermal_notify, status=self._thermal_status,
                 provider_factory=self.o.thermal_provider, interval_s=self.o.thermal_interval_s,
@@ -1625,6 +1632,7 @@ class Converter:
             if sm is not None:
                 sm.pauses, sm.pause_seconds, sm.max_cpu_c = st.pauses, st.pause_seconds, st.max_cpu_c
                 sm.throttle_steps, sm.throttle_seconds = st.throttle_steps, st.throttle_seconds
+                sm.thermal_throttle = bool(self.o.thermal_throttle)
                 if st.unavailable_reason:
                     sm.thermal_note = f"Temperatur nicht verfügbar/ausgefallen: {st.unavailable_reason}"
         except Exception:  # noqa: BLE001
@@ -2276,11 +2284,58 @@ class Converter:
         if anc is not None:
             args += ["--klv", "s", "--anc", str(anc)]
         lines: list[str] = []
-        res = tools.run_capture(args, cancel=self.cancel, on_stdout_line=lines.append, on_stderr_line=lines.append, keep_lines=100)
+        # Fortschritt beim Verpacken (17.11.2026): waehrend raw2bmx laeuft, die Groesse der entstehenden Datei abfragen
+        inputs = [v_path, *wavs] + ([anc] if anc is not None else []) + ([xml] if xml is not None else [])
+        stop = threading.Event()
+        watcher = threading.Thread(target=self._wrap_watch, args=(plan, frames, out, inputs, stop), daemon=True,
+                                   name="wrap-progress")
+        watcher.start()
+        try:
+            res = tools.run_capture(args, cancel=self.cancel, on_stdout_line=lines.append, on_stderr_line=lines.append, keep_lines=100)
+        finally:
+            stop.set()
+            watcher.join(timeout=2)
         if res.returncode != 0:
             msg = [l for l in (res.stdout + "\n" + res.stderr).splitlines() if l.strip()]
             return "raw2bmx Code %d: %s" % (res.returncode, " | ".join(msg[-4:]))
         return ""
+
+    # Fortschritt beim Verpacken: Abfrageabstand (Sekunden), Anteil des Verpackens am Clip (0.92 bis 0.95 wie bisher)
+    WRAP_POLL_S = 1.0
+    WRAP_FRAC_FROM, WRAP_FRAC_TO = 0.92, 0.95
+
+    @staticmethod
+    def wrap_fraction(out_size: int, expected: int) -> float:
+        """Anteil des Verpackens (0 bis 0.99) aus der Groesse der entstehenden Datei; 0 ohne brauchbare Erwartung."""
+        if expected <= 0 or out_size <= 0:
+            return 0.0
+        return max(0.0, min(0.99, out_size / expected))
+
+    def _wrap_watch(self, plan: ClipPlan, frames: int, out: Path, inputs: list, stop: threading.Event) -> None:
+        """Thread waehrend raw2bmx: Groesse der entstehenden MXF im Verhaeltnis zur Summe der Eingabedateien als
+        Clip-Fortschritt melden (hoechstens einmal je WRAP_POLL_S, nie rueckwaerts, hoechstens 99 %).  Jeder Fehler
+        (Datei fehlt, gesperrt, Anzeige) wird ignoriert; Ablauf und Gesamtfortschritt-Gewichtung bleiben unveraendert."""
+        try:
+            expected = 0
+            for f in inputs:
+                try:
+                    expected += os.stat(f).st_size
+                except OSError:
+                    pass
+            last = -1
+            while not stop.wait(self.WRAP_POLL_S):
+                try:
+                    frac = self.wrap_fraction(os.stat(out).st_size, expected)
+                    pct = int(frac * 100)
+                    if pct <= last:
+                        continue
+                    last = pct
+                    self._emit_progress(plan, self.WRAP_FRAC_FROM + (self.WRAP_FRAC_TO - self.WRAP_FRAC_FROM) * frac,
+                                        f"Verpacke MXF (raw2bmx) {pct} %", transcoded=frames)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @dataclass

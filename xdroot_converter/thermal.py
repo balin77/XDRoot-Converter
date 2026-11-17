@@ -205,22 +205,29 @@ class ThermalConfig:
     max_pause_s: float = DEFAULT_MAX_PAUSE_S  # längste Pause; danach Abbruch des Laufs (fortsetzbar)
     pause_log_s: float = PAUSE_LOG_INTERVAL_S  # Protokollzeile während einer Pause
     fan_effect_window_s: float = FAN_EFFECT_WINDOW_S
+    # Runde 6: Drosseln/Pause/Notfall/Hitze-Abbruch nur bei True.  Der Dataclass-Standard bleibt True, damit direkte
+    # ThermalConfig()-Aufrufe (viele Tests) das Verhalten von Runde 5 behalten; der Standard AUS gilt für Options, CLI und
+    # GUI (converter.Options.thermal_throttle = False reicht ihn explizit durch).
+    throttle: bool = True
 
     @classmethod
     def from_limits(cls, fan_on_c: float = DEFAULT_FAN_ON_C, pause_c: float = DEFAULT_PAUSE_C, **kw) -> "ThermalConfig":
-        """Rückschwelle der Pause aus den beiden einstellbaren Schwellen ableiten (Standard 97 -> 85)."""
+        """Rückschwelle der Pause aus den beiden einstellbaren Schwellen ableiten (Standard 97 -> 85).  Bei
+        ``throttle=False`` wird ``pause_c`` nicht ausgewertet (es gelten die Standardwerte, nichts davon wird geprüft)."""
+        if not kw.get("throttle", True):
+            pause_c = DEFAULT_PAUSE_C
         cfg = cls(fan_on_c=float(fan_on_c), pause_c=float(pause_c), resume_c=float(pause_c) - PAUSE_HYSTERESIS_C, **kw)
         cfg.validate()
         return cfg
 
     def validate(self) -> None:
-        for n in ("fan_on_c", "pause_c", "resume_c"):
+        for n in (("fan_on_c", "pause_c", "resume_c") if self.throttle else ("fan_on_c",)):
             v = getattr(self, n)
             if not plausible(v):
                 raise ValueError(f"Temperaturschwelle {v} °C ist unplausibel (erlaubt: über 0 bis {TEMP_MAX_PLAUSIBLE_C:.0f}).")
-        if not self.resume_c < self.pause_c:
+        if self.throttle and not self.resume_c < self.pause_c:
             raise ValueError("Die Rückschwelle der Pause muss unter der Pausenschwelle liegen.")
-        if not self.fan_on_c < self.pause_c:
+        if self.throttle and not self.fan_on_c < self.pause_c:
             raise ValueError("Die Pausenschwelle muss über der Lüfter-voll-Schwelle liegen.")
         if self.confirm_up < 1 or self.confirm_down < 1 or self.bad_limit < 1:
             raise ValueError("Anzahl der bestätigenden Messungen muss mindestens 1 sein.")
@@ -228,13 +235,14 @@ class ThermalConfig:
             raise ValueError("Die Höchstdauer einer Pause muss positiv sein.")
 
 
-def check_limits(fan_c: float, pause_c: float, fan_name: str = "Lüfter voll ab", pause_name: str = "Pause ab") -> None:
+def check_limits(fan_c: float, pause_c: Optional[float], fan_name: str = "Lüfter voll ab", pause_name: str = "Pause ab") -> None:
     """Gemeinsame Prüfung der beiden einstellbaren Schwellen (GUI und CLI).  ValueError mit deutscher Meldung, die den
-    EINGEGEBENEN Wert nennt."""
-    for name, v, lo, hi in ((fan_name, fan_c, TEMP_FAN_MIN, TEMP_FAN_MAX), (pause_name, pause_c, TEMP_PAUSE_MIN, TEMP_PAUSE_MAX)):
+    EINGEGEBENEN Wert nennt.  ``pause_c=None`` (Schalter "drosseln und pausieren" aus): nur die Lüfter-Schwelle wird geprüft."""
+    for name, v, lo, hi in (((fan_name, fan_c, TEMP_FAN_MIN, TEMP_FAN_MAX),) if pause_c is None else
+                            ((fan_name, fan_c, TEMP_FAN_MIN, TEMP_FAN_MAX), (pause_name, pause_c, TEMP_PAUSE_MIN, TEMP_PAUSE_MAX))):
         if v != v or not (lo <= v <= hi):
             raise ValueError(f"{name}: {v:g} °C liegt außerhalb des erlaubten Bereichs ({lo:.0f} bis {hi:.0f} °C).")
-    if fan_c >= pause_c:
+    if pause_c is not None and fan_c >= pause_c:
         raise ValueError(f"{pause_name} ({pause_c:g} °C) muss höher sein als {fan_name} ({fan_c:g} °C).")
 
 
@@ -1795,10 +1803,15 @@ class ThermalController:
         self.stats.fan_note = str(note)
         self.fan_reason = "" if self.fan_ok else str(note)
         self._drain()
-        self._n("info", f"Temperaturüberwachung aktiv ({getattr(self.provider, 'name', '?')}); "
-                        f"Lüfter voll ab {self.cfg.fan_on_c:g} °C (bleibt bis zum Laufende), "
-                        f"ab {self.cfg.pause_c:g} °C wird die Last gedrosselt, Pause als letzte Stufe "
-                        f"(weiter unter {self.cfg.resume_c:g}).")
+        if self.cfg.throttle:
+            self._n("info", f"Temperaturüberwachung aktiv ({getattr(self.provider, 'name', '?')}); "
+                            f"Lüfter voll ab {self.cfg.fan_on_c:g} °C (bleibt bis zum Laufende), "
+                            f"ab {self.cfg.pause_c:g} °C wird die Last gedrosselt, Pause als letzte Stufe "
+                            f"(weiter unter {self.cfg.resume_c:g}).")
+        else:
+            self._n("info", f"Temperaturüberwachung aktiv ({getattr(self.provider, 'name', '?')}); "
+                            f"Lüfter voll ab {self.cfg.fan_on_c:g} °C (bleibt bis zum Laufende); "
+                            "kein Drosseln, keine Pause (die CPU regelt sich selbst).")
         src = getattr(self.provider, "temp_source_label", "")
         if isinstance(src, str) and src:
             if getattr(self.provider, "temp_source", "") in COARSE_SOURCES:
@@ -1810,7 +1823,7 @@ class ThermalController:
             self._n("info", f"Lüfterschaltung: {note}")
         else:
             what = str(note) if str(note).startswith("Lüftersteuerung") else f"Lüftersteuerung nicht verfügbar: {note}"
-            self._n("warn", f"{what}. Es wird nur gemessen und bei Bedarf pausiert.")
+            self._n("warn", f"{what}. Es wird nur gemessen" + (" und bei Bedarf pausiert." if self.cfg.throttle else "."))
 
     def tick(self, measurement: Optional[Messung] = None) -> None:
         """Eine Messung (oder die übergebene) auswerten.  Wirft nie."""
@@ -1885,7 +1898,9 @@ class ThermalController:
             # --- Last drosseln / Pause (Reihenfolge: Notfall, Stufe runter bzw. Pause als letzte Stufe, Stufe hoch)
             now = self._clock()
             self._acc_throttle(now)
-            if not self.paused:
+            if not c.throttle:
+                pass  # Schalter aus (Runde 6): nie drosseln, pausieren oder abbrechen; nur messen, anzeigen, Lüfter
+            elif not self.paused:
                 self._up_pause = self._up_pause + 1 if t >= c.pause_c else 0
                 self._emerg = self._emerg + 1 if t >= c.pause_c + EMERGENCY_MARGIN_C else 0
                 self._control_load(t, now)
@@ -1895,7 +1910,8 @@ class ThermalController:
                     self._do_resume(t)
                 elif self._pause_progress(t):
                     return
-            self._apply_pending_throttle()
+            if c.throttle:
+                self._apply_pending_throttle()
 
             # --- Lüfter voll (Bestätigung); während der Pause immer voll.  Einmal voll bleibt es bis zum Laufende
             # (Zurückstellen nur in finish()/_fail()), damit Lüfter und Pause nicht pendeln.
@@ -2208,7 +2224,7 @@ class ThermalController:
             self.fan_ok = False
             if isinstance(e, FanControlBusy):
                 self.fan_reason = "Lüftersteuerung wird von einem anderen Lauf benutzt"
-                self._n("warn", f"{self.fan_reason}; es wird nur gemessen und bei Bedarf pausiert.")
+                self._n("warn", f"{self.fan_reason}; es wird nur gemessen" + (" und bei Bedarf pausiert." if self.cfg.throttle else "."))
             else:
                 self.fan_reason = "Lüfter konnten nicht geschaltet werden"
                 self._n("warn", "Die Lüfter konnten nicht auf voll geschaltet werden; es wird nicht weiter geschaltet.")
